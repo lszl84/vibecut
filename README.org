@@ -81,4 +81,5 @@ Adding/changing code by hand, debugging, etc.
 
 * Devlog
 ** Day 1
-Set up the GitHub project with README.org and AGENTS.mg
+Set up the GitHub project with README.org and AGENTS.mg. Added basic
+CMakeLists.txt and program code showing a window with a button.
