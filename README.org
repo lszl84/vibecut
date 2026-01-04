@@ -17,6 +17,39 @@ amount of manual code typing, and prefer written or spoken prompts.
 - ImGui
 - ffmpeg
 
+* Building
+
+** Dependencies
+
+Install GLFW on your Linux distribution:
+
+#+begin_src bash
+# Arch Linux
+sudo pacman -S glfw
+
+# Ubuntu/Debian
+sudo apt install libglfw3-dev
+
+# Fedora
+sudo dnf install glfw-devel
+#+end_src
+
+** Clone and Build
+
+#+begin_src bash
+git clone --recurse-submodules https://github.com/lszl84/vibecut.git
+cd vibecut
+cmake -B build
+cmake --build build
+./build/vibecut
+#+end_src
+
+If you already cloned without submodules:
+
+#+begin_src bash
+git submodule update --init
+#+end_src
+
 * Tasks
 We'll track the time spent on the tasks below:
 ** Initial Setup
