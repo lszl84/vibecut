@@ -26,6 +26,9 @@ CLOCK: [2026-01-04 Sun 15:10]--[2026-01-04 Sun 15:16] =>  0:06
 CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
 :END:
 ** Vibe coding
+:LOGBOOK:
+CLOCK: [2026-01-04 Sun 15:19]--[2026-01-04 Sun 15:22] =>  0:03
+:END:
 Typing or speaking prompts, babysiting Agents, testing the features
 implemented by agents, etc.
 ** Manual coding
