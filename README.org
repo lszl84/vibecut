@@ -10,24 +10,29 @@ Final Cut, but more advanced than iMovie. We want to use minimal
 amount of manual code typing, and prefer written or spoken prompts.
 
 * Tech Stack
-** GNU+Linux
-** C++23
-** CMake
-** GLFW + OpenGL 4
-** ImGui
+- GNU+Linux
+- C++23
+- CMake
+- GLFW + OpenGL 4
+- ImGui
 
 * Tasks
+We'll track the time spent on the tasks below:
 ** Initial Setup
+Git Setup, AGENTS.md, workflow changes, etc.
 :LOGBOOK:
 CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
 :END:
-** Vibe coding (prompts, babysitting the agents, etc)
-** Manual coding (typing code, debugging)
+** Vibe coding
+Typing or speaking prompts, babysiting Agents, testing the features
+implemented by agents, etc.
+** Manual coding
+Adding/changing code by hand, debugging, etc.
 
 * Time Tracking
 
-#+BEGIN: clocktable :maxlevel 2 :scope file :block nil
-#+CAPTION: Clock summary at [2026-01-04 Sun 15:04]
+#+BEGIN: clocktable :maxlevel nil :scope file :block nil
+#+CAPTION: Clock summary at [2026-01-04 Sun 15:08]
 | Headline          | Time |      |
 |-------------------+------+------|
 | *Total time*        | *0:07* |      |
