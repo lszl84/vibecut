@@ -1,0 +1,41 @@
+#+title: Vibecut: a vibe-coded video editor
+
+* What is this?
+This is a long-term experiment to see how viable vibe-coding with AI
+agents is in 2026.
+
+* The Goal
+Create an advanced desktop application for video editing. Simpler than
+Final Cut, but more advanced than iMovie. We want to use minimal
+amount of manual code typing, and prefer written or spoken prompts.
+
+* Tech Stack
+** GNU+Linux
+** C++23
+** CMake
+** GLFW + OpenGL 4
+** ImGui
+
+* Tasks
+** Initial Setup
+:LOGBOOK:
+CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
+:END:
+** Vibe coding (prompts, babysitting the agents, etc)
+** Manual coding (typing code, debugging)
+
+* Time Tracking
+
+#+BEGIN: clocktable :maxlevel 2 :scope file :block nil
+#+CAPTION: Clock summary at [2026-01-04 Sun 15:04]
+| Headline          | Time |      |
+|-------------------+------+------|
+| *Total time*        | *0:07* |      |
+|-------------------+------+------|
+| Tasks             | 0:07 |      |
+| \_  Initial Setup |      | 0:07 |
+#+END:
+
+* Devlog
+** Day 1
+Set up the GitHub project with README.org and AGENTS.mg
