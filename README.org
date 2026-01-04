@@ -15,12 +15,14 @@ amount of manual code typing, and prefer written or spoken prompts.
 - CMake
 - GLFW + OpenGL 4
 - ImGui
+- ffmpeg
 
 * Tasks
 We'll track the time spent on the tasks below:
 ** Initial Setup
 Git Setup, AGENTS.md, workflow changes, etc.
 :LOGBOOK:
+CLOCK: [2026-01-04 Sun 15:10]--[2026-01-04 Sun 15:16] =>  0:06
 CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
 :END:
 ** Vibe coding
@@ -32,13 +34,13 @@ Adding/changing code by hand, debugging, etc.
 * Time Tracking
 
 #+BEGIN: clocktable :maxlevel nil :scope file :block nil
-#+CAPTION: Clock summary at [2026-01-04 Sun 15:08]
+#+CAPTION: Clock summary at [2026-01-04 Sun 15:17]
 | Headline          | Time |      |
 |-------------------+------+------|
-| *Total time*        | *0:07* |      |
+| *Total time*        | *0:13* |      |
 |-------------------+------+------|
-| Tasks             | 0:07 |      |
-| \_  Initial Setup |      | 0:07 |
+| Tasks             | 0:13 |      |
+| \_  Initial Setup |      | 0:13 |
 #+END:
 
 * Devlog
