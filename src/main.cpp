@@ -3,14 +3,85 @@
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 #include <cstdio>
+#include <string>
 #include <vector>
+#include <filesystem>
+#include <algorithm>
 
 #include "embedded_font.h"
+
+namespace fs = std::filesystem;
+
+std::string path_display_name(const fs::path& p) {
+    if (p.empty()) return "";
+    auto fname = p.filename();
+    if (fname.empty() || fname == "/" || fname == ".") {
+        return p.string();
+    }
+    return fname.string();
+}
 
 struct WindowData {
     GLFWwindow* window = nullptr;
     ImGuiContext* imgui_ctx = nullptr;
     float scale = 1.0f;
+};
+
+struct FileBrowser {
+    fs::path current_path;
+    int selected_index = -1;
+    std::vector<fs::directory_entry> entries;
+    
+    FileBrowser() {
+        try { current_path = fs::current_path(); } 
+        catch (...) { current_path = "/"; }
+    }
+    
+    void refresh() {
+        entries.clear();
+        selected_index = -1;
+        
+        try {
+            current_path = fs::canonical(current_path);
+        } catch (...) {
+            try { current_path = fs::current_path(); }
+            catch (...) { current_path = "/"; }
+        }
+        
+        if (current_path.has_parent_path()) {
+            auto parent = current_path.parent_path();
+            if (!parent.empty() && parent != current_path) {
+                try { entries.push_back(fs::directory_entry(parent)); }
+                catch (...) {}
+            }
+        }
+        
+        std::vector<fs::directory_entry> dirs, files;
+        try {
+            for (auto& entry : fs::directory_iterator(current_path, fs::directory_options::skip_permission_denied)) {
+                try {
+                    if (entry.is_directory()) dirs.push_back(entry);
+                    else files.push_back(entry);
+                } catch (...) {}
+            }
+        } catch (...) {}
+        
+        auto get_name = [](const fs::directory_entry& e) { return path_display_name(e.path()); };
+        std::ranges::sort(dirs, {}, get_name);
+        std::ranges::sort(files, {}, get_name);
+        
+        entries.insert(entries.end(), dirs.begin(), dirs.end());
+        entries.insert(entries.end(), files.begin(), files.end());
+    }
+    
+    void navigate_to(const fs::path& p) {
+        try {
+            current_path = fs::canonical(p);
+        } catch (...) {
+            current_path = p;
+        }
+        refresh();
+    }
 };
 
 WindowData create_window(const char* title, int width, int height, GLFWwindow* share_context = nullptr) {
@@ -96,21 +167,18 @@ int main() {
         return 1;
     }
 
-    std::vector<WindowData> child_windows;
-    int child_count = 0;
+    WindowData browser_window{};
+    FileBrowser browser;
+    std::string selected_file;
 
     while (!glfwWindowShouldClose(main_window.window)) {
         glfwPollEvents();
 
-        // Clean up closed child windows
-        for (auto& child : child_windows) {
-            if (child.window && glfwWindowShouldClose(child.window)) {
-                destroy_window(child);
-            }
+        if (browser_window.window && glfwWindowShouldClose(browser_window.window)) {
+            destroy_window(browser_window);
         }
 
-        // Render main window
-        bool open_new_window = false;
+        bool open_browser = false;
         render_window(main_window, [&]() {
             ImGuiViewport* viewport = ImGui::GetMainViewport();
             ImVec2 center = viewport->GetCenter();
@@ -125,54 +193,119 @@ int main() {
                 ImGuiWindowFlags_NoBackground |
                 ImGuiWindowFlags_AlwaysAutoResize);
 
-            if (ImGui::Button("Click Me!", ImVec2(200, 60))) {
-                open_new_window = true;
+            if (ImGui::Button("Open File...", ImVec2(200, 60))) {
+                if (!browser_window.window) {
+                    open_browser = true;
+                }
+            }
+
+            if (!selected_file.empty()) {
+                ImGui::Spacing();
+                ImGui::Text("Selected: %s", selected_file.c_str());
             }
 
             ImGui::End();
         });
 
-        // Create new child window if button was clicked
-        if (open_new_window) {
-            child_count++;
-            char title[64];
-            std::snprintf(title, sizeof(title), "Child Window %d", child_count);
-            
-            WindowData child = create_window(title, 400, 300, main_window.window);
-            if (child.window) {
-                child_windows.push_back(child);
-            }
+        if (open_browser) {
+            browser_window = create_window("Open File", 600, 500, main_window.window);
+            try { browser.current_path = fs::current_path(); }
+            catch (...) { browser.current_path = "/"; }
+            browser.refresh();
         }
 
-        // Render child windows
-        for (auto& child : child_windows) {
-            if (!child.window) continue;
+        if (browser_window.window) {
+            bool should_close = false;
             
-            render_window(child, [&]() {
-                ImGuiViewport* viewport = ImGui::GetMainViewport();
-                ImVec2 center = viewport->GetCenter();
+            render_window(browser_window, [&]() {
+                ImGui::SetNextWindowPos(ImVec2(0, 0));
+                ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
 
-                ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-                ImGui::SetNextWindowSize(ImVec2(0, 0));
-
-                ImGui::Begin("##About", nullptr,
+                ImGui::Begin("##FileBrowser", nullptr,
                     ImGuiWindowFlags_NoTitleBar |
                     ImGuiWindowFlags_NoResize |
                     ImGuiWindowFlags_NoMove |
-                    ImGuiWindowFlags_NoBackground |
-                    ImGuiWindowFlags_AlwaysAutoResize);
+                    ImGuiWindowFlags_NoCollapse);
 
-                ImGui::Text("About VibeCut");
+                ImGui::Text("Path: %s", browser.current_path.string().c_str());
                 ImGui::Separator();
-                ImGui::Text("A vibe-coded video editor");
+
+                ImVec2 list_size(ImGui::GetContentRegionAvail().x, 
+                                 ImGui::GetContentRegionAvail().y - 40);
+                
+                if (ImGui::BeginListBox("##files", list_size)) {
+                    bool first_is_parent = !browser.entries.empty() && 
+                        browser.entries[0].path() != browser.current_path &&
+                        browser.current_path.string().starts_with(browser.entries[0].path().string());
+                    
+                    for (int i = 0; i < (int)browser.entries.size(); i++) {
+                        auto& entry = browser.entries[i];
+                        std::string label;
+                        
+                        try {
+                            if (first_is_parent && i == 0) {
+                                label = "..";
+                            } else if (entry.is_directory()) {
+                                label = "[" + path_display_name(entry.path()) + "]";
+                            } else {
+                                label = path_display_name(entry.path());
+                            }
+                        } catch (...) {
+                            label = "???";
+                        }
+                        
+                        bool is_selected = (browser.selected_index == i);
+                        if (ImGui::Selectable(label.c_str(), is_selected, ImGuiSelectableFlags_AllowDoubleClick)) {
+                            browser.selected_index = i;
+                            
+                            if (ImGui::IsMouseDoubleClicked(0)) {
+                                try {
+                                    if (entry.is_directory()) {
+                                        browser.navigate_to(entry.path());
+                                    } else {
+                                        selected_file = entry.path().string();
+                                        should_close = true;
+                                    }
+                                } catch (...) {}
+                            }
+                        }
+                    }
+                    ImGui::EndListBox();
+                }
+
+                ImGui::Spacing();
+                
+                bool can_open = browser.selected_index >= 0 && 
+                               browser.selected_index < (int)browser.entries.size();
+                try {
+                    can_open = can_open && !browser.entries[browser.selected_index].is_directory();
+                } catch (...) { can_open = false; }
+                
+                if (!can_open) ImGui::BeginDisabled();
+                if (ImGui::Button("Open", ImVec2(100, 0))) {
+                    try {
+                        selected_file = browser.entries[browser.selected_index].path().string();
+                    } catch (...) {}
+                    should_close = true;
+                }
+                if (!can_open) ImGui::EndDisabled();
+                
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel", ImVec2(100, 0))) {
+                    should_close = true;
+                }
 
                 ImGui::End();
             });
+            
+            if (should_close) {
+                destroy_window(browser_window);
+            }
         }
     }
 
-    for (auto& child : child_windows) {
-        destroy_window(child);
+    if (browser_window.window) {
+        destroy_window(browser_window);
     }
     destroy_window(main_window);
     glfwTerminate();
