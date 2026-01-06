@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <vector>
 
+#include "embedded_font.h"
+
 struct WindowData {
     GLFWwindow* window = nullptr;
     ImGuiContext* imgui_ctx = nullptr;
@@ -33,7 +35,7 @@ WindowData create_window(const char* title, int width, int height, GLFWwindow* s
     
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    io.FontGlobalScale = data.scale;
+    io.Fonts->AddFontFromMemoryCompressedBase85TTF(RobotoMedium_compressed_data_base85, 16.0f * data.scale);
     
     ImGui::StyleColorsDark();
     ImGui::GetStyle().ScaleAllSizes(data.scale);
