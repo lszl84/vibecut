@@ -60,7 +60,7 @@ CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
 :END:
 ** Vibe coding
 :LOGBOOK:
-CLOCK: [2026-01-06 Tue 19:22]
+CLOCK: [2026-01-06 Tue 19:22]--[2026-01-06 Tue 20:03] =>  0:41
 CLOCK: [2026-01-04 Sun 15:19]--[2026-01-04 Sun 15:22] =>  0:03
 :END:
 Typing or speaking prompts, babysiting Agents, testing the features
@@ -71,17 +71,24 @@ Adding/changing code by hand, debugging, etc.
 * Time Tracking
 
 #+BEGIN: clocktable :maxlevel nil :scope file :block nil
-#+CAPTION: Clock summary at [2026-01-04 Sun 16:22]
+#+CAPTION: Clock summary at [2026-01-06 Tue 20:04]
 | Headline          | Time |      |
 |-------------------+------+------|
-| *Total time*        | *0:16* |      |
+| *Total time*        | *0:57* |      |
 |-------------------+------+------|
-| Tasks             | 0:16 |      |
+| Tasks             | 0:57 |      |
 | \_  Initial Setup |      | 0:13 |
-| \_  Vibe coding   |      | 0:03 |
+| \_  Vibe coding   |      | 0:44 |
 #+END:
 
 * Devlog
+
+Live Streams: https://www.youtube.com/@lukeatdevmindscape/streams
+
+** Day 2
+Just a quick session, this time with live streaming on YouTube. Added
+a custom file selector on button click.
+
 ** Day 1
 Set up the GitHub project with README.org and AGENTS.mg. Added basic
 CMakeLists.txt and program code showing a window with a button.
