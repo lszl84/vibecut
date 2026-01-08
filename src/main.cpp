@@ -3,6 +3,8 @@
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 #include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -11,6 +13,36 @@
 #include "embedded_font.h"
 
 namespace fs = std::filesystem;
+
+fs::path get_config_dir() {
+    const char* home = std::getenv("HOME");
+    if (!home) home = "/tmp";
+    return fs::path(home) / ".config" / "vibecut";
+}
+
+fs::path load_last_path() {
+    try {
+        auto config_file = get_config_dir() / "last_path";
+        if (fs::exists(config_file)) {
+            std::ifstream f(config_file);
+            std::string path_str;
+            std::getline(f, path_str);
+            if (!path_str.empty() && fs::exists(path_str)) {
+                return path_str;
+            }
+        }
+    } catch (...) {}
+    return fs::current_path();
+}
+
+void save_last_path(const fs::path& p) {
+    try {
+        auto config_dir = get_config_dir();
+        fs::create_directories(config_dir);
+        std::ofstream f(config_dir / "last_path");
+        f << p.string();
+    } catch (...) {}
+}
 
 std::string path_display_name(const fs::path& p) {
     if (p.empty()) return "";
@@ -33,7 +65,7 @@ struct FileBrowser {
     std::vector<fs::directory_entry> entries;
     
     FileBrowser() {
-        try { current_path = fs::current_path(); } 
+        try { current_path = load_last_path(); } 
         catch (...) { current_path = "/"; }
     }
     
@@ -80,6 +112,7 @@ struct FileBrowser {
         } catch (...) {
             current_path = p;
         }
+        save_last_path(current_path);
         refresh();
     }
 };
@@ -209,8 +242,6 @@ int main() {
 
         if (open_browser) {
             browser_window = create_window("Open File", 600, 500, main_window.window);
-            try { browser.current_path = fs::current_path(); }
-            catch (...) { browser.current_path = "/"; }
             browser.refresh();
         }
 
