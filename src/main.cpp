@@ -539,68 +539,96 @@ void render_window(WindowData& data, auto ui_func) {
     glfwSwapBuffers(data.window);
 }
 
-bool TrimTimeline(const char* label, float* current, float* trim_start, float* trim_end, float duration, const ImVec2& size) {
+struct TrimTimelineState {
+    int dragging = 0; // 0=none, 1=left, 2=right, 3=playhead
+};
+
+bool TrimTimeline(const char* label, float* current, float* trim_start, float* trim_end, float duration, const ImVec2& size, TrimTimelineState& state) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     
     ImVec2 bb_min = pos;
     ImVec2 bb_max = ImVec2(pos.x + size.x, pos.y + size.y);
     
-    // Background
-    draw_list->AddRectFilled(bb_min, bb_max, IM_COL32(40, 40, 45, 255), 4.0f);
+    // Background (dark, represents untrimmed/excluded areas)
+    draw_list->AddRectFilled(bb_min, bb_max, IM_COL32(30, 30, 35, 255), 4.0f);
     
-    // Trimmed region
+    // Trimmed region (the part that will be kept)
     float start_x = bb_min.x + (*trim_start / duration) * size.x;
     float end_x = bb_min.x + (*trim_end / duration) * size.x;
     draw_list->AddRectFilled(ImVec2(start_x, bb_min.y), ImVec2(end_x, bb_max.y), IM_COL32(70, 130, 180, 200), 4.0f);
     
-    // Current position
+    // Trim handles - vertical bars at the edges of trim region
+    float handle_w = 6.0f;
+    draw_list->AddRectFilled(ImVec2(start_x, bb_min.y), ImVec2(start_x + handle_w, bb_max.y), IM_COL32(255, 200, 50, 255));
+    draw_list->AddRectFilled(ImVec2(end_x - handle_w, bb_min.y), ImVec2(end_x, bb_max.y), IM_COL32(255, 200, 50, 255));
+    
+    // Current position (playhead)
     float curr_x = bb_min.x + (*current / duration) * size.x;
-    draw_list->AddLine(ImVec2(curr_x, bb_min.y), ImVec2(curr_x, bb_max.y), IM_COL32(255, 255, 255, 255), 2.0f);
-    
-    // Trim handles
-    float handle_w = 10.0f;
-    ImVec2 lh_min(start_x - handle_w/2, bb_min.y);
-    ImVec2 lh_max(start_x + handle_w/2, bb_max.y);
-    ImVec2 rh_min(end_x - handle_w/2, bb_min.y);
-    ImVec2 rh_max(end_x + handle_w/2, bb_max.y);
-    
-    draw_list->AddRectFilled(lh_min, lh_max, IM_COL32(255, 200, 50, 255), 2.0f);
-    draw_list->AddRectFilled(rh_min, rh_max, IM_COL32(255, 200, 50, 255), 2.0f);
+    draw_list->AddLine(ImVec2(curr_x, bb_min.y - 2), ImVec2(curr_x, bb_max.y + 2), IM_COL32(255, 255, 255, 255), 3.0f);
     
     // Invisible button for interaction
     ImGui::InvisibleButton(label, size);
+    bool is_hovered = ImGui::IsItemHovered();
+    bool is_active = ImGui::IsItemActive();
     
     bool changed = false;
     ImVec2 mouse = ImGui::GetIO().MousePos;
     
-    auto in_rect = [](ImVec2 p, ImVec2 min, ImVec2 max) {
-        return p.x >= min.x && p.x <= max.x && p.y >= min.y && p.y <= max.y;
-    };
-    
-    static int dragging = 0; // 0=none, 1=left, 2=right, 3=playhead
-    
+    // Detect what we clicked on
     if (ImGui::IsItemClicked(0)) {
-        if (in_rect(mouse, lh_min, lh_max)) dragging = 1;
-        else if (in_rect(mouse, rh_min, rh_max)) dragging = 2;
-        else dragging = 3;
+        float click_x = mouse.x;
+        
+        // Check if clicking on left handle (within handle_w pixels of start_x, on the inside)
+        bool on_left_handle = (click_x >= start_x && click_x <= start_x + handle_w + 4);
+        // Check if clicking on right handle (within handle_w pixels of end_x, on the inside)  
+        bool on_right_handle = (click_x >= end_x - handle_w - 4 && click_x <= end_x);
+        
+        // Prioritize: if both handles overlap (very short trim), use the closer one
+        if (on_left_handle && on_right_handle) {
+            if (std::abs(click_x - start_x) < std::abs(click_x - end_x)) {
+                state.dragging = 1;
+            } else {
+                state.dragging = 2;
+            }
+        } else if (on_left_handle) {
+            state.dragging = 1;
+        } else if (on_right_handle) {
+            state.dragging = 2;
+        } else {
+            state.dragging = 3; // Playhead
+        }
     }
     
-    if (ImGui::IsMouseReleased(0)) dragging = 0;
+    if (!is_active) {
+        state.dragging = 0;
+    }
     
-    if (dragging && ImGui::IsMouseDown(0)) {
+    if (state.dragging != 0 && is_active) {
         float rel_x = (mouse.x - bb_min.x) / size.x;
         float time = std::clamp(rel_x * duration, 0.0f, duration);
         
-        if (dragging == 1) {
-            *trim_start = std::min(time, *trim_end - 0.1f);
+        if (state.dragging == 1) {
+            float new_start = std::min(time, *trim_end - 0.1f);
+            *trim_start = std::max(new_start, 0.0f);
             changed = true;
-        } else if (dragging == 2) {
-            *trim_end = std::max(time, *trim_start + 0.1f);
+        } else if (state.dragging == 2) {
+            float new_end = std::max(time, *trim_start + 0.1f);
+            *trim_end = std::min(new_end, duration);
             changed = true;
-        } else if (dragging == 3) {
-            *current = std::clamp(time, *trim_start, *trim_end);
+        } else if (state.dragging == 3) {
+            *current = time;
             changed = true;
+        }
+    }
+    
+    // Change cursor when hovering handles
+    if (is_hovered && state.dragging == 0) {
+        float hover_x = mouse.x;
+        bool over_left = (hover_x >= start_x && hover_x <= start_x + handle_w + 4);
+        bool over_right = (hover_x >= end_x - handle_w - 4 && hover_x <= end_x);
+        if (over_left || over_right) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
         }
     }
     
@@ -625,6 +653,7 @@ int main() {
     std::string selected_file;
     VideoPlayer player;
     std::string pending_load;
+    TrimTimelineState timeline_state;
     
     std::atomic<bool> exporting{false};
     std::atomic<float> export_progress{0.0f};
@@ -696,7 +725,7 @@ int main() {
                 float te = (float)player.trim_end;
                 
                 if (TrimTimeline("##trim_timeline", &curr, &ts, &te, (float)player.duration, 
-                                 ImVec2(viewport->Size.x - 20, 30))) {
+                                 ImVec2(viewport->Size.x - 20, 30), timeline_state)) {
                     player.trim_start = ts;
                     player.trim_end = te;
                     if (curr != (float)player.current_time) {
