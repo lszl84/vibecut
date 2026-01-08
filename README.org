@@ -60,6 +60,7 @@ CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
 :END:
 ** Vibe coding
 :LOGBOOK:
+CLOCK: [2026-01-08 Thu 19:40]--[2026-01-08 Thu 20:14] =>  0:34
 CLOCK: [2026-01-06 Tue 19:22]--[2026-01-06 Tue 20:03] =>  0:41
 CLOCK: [2026-01-04 Sun 15:19]--[2026-01-04 Sun 15:22] =>  0:03
 :END:
@@ -71,19 +72,30 @@ Adding/changing code by hand, debugging, etc.
 * Time Tracking
 
 #+BEGIN: clocktable :maxlevel nil :scope file :block nil
-#+CAPTION: Clock summary at [2026-01-06 Tue 20:04]
+#+CAPTION: Clock summary at [2026-01-08 Thu 20:14]
 | Headline          | Time |      |
 |-------------------+------+------|
-| *Total time*        | *0:57* |      |
+| *Total time*        | *1:31* |      |
 |-------------------+------+------|
-| Tasks             | 0:57 |      |
+| Tasks             | 1:31 |      |
 | \_  Initial Setup |      | 0:13 |
-| \_  Vibe coding   |      | 0:44 |
+| \_  Vibe coding   |      | 1:18 |
 #+END:
 
 * Devlog
 
 Live Streams: https://www.youtube.com/@lukeatdevmindscape/streams
+
+** Day 3
+Claude integrated FFmpeg C API into the program, created an ImGui
+OpenGL video player and added an ability to trim the timeline and
+export the video. This is absolutely insane.
+
+However, it got stuck with a bug - wrong behavior when clicking near
+the beginning of a timeline for short videos. I wonder if it's
+possible to fix this just by prompts? How to explain the issue without
+shoving it a recording of the problem? Is it possible to upload a
+video as a problem description? Will AI be able to interpret a video?
 
 ** Day 2
 Just a quick session, this time with live streaming on YouTube. Added
