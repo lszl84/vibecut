@@ -9,6 +9,8 @@
 #include <vector>
 #include <filesystem>
 #include <algorithm>
+#include <thread>
+#include <atomic>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -44,8 +46,14 @@ struct VideoPlayer {
     bool playing = false;
     bool loaded = false;
     
+    double trim_start = 0.0;
+    double trim_end = 0.0;
+    
+    std::string source_path;
+    
     bool open(const std::string& path) {
         close();
+        source_path = path;
         
         if (avformat_open_input(&format_ctx, path.c_str(), nullptr, nullptr) < 0) {
             std::fprintf(stderr, "Could not open file: %s\n", path.c_str());
@@ -120,6 +128,8 @@ struct VideoPlayer {
         loaded = true;
         current_time = 0.0;
         playing = false;
+        trim_start = 0.0;
+        trim_end = duration;
         
         seek(0.0);
         return true;
@@ -142,6 +152,7 @@ struct VideoPlayer {
         width = height = 0;
         duration = 0.0;
         current_time = 0.0;
+        source_path.clear();
     }
     
     bool decode_frame() {
@@ -178,7 +189,6 @@ struct VideoPlayer {
         avcodec_flush_buffers(codec_ctx);
         av_seek_frame(format_ctx, video_stream, timestamp, AVSEEK_FLAG_BACKWARD);
         
-        // Decode frames until we reach the target time
         while (decode_frame()) {
             if (current_time >= time - 0.01) break;
         }
@@ -191,6 +201,7 @@ struct VideoPlayer {
     
     void play() {
         if (!loaded) return;
+        if (current_time < trim_start) seek(trim_start);
         playing = true;
         play_start_time = glfwGetTime();
         play_start_position = current_time;
@@ -210,16 +221,15 @@ struct VideoPlayer {
         
         double target_time = play_start_position + (glfwGetTime() - play_start_time);
         
-        if (target_time >= duration) {
-            seek(0.0);
+        if (target_time >= trim_end) {
+            seek(trim_start);
             pause();
             return;
         }
         
-        // Decode frames to catch up to target time
         while (current_time < target_time - 0.5 / framerate) {
             if (!decode_frame()) {
-                seek(0.0);
+                seek(trim_start);
                 pause();
                 return;
             }
@@ -233,7 +243,128 @@ struct VideoPlayer {
         std::snprintf(buf, sizeof(buf), "%d:%02d", minutes, seconds);
         return buf;
     }
+    
+    double trimmed_duration() const {
+        return trim_end - trim_start;
+    }
 };
+
+bool export_video(const std::string& input, const std::string& output, double start, double end, std::atomic<bool>& exporting, std::atomic<float>& progress) {
+    AVFormatContext* in_ctx = nullptr;
+    AVFormatContext* out_ctx = nullptr;
+    
+    if (avformat_open_input(&in_ctx, input.c_str(), nullptr, nullptr) < 0) {
+        exporting = false;
+        return false;
+    }
+    
+    if (avformat_find_stream_info(in_ctx, nullptr) < 0) {
+        avformat_close_input(&in_ctx);
+        exporting = false;
+        return false;
+    }
+    
+    if (avformat_alloc_output_context2(&out_ctx, nullptr, nullptr, output.c_str()) < 0) {
+        avformat_close_input(&in_ctx);
+        exporting = false;
+        return false;
+    }
+    
+    int* stream_mapping = (int*)av_malloc(in_ctx->nb_streams * sizeof(int));
+    int stream_count = 0;
+    
+    for (unsigned i = 0; i < in_ctx->nb_streams; i++) {
+        AVStream* in_stream = in_ctx->streams[i];
+        AVCodecParameters* codecpar = in_stream->codecpar;
+        
+        if (codecpar->codec_type != AVMEDIA_TYPE_VIDEO &&
+            codecpar->codec_type != AVMEDIA_TYPE_AUDIO &&
+            codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
+            stream_mapping[i] = -1;
+            continue;
+        }
+        
+        stream_mapping[i] = stream_count++;
+        
+        AVStream* out_stream = avformat_new_stream(out_ctx, nullptr);
+        avcodec_parameters_copy(out_stream->codecpar, codecpar);
+        out_stream->codecpar->codec_tag = 0;
+    }
+    
+    if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) {
+        if (avio_open(&out_ctx->pb, output.c_str(), AVIO_FLAG_WRITE) < 0) {
+            av_free(stream_mapping);
+            avformat_free_context(out_ctx);
+            avformat_close_input(&in_ctx);
+            exporting = false;
+            return false;
+        }
+    }
+    
+    int64_t start_ts = (int64_t)(start * AV_TIME_BASE);
+    av_seek_frame(in_ctx, -1, start_ts, AVSEEK_FLAG_BACKWARD);
+    
+    if (avformat_write_header(out_ctx, nullptr) < 0) {
+        if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) avio_closep(&out_ctx->pb);
+        av_free(stream_mapping);
+        avformat_free_context(out_ctx);
+        avformat_close_input(&in_ctx);
+        exporting = false;
+        return false;
+    }
+    
+    AVPacket* pkt = av_packet_alloc();
+    double duration = end - start;
+    
+    while (av_read_frame(in_ctx, pkt) >= 0 && exporting) {
+        if (stream_mapping[pkt->stream_index] < 0) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        
+        AVStream* in_stream = in_ctx->streams[pkt->stream_index];
+        double pkt_time = pkt->pts * av_q2d(in_stream->time_base);
+        
+        if (pkt_time < start) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        
+        if (pkt_time > end) {
+            av_packet_unref(pkt);
+            break;
+        }
+        
+        progress = (float)((pkt_time - start) / duration);
+        
+        AVStream* out_stream = out_ctx->streams[stream_mapping[pkt->stream_index]];
+        
+        pkt->pts = av_rescale_q_rnd(pkt->pts - (int64_t)(start / av_q2d(in_stream->time_base)),
+                                     in_stream->time_base, out_stream->time_base,
+                                     (AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+        pkt->dts = av_rescale_q_rnd(pkt->dts - (int64_t)(start / av_q2d(in_stream->time_base)),
+                                     in_stream->time_base, out_stream->time_base,
+                                     (AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+        pkt->duration = av_rescale_q(pkt->duration, in_stream->time_base, out_stream->time_base);
+        pkt->stream_index = stream_mapping[pkt->stream_index];
+        pkt->pos = -1;
+        
+        av_interleaved_write_frame(out_ctx, pkt);
+        av_packet_unref(pkt);
+    }
+    
+    av_write_trailer(out_ctx);
+    
+    av_packet_free(&pkt);
+    if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) avio_closep(&out_ctx->pb);
+    av_free(stream_mapping);
+    avformat_free_context(out_ctx);
+    avformat_close_input(&in_ctx);
+    
+    progress = 1.0f;
+    exporting = false;
+    return true;
+}
 
 fs::path get_config_dir() {
     const char* home = std::getenv("HOME");
@@ -408,6 +539,74 @@ void render_window(WindowData& data, auto ui_func) {
     glfwSwapBuffers(data.window);
 }
 
+bool TrimTimeline(const char* label, float* current, float* trim_start, float* trim_end, float duration, const ImVec2& size) {
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    
+    ImVec2 bb_min = pos;
+    ImVec2 bb_max = ImVec2(pos.x + size.x, pos.y + size.y);
+    
+    // Background
+    draw_list->AddRectFilled(bb_min, bb_max, IM_COL32(40, 40, 45, 255), 4.0f);
+    
+    // Trimmed region
+    float start_x = bb_min.x + (*trim_start / duration) * size.x;
+    float end_x = bb_min.x + (*trim_end / duration) * size.x;
+    draw_list->AddRectFilled(ImVec2(start_x, bb_min.y), ImVec2(end_x, bb_max.y), IM_COL32(70, 130, 180, 200), 4.0f);
+    
+    // Current position
+    float curr_x = bb_min.x + (*current / duration) * size.x;
+    draw_list->AddLine(ImVec2(curr_x, bb_min.y), ImVec2(curr_x, bb_max.y), IM_COL32(255, 255, 255, 255), 2.0f);
+    
+    // Trim handles
+    float handle_w = 10.0f;
+    ImVec2 lh_min(start_x - handle_w/2, bb_min.y);
+    ImVec2 lh_max(start_x + handle_w/2, bb_max.y);
+    ImVec2 rh_min(end_x - handle_w/2, bb_min.y);
+    ImVec2 rh_max(end_x + handle_w/2, bb_max.y);
+    
+    draw_list->AddRectFilled(lh_min, lh_max, IM_COL32(255, 200, 50, 255), 2.0f);
+    draw_list->AddRectFilled(rh_min, rh_max, IM_COL32(255, 200, 50, 255), 2.0f);
+    
+    // Invisible button for interaction
+    ImGui::InvisibleButton(label, size);
+    
+    bool changed = false;
+    ImVec2 mouse = ImGui::GetIO().MousePos;
+    
+    auto in_rect = [](ImVec2 p, ImVec2 min, ImVec2 max) {
+        return p.x >= min.x && p.x <= max.x && p.y >= min.y && p.y <= max.y;
+    };
+    
+    static int dragging = 0; // 0=none, 1=left, 2=right, 3=playhead
+    
+    if (ImGui::IsItemClicked(0)) {
+        if (in_rect(mouse, lh_min, lh_max)) dragging = 1;
+        else if (in_rect(mouse, rh_min, rh_max)) dragging = 2;
+        else dragging = 3;
+    }
+    
+    if (ImGui::IsMouseReleased(0)) dragging = 0;
+    
+    if (dragging && ImGui::IsMouseDown(0)) {
+        float rel_x = (mouse.x - bb_min.x) / size.x;
+        float time = std::clamp(rel_x * duration, 0.0f, duration);
+        
+        if (dragging == 1) {
+            *trim_start = std::min(time, *trim_end - 0.1f);
+            changed = true;
+        } else if (dragging == 2) {
+            *trim_end = std::max(time, *trim_start + 0.1f);
+            changed = true;
+        } else if (dragging == 3) {
+            *current = std::clamp(time, *trim_start, *trim_end);
+            changed = true;
+        }
+    }
+    
+    return changed;
+}
+
 int main() {
     if (!glfwInit()) {
         std::fprintf(stderr, "Failed to initialize GLFW\n");
@@ -426,6 +625,10 @@ int main() {
     std::string selected_file;
     VideoPlayer player;
     std::string pending_load;
+    
+    std::atomic<bool> exporting{false};
+    std::atomic<float> export_progress{0.0f};
+    std::thread export_thread;
 
     while (!glfwWindowShouldClose(main_window.window)) {
         glfwPollEvents();
@@ -434,7 +637,6 @@ int main() {
             destroy_window(browser_window);
         }
 
-        // Load video after browser closes
         if (!pending_load.empty()) {
             glfwMakeContextCurrent(main_window.window);
             if (player.open(pending_load)) {
@@ -444,7 +646,6 @@ int main() {
             pending_load.clear();
         }
 
-        // Update video playback
         glfwMakeContextCurrent(main_window.window);
         player.update();
 
@@ -459,9 +660,10 @@ int main() {
                     ImGuiWindowFlags_NoTitleBar |
                     ImGuiWindowFlags_NoResize |
                     ImGuiWindowFlags_NoMove |
-                    ImGuiWindowFlags_NoBackground);
+                    ImGuiWindowFlags_NoBackground |
+                    ImGuiWindowFlags_NoScrollbar);
                 
-                float controls_height = 100;
+                float controls_height = 130;
                 float scale_x = viewport->Size.x / player.width;
                 float scale_y = (viewport->Size.y - controls_height) / player.height;
                 float scale = std::min(scale_x, scale_y);
@@ -477,31 +679,57 @@ int main() {
                 // Controls
                 ImGui::SetCursorPos(ImVec2(10, viewport->Size.y - controls_height + 5));
                 
-                // Play/Pause button
                 if (ImGui::Button(player.playing ? "Pause" : "Play", ImVec2(80, 30))) {
                     player.toggle_play();
                 }
                 
                 ImGui::SameLine();
+                ImGui::Text("%s / %s (trim: %s)", 
+                    player.format_time(player.current_time).c_str(),
+                    player.format_time(player.duration).c_str(),
+                    player.format_time(player.trimmed_duration()).c_str());
                 
-                // Timeline slider
-                ImGui::SetNextItemWidth(viewport->Size.x - 320);
-                float time_f = (float)player.current_time;
-                if (ImGui::SliderFloat("##timeline", &time_f, 0.0f, (float)player.duration, "")) {
-                    if (ImGui::IsItemActive()) {
+                // Timeline with trim handles
+                ImGui::SetCursorPos(ImVec2(10, viewport->Size.y - controls_height + 45));
+                float curr = (float)player.current_time;
+                float ts = (float)player.trim_start;
+                float te = (float)player.trim_end;
+                
+                if (TrimTimeline("##trim_timeline", &curr, &ts, &te, (float)player.duration, 
+                                 ImVec2(viewport->Size.x - 20, 30))) {
+                    player.trim_start = ts;
+                    player.trim_end = te;
+                    if (curr != (float)player.current_time) {
                         player.pause();
-                        player.seek(time_f);
+                        player.seek(curr);
+                    }
+                }
+                
+                // Bottom row
+                ImGui::SetCursorPos(ImVec2(10, viewport->Size.y - 40));
+                ImGui::Text("File: %s", path_display_name(fs::path(selected_file)).c_str());
+                
+                ImGui::SameLine(viewport->Size.x - 240);
+                
+                if (exporting) {
+                    ImGui::ProgressBar(export_progress, ImVec2(120, 0), "Exporting...");
+                } else {
+                    if (ImGui::Button("Export", ImVec2(80, 0))) {
+                        fs::path src(selected_file);
+                        std::string out_name = src.stem().string() + "_trimmed" + src.extension().string();
+                        std::string out_path = (src.parent_path() / out_name).string();
+                        
+                        exporting = true;
+                        export_progress = 0.0f;
+                        
+                        if (export_thread.joinable()) export_thread.join();
+                        export_thread = std::thread([&, out_path]() {
+                            export_video(player.source_path, out_path, player.trim_start, player.trim_end, exporting, export_progress);
+                        });
                     }
                 }
                 
                 ImGui::SameLine();
-                ImGui::Text("%s / %s", player.format_time(player.current_time).c_str(), 
-                           player.format_time(player.duration).c_str());
-                
-                // Second row
-                ImGui::SetCursorPos(ImVec2(10, viewport->Size.y - 40));
-                ImGui::Text("File: %s", selected_file.c_str());
-                ImGui::SameLine(viewport->Size.x - 120);
                 if (ImGui::Button("Open File...", ImVec2(110, 0))) {
                     if (!browser_window.window) open_browser = true;
                 }
@@ -624,6 +852,11 @@ int main() {
         }
     }
 
+    if (export_thread.joinable()) {
+        exporting = false;
+        export_thread.join();
+    }
+    
     player.close();
     if (browser_window.window) {
         destroy_window(browser_window);
