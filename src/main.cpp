@@ -10,9 +10,131 @@
 #include <filesystem>
 #include <algorithm>
 
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
+#include <libavutil/imgutils.h>
+}
+
 #include "embedded_font.h"
 
 namespace fs = std::filesystem;
+
+struct VideoFrame {
+    GLuint texture_id = 0;
+    int width = 0;
+    int height = 0;
+    
+    void destroy() {
+        if (texture_id) {
+            glDeleteTextures(1, &texture_id);
+            texture_id = 0;
+        }
+        width = height = 0;
+    }
+};
+
+VideoFrame load_first_frame(const std::string& path) {
+    VideoFrame result;
+    
+    AVFormatContext* format_ctx = nullptr;
+    if (avformat_open_input(&format_ctx, path.c_str(), nullptr, nullptr) < 0) {
+        std::fprintf(stderr, "Could not open file: %s\n", path.c_str());
+        return result;
+    }
+    
+    if (avformat_find_stream_info(format_ctx, nullptr) < 0) {
+        std::fprintf(stderr, "Could not find stream info\n");
+        avformat_close_input(&format_ctx);
+        return result;
+    }
+    
+    int video_stream = -1;
+    for (unsigned i = 0; i < format_ctx->nb_streams; i++) {
+        if (format_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            video_stream = i;
+            break;
+        }
+    }
+    
+    if (video_stream < 0) {
+        std::fprintf(stderr, "No video stream found\n");
+        avformat_close_input(&format_ctx);
+        return result;
+    }
+    
+    AVCodecParameters* codecpar = format_ctx->streams[video_stream]->codecpar;
+    const AVCodec* codec = avcodec_find_decoder(codecpar->codec_id);
+    if (!codec) {
+        std::fprintf(stderr, "Codec not found\n");
+        avformat_close_input(&format_ctx);
+        return result;
+    }
+    
+    AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
+    avcodec_parameters_to_context(codec_ctx, codecpar);
+    
+    if (avcodec_open2(codec_ctx, codec, nullptr) < 0) {
+        std::fprintf(stderr, "Could not open codec\n");
+        avcodec_free_context(&codec_ctx);
+        avformat_close_input(&format_ctx);
+        return result;
+    }
+    
+    AVFrame* frame = av_frame_alloc();
+    AVFrame* frame_rgb = av_frame_alloc();
+    AVPacket* packet = av_packet_alloc();
+    
+    int width = codec_ctx->width;
+    int height = codec_ctx->height;
+    
+    uint8_t* buffer = (uint8_t*)av_malloc(av_image_get_buffer_size(AV_PIX_FMT_RGB24, width, height, 1));
+    av_image_fill_arrays(frame_rgb->data, frame_rgb->linesize, buffer, AV_PIX_FMT_RGB24, width, height, 1);
+    
+    SwsContext* sws_ctx = sws_getContext(
+        width, height, codec_ctx->pix_fmt,
+        width, height, AV_PIX_FMT_RGB24,
+        SWS_BILINEAR, nullptr, nullptr, nullptr
+    );
+    
+    bool got_frame = false;
+    while (av_read_frame(format_ctx, packet) >= 0 && !got_frame) {
+        if (packet->stream_index == video_stream) {
+            if (avcodec_send_packet(codec_ctx, packet) >= 0) {
+                if (avcodec_receive_frame(codec_ctx, frame) >= 0) {
+                    sws_scale(sws_ctx, frame->data, frame->linesize, 0, height,
+                              frame_rgb->data, frame_rgb->linesize);
+                    got_frame = true;
+                }
+            }
+        }
+        av_packet_unref(packet);
+    }
+    
+    if (got_frame) {
+        glGenTextures(1, &result.texture_id);
+        glBindTexture(GL_TEXTURE_2D, result.texture_id);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, frame_rgb->linesize[0] / 3);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, frame_rgb->data[0]);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        
+        result.width = width;
+        result.height = height;
+    }
+    
+    av_free(buffer);
+    sws_freeContext(sws_ctx);
+    av_packet_free(&packet);
+    av_frame_free(&frame_rgb);
+    av_frame_free(&frame);
+    avcodec_free_context(&codec_ctx);
+    avformat_close_input(&format_ctx);
+    
+    return result;
+}
 
 fs::path get_config_dir() {
     const char* home = std::getenv("HOME");
@@ -203,6 +325,8 @@ int main() {
     WindowData browser_window{};
     FileBrowser browser;
     std::string selected_file;
+    VideoFrame video_frame;
+    std::string pending_load;
 
     while (!glfwWindowShouldClose(main_window.window)) {
         glfwPollEvents();
@@ -211,33 +335,72 @@ int main() {
             destroy_window(browser_window);
         }
 
+        // Load video after browser closes (need main window's GL context)
+        if (!pending_load.empty()) {
+            glfwMakeContextCurrent(main_window.window);
+            video_frame.destroy();
+            video_frame = load_first_frame(pending_load);
+            if (video_frame.texture_id) {
+                std::printf("Loaded video: %dx%d\n", video_frame.width, video_frame.height);
+            }
+            pending_load.clear();
+        }
+
         bool open_browser = false;
         render_window(main_window, [&]() {
             ImGuiViewport* viewport = ImGui::GetMainViewport();
-            ImVec2 center = viewport->GetCenter();
-
-            ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-            ImGui::SetNextWindowSize(ImVec2(0, 0));
-
-            ImGui::Begin("##MainWindow", nullptr, 
-                ImGuiWindowFlags_NoTitleBar | 
-                ImGuiWindowFlags_NoResize | 
-                ImGuiWindowFlags_NoMove |
-                ImGuiWindowFlags_NoBackground |
-                ImGuiWindowFlags_AlwaysAutoResize);
-
-            if (ImGui::Button("Open File...", ImVec2(200, 60))) {
-                if (!browser_window.window) {
-                    open_browser = true;
+            
+            if (video_frame.texture_id) {
+                // Show video frame centered, scaled to fit
+                ImGui::SetNextWindowPos(ImVec2(0, 0));
+                ImGui::SetNextWindowSize(viewport->Size);
+                ImGui::Begin("##VideoView", nullptr,
+                    ImGuiWindowFlags_NoTitleBar |
+                    ImGuiWindowFlags_NoResize |
+                    ImGuiWindowFlags_NoMove |
+                    ImGuiWindowFlags_NoBackground);
+                
+                float scale_x = viewport->Size.x / video_frame.width;
+                float scale_y = (viewport->Size.y - 80) / video_frame.height;
+                float scale = std::min(scale_x, scale_y);
+                
+                float img_w = video_frame.width * scale;
+                float img_h = video_frame.height * scale;
+                float img_x = (viewport->Size.x - img_w) / 2;
+                float img_y = (viewport->Size.y - 80 - img_h) / 2;
+                
+                ImGui::SetCursorPos(ImVec2(img_x, img_y));
+                ImGui::Image((ImTextureID)(intptr_t)video_frame.texture_id, ImVec2(img_w, img_h));
+                
+                // Controls at bottom
+                ImGui::SetCursorPos(ImVec2(0, viewport->Size.y - 70));
+                ImGui::Separator();
+                ImGui::Text("File: %s", selected_file.c_str());
+                ImGui::SameLine(viewport->Size.x - 120);
+                if (ImGui::Button("Open File...", ImVec2(110, 0))) {
+                    if (!browser_window.window) open_browser = true;
                 }
-            }
+                
+                ImGui::End();
+            } else {
+                // No video loaded - show centered button
+                ImVec2 center = viewport->GetCenter();
+                ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+                ImGui::SetNextWindowSize(ImVec2(0, 0));
 
-            if (!selected_file.empty()) {
-                ImGui::Spacing();
-                ImGui::Text("Selected: %s", selected_file.c_str());
-            }
+                ImGui::Begin("##MainWindow", nullptr, 
+                    ImGuiWindowFlags_NoTitleBar | 
+                    ImGuiWindowFlags_NoResize | 
+                    ImGuiWindowFlags_NoMove |
+                    ImGuiWindowFlags_NoBackground |
+                    ImGuiWindowFlags_AlwaysAutoResize);
 
-            ImGui::End();
+                if (ImGui::Button("Open File...", ImVec2(200, 60))) {
+                    if (!browser_window.window) open_browser = true;
+                }
+
+                ImGui::End();
+            }
         });
 
         if (open_browser) {
@@ -295,6 +458,7 @@ int main() {
                                         browser.navigate_to(entry.path());
                                     } else {
                                         selected_file = entry.path().string();
+                                        pending_load = selected_file;
                                         should_close = true;
                                     }
                                 } catch (...) {}
@@ -316,6 +480,7 @@ int main() {
                 if (ImGui::Button("Open", ImVec2(100, 0))) {
                     try {
                         selected_file = browser.entries[browser.selected_index].path().string();
+                        pending_load = selected_file;
                     } catch (...) {}
                     should_close = true;
                 }
@@ -335,6 +500,7 @@ int main() {
         }
     }
 
+    video_frame.destroy();
     if (browser_window.window) {
         destroy_window(browser_window);
     }

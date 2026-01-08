@@ -8,6 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Dependencies
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GLFW REQUIRED glfw3)
+pkg_check_modules(LIBAV REQUIRED libavformat libavcodec libswscale libavutil)
 find_package(OpenGL REQUIRED)
 
 # ImGui
@@ -48,5 +49,5 @@ add_custom_target(embedded_font DEPENDS ${FONT_OUTPUT})
 # Main executable
 add_executable(vibecut src/main.cpp ${FONT_OUTPUT})
 add_dependencies(vibecut embedded_font)
-target_include_directories(vibecut PRIVATE ${GLFW_INCLUDE_DIRS} ${CMAKE_BINARY_DIR}/generated)
-target_link_libraries(vibecut PRIVATE imgui ${GLFW_LIBRARIES} OpenGL::GL)
+target_include_directories(vibecut PRIVATE ${GLFW_INCLUDE_DIRS} ${LIBAV_INCLUDE_DIRS} ${CMAKE_BINARY_DIR}/generated)
+target_link_libraries(vibecut PRIVATE imgui ${GLFW_LIBRARIES} ${LIBAV_LIBRARIES} OpenGL::GL)
