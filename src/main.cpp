@@ -374,8 +374,12 @@ bool export_clips(const std::string& input, const std::string& output, const std
     int out_video_idx = -1;
     int out_audio_idx = -1;
     
-    // Open input
-    if (avformat_open_input(&in_ctx, input.c_str(), nullptr, nullptr) < 0) {
+    // Open input with ignore_editlist to prevent skipping initial frames
+    AVDictionary* opts = nullptr;
+    av_dict_set(&opts, "ignore_editlist", "1", 0);
+    int ret = avformat_open_input(&in_ctx, input.c_str(), nullptr, &opts);
+    av_dict_free(&opts);
+    if (ret < 0) {
         exporting = false;
         return false;
     }
@@ -508,10 +512,16 @@ bool export_clips(const std::string& input, const std::string& output, const std
     for (const auto& clip : clips) {
         if (!exporting) break;
         
-        // Seek to before clip start
-        int64_t start_ts = (int64_t)(clip.source_start * AV_TIME_BASE);
-        avformat_seek_file(in_ctx, -1, INT64_MIN, start_ts, start_ts, 0);
+        // Seek to before clip start - use different strategy for beginning vs middle
         avcodec_flush_buffers(dec_ctx);
+        if (clip.source_start < 0.5) {
+            // For clips starting near the beginning, seek to absolute start
+            av_seek_frame(in_ctx, video_stream_idx, 0, AVSEEK_FLAG_BACKWARD);
+        } else {
+            // For other clips, seek to nearest keyframe before desired time
+            int64_t start_ts = (int64_t)(clip.source_start / av_q2d(in_video->time_base));
+            av_seek_frame(in_ctx, video_stream_idx, start_ts, AVSEEK_FLAG_BACKWARD);
+        }
         
         bool reached_clip = false;
         
