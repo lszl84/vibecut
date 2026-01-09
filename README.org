@@ -60,7 +60,7 @@ CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
 :END:
 ** Vibe coding
 :LOGBOOK:
-CLOCK: [2026-01-09 Fri 17:45]
+CLOCK: [2026-01-09 Fri 17:45]--[2026-01-09 Fri 18:40] =>  0:55
 CLOCK: [2026-01-08 Thu 19:40]--[2026-01-08 Thu 20:14] =>  0:34
 CLOCK: [2026-01-06 Tue 19:22]--[2026-01-06 Tue 20:03] =>  0:41
 CLOCK: [2026-01-04 Sun 15:19]--[2026-01-04 Sun 15:22] =>  0:03
@@ -73,19 +73,34 @@ Adding/changing code by hand, debugging, etc.
 * Time Tracking
 
 #+BEGIN: clocktable :maxlevel nil :scope file :block nil
-#+CAPTION: Clock summary at [2026-01-08 Thu 20:14]
+#+CAPTION: Clock summary at [2026-01-09 Fri 18:44]
 | Headline          | Time |      |
 |-------------------+------+------|
-| *Total time*        | *1:31* |      |
+| *Total time*        | *2:26* |      |
 |-------------------+------+------|
-| Tasks             | 1:31 |      |
+| Tasks             | 2:26 |      |
 | \_  Initial Setup |      | 0:13 |
-| \_  Vibe coding   |      | 1:18 |
+| \_  Vibe coding   |      | 2:13 |
 #+END:
 
 * Devlog
 
 Live Streams: https://www.youtube.com/@lukeatdevmindscape/streams
+
+** Day 4
+Claude managed to fix the bug after a few back-and-forth prompts.
+Think about this: with absolutely no visual feedback, no ability to
+play with the UI and see the effect of the changes, it managed to find
+and solve the problem...
+
+The process was very tedious, though: basically 30mins of me testing
+this stuff and telling the AI it did not work. Are the QA Engineers of
+today the future AI Orchestrators?
+
+The next feature to implement was the ability to split the timeline
+into multiple clips. The AI understood the feature description
+perfectly. There are still bugs that we are going to tackle tomorrow,
+but this is quite mind-blowing, to be honest.
 
 ** Day 3
 Claude integrated FFmpeg C API into the program, created an ImGui
