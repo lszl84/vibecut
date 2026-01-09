@@ -277,6 +277,21 @@ struct VideoPlayer {
     
     void play() {
         if (!loaded || clips.empty()) return;
+        
+        // Find which clip we're starting in
+        active_clip = clip_at_source_time(current_time);
+        if (active_clip < 0) {
+            // Not in any clip - find the next clip after current position
+            active_clip = 0;
+            for (int i = 0; i < (int)clips.size(); i++) {
+                if (clips[i].source_start >= current_time) {
+                    active_clip = i;
+                    seek(clips[i].source_start);
+                    break;
+                }
+            }
+        }
+        
         playing = true;
         play_start_time = glfwGetTime();
         play_start_position = current_time;
@@ -293,34 +308,38 @@ struct VideoPlayer {
     
     void update() {
         if (!loaded || !playing || clips.empty()) return;
+        if (active_clip < 0 || active_clip >= (int)clips.size()) active_clip = 0;
         
-        double target_time = play_start_position + (glfwGetTime() - play_start_time);
-        
-        // Find current clip
-        int clip_idx = clip_at_source_time(current_time);
-        if (clip_idx < 0) clip_idx = 0;
+        double elapsed = glfwGetTime() - play_start_time;
+        double target_time = play_start_position + elapsed;
         
         // Check if we've reached end of current clip
-        if (target_time >= clips[clip_idx].source_end) {
+        const Clip& clip = clips[active_clip];
+        if (current_time >= clip.source_end - 0.01 || target_time >= clip.source_end) {
             // Move to next clip or stop
-            if (clip_idx + 1 < (int)clips.size()) {
-                seek(clips[clip_idx + 1].source_start);
+            if (active_clip + 1 < (int)clips.size()) {
+                active_clip++;
+                seek(clips[active_clip].source_start);
                 play_start_time = glfwGetTime();
-                play_start_position = current_time;
+                play_start_position = clips[active_clip].source_start;
                 return;
             } else {
-                // End of all clips
+                // End of all clips - go back to start
+                active_clip = 0;
                 seek(clips[0].source_start);
                 pause();
                 return;
             }
         }
         
+        // Decode frames to catch up to target time
         while (current_time < target_time - 0.5 / framerate) {
             if (!decode_frame()) {
                 pause();
                 return;
             }
+            // Safety: don't decode past clip end
+            if (current_time >= clip.source_end) break;
         }
     }
     
@@ -337,7 +356,7 @@ struct VideoPlayer {
     }
 };
 
-// Export multiple clips concatenated together
+// Export multiple clips with re-encoding for clean transitions
 bool export_clips(const std::string& input, const std::string& output, const std::vector<Clip>& clips, std::atomic<bool>& exporting, std::atomic<float>& progress) {
     if (clips.empty()) {
         exporting = false;
@@ -346,7 +365,16 @@ bool export_clips(const std::string& input, const std::string& output, const std
     
     AVFormatContext* in_ctx = nullptr;
     AVFormatContext* out_ctx = nullptr;
+    AVCodecContext* dec_ctx = nullptr;
+    AVCodecContext* enc_ctx = nullptr;
+    SwsContext* sws_ctx = nullptr;
     
+    int video_stream_idx = -1;
+    int audio_stream_idx = -1;
+    int out_video_idx = -1;
+    int out_audio_idx = -1;
+    
+    // Open input
     if (avformat_open_input(&in_ctx, input.c_str(), nullptr, nullptr) < 0) {
         exporting = false;
         return false;
@@ -358,36 +386,88 @@ bool export_clips(const std::string& input, const std::string& output, const std
         return false;
     }
     
-    if (avformat_alloc_output_context2(&out_ctx, nullptr, nullptr, output.c_str()) < 0) {
+    // Find video and audio streams
+    for (unsigned i = 0; i < in_ctx->nb_streams; i++) {
+        if (in_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && video_stream_idx < 0) {
+            video_stream_idx = i;
+        } else if (in_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && audio_stream_idx < 0) {
+            audio_stream_idx = i;
+        }
+    }
+    
+    if (video_stream_idx < 0) {
         avformat_close_input(&in_ctx);
         exporting = false;
         return false;
     }
     
-    int* stream_mapping = (int*)av_malloc(in_ctx->nb_streams * sizeof(int));
-    int stream_count = 0;
+    // Set up video decoder
+    AVStream* in_video = in_ctx->streams[video_stream_idx];
+    const AVCodec* decoder = avcodec_find_decoder(in_video->codecpar->codec_id);
+    dec_ctx = avcodec_alloc_context3(decoder);
+    avcodec_parameters_to_context(dec_ctx, in_video->codecpar);
+    avcodec_open2(dec_ctx, decoder, nullptr);
     
-    for (unsigned i = 0; i < in_ctx->nb_streams; i++) {
-        AVStream* in_stream = in_ctx->streams[i];
-        AVCodecParameters* codecpar = in_stream->codecpar;
-        
-        if (codecpar->codec_type != AVMEDIA_TYPE_VIDEO &&
-            codecpar->codec_type != AVMEDIA_TYPE_AUDIO &&
-            codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
-            stream_mapping[i] = -1;
-            continue;
-        }
-        
-        stream_mapping[i] = stream_count++;
-        
-        AVStream* out_stream = avformat_new_stream(out_ctx, nullptr);
-        avcodec_parameters_copy(out_stream->codecpar, codecpar);
-        out_stream->codecpar->codec_tag = 0;
+    // Create output context
+    if (avformat_alloc_output_context2(&out_ctx, nullptr, nullptr, output.c_str()) < 0) {
+        avcodec_free_context(&dec_ctx);
+        avformat_close_input(&in_ctx);
+        exporting = false;
+        return false;
     }
     
+    // Set up video encoder (H.264)
+    const AVCodec* encoder = avcodec_find_encoder(AV_CODEC_ID_H264);
+    if (!encoder) encoder = avcodec_find_encoder(in_video->codecpar->codec_id);
+    
+    AVStream* out_video = avformat_new_stream(out_ctx, nullptr);
+    out_video_idx = out_video->index;
+    
+    enc_ctx = avcodec_alloc_context3(encoder);
+    enc_ctx->width = dec_ctx->width;
+    enc_ctx->height = dec_ctx->height;
+    enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    enc_ctx->time_base = AVRational{1, 30};  // 30 fps output
+    enc_ctx->framerate = AVRational{30, 1};
+    enc_ctx->bit_rate = 4000000;  // 4 Mbps
+    enc_ctx->gop_size = 30;
+    enc_ctx->max_b_frames = 2;
+    
+    if (out_ctx->oformat->flags & AVFMT_GLOBALHEADER) {
+        enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+    
+    AVDictionary* enc_opts = nullptr;
+    av_dict_set(&enc_opts, "preset", "fast", 0);
+    avcodec_open2(enc_ctx, encoder, &enc_opts);
+    av_dict_free(&enc_opts);
+    
+    avcodec_parameters_from_context(out_video->codecpar, enc_ctx);
+    out_video->time_base = enc_ctx->time_base;
+    
+    // Copy audio stream (stream copy for audio is fine)
+    if (audio_stream_idx >= 0) {
+        AVStream* in_audio = in_ctx->streams[audio_stream_idx];
+        AVStream* out_audio = avformat_new_stream(out_ctx, nullptr);
+        out_audio_idx = out_audio->index;
+        avcodec_parameters_copy(out_audio->codecpar, in_audio->codecpar);
+        out_audio->codecpar->codec_tag = 0;
+        out_audio->time_base = in_audio->time_base;
+    }
+    
+    // Set up pixel format converter if needed
+    sws_ctx = sws_getContext(
+        dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
+        enc_ctx->width, enc_ctx->height, enc_ctx->pix_fmt,
+        SWS_BILINEAR, nullptr, nullptr, nullptr
+    );
+    
+    // Open output file
     if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) {
         if (avio_open(&out_ctx->pb, output.c_str(), AVIO_FLAG_WRITE) < 0) {
-            av_free(stream_mapping);
+            sws_freeContext(sws_ctx);
+            avcodec_free_context(&enc_ctx);
+            avcodec_free_context(&dec_ctx);
             avformat_free_context(out_ctx);
             avformat_close_input(&in_ctx);
             exporting = false;
@@ -397,63 +477,101 @@ bool export_clips(const std::string& input, const std::string& output, const std
     
     if (avformat_write_header(out_ctx, nullptr) < 0) {
         if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) avio_closep(&out_ctx->pb);
-        av_free(stream_mapping);
+        sws_freeContext(sws_ctx);
+        avcodec_free_context(&enc_ctx);
+        avcodec_free_context(&dec_ctx);
         avformat_free_context(out_ctx);
         avformat_close_input(&in_ctx);
         exporting = false;
         return false;
     }
     
-    // Calculate total duration for progress
+    // Calculate total duration
     double total_duration = 0.0;
     for (const auto& clip : clips) total_duration += clip.duration();
     
     AVPacket* pkt = av_packet_alloc();
-    double time_offset = 0.0;  // Cumulative offset for output timestamps
+    AVPacket* enc_pkt = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    AVFrame* enc_frame = av_frame_alloc();
+    
+    enc_frame->format = enc_ctx->pix_fmt;
+    enc_frame->width = enc_ctx->width;
+    enc_frame->height = enc_ctx->height;
+    av_frame_get_buffer(enc_frame, 0);
+    
+    double time_offset = 0.0;
+    int64_t video_pts = 0;
+    int64_t audio_pts_offset = 0;
     double processed_time = 0.0;
     
     for (const auto& clip : clips) {
         if (!exporting) break;
         
-        // Seek to clip start
+        // Seek to before clip start
         int64_t start_ts = (int64_t)(clip.source_start * AV_TIME_BASE);
-        av_seek_frame(in_ctx, -1, start_ts, AVSEEK_FLAG_BACKWARD);
+        avformat_seek_file(in_ctx, -1, INT64_MIN, start_ts, start_ts, 0);
+        avcodec_flush_buffers(dec_ctx);
         
-        // Process packets for this clip
+        bool reached_clip = false;
+        
         while (av_read_frame(in_ctx, pkt) >= 0 && exporting) {
-            if (stream_mapping[pkt->stream_index] < 0) {
-                av_packet_unref(pkt);
-                continue;
-            }
-            
             AVStream* in_stream = in_ctx->streams[pkt->stream_index];
             double pkt_time = pkt->pts * av_q2d(in_stream->time_base);
             
-            if (pkt_time < clip.source_start) {
-                av_packet_unref(pkt);
-                continue;
+            if (pkt->stream_index == video_stream_idx) {
+                // Skip frames before clip start
+                if (pkt_time > clip.source_end) {
+                    av_packet_unref(pkt);
+                    break;
+                }
+                
+                // Decode frame
+                avcodec_send_packet(dec_ctx, pkt);
+                while (avcodec_receive_frame(dec_ctx, frame) >= 0) {
+                    double frame_time = frame->pts * av_q2d(in_stream->time_base);
+                    
+                    if (frame_time < clip.source_start) continue;
+                    if (frame_time > clip.source_end) break;
+                    
+                    reached_clip = true;
+                    progress = (float)((processed_time + (frame_time - clip.source_start)) / total_duration);
+                    
+                    // Convert pixel format
+                    sws_scale(sws_ctx, frame->data, frame->linesize, 0, frame->height,
+                              enc_frame->data, enc_frame->linesize);
+                    
+                    enc_frame->pts = video_pts++;
+                    
+                    // Encode frame
+                    avcodec_send_frame(enc_ctx, enc_frame);
+                    while (avcodec_receive_packet(enc_ctx, enc_pkt) >= 0) {
+                        enc_pkt->stream_index = out_video_idx;
+                        av_packet_rescale_ts(enc_pkt, enc_ctx->time_base, out_ctx->streams[out_video_idx]->time_base);
+                        av_interleaved_write_frame(out_ctx, enc_pkt);
+                        av_packet_unref(enc_pkt);
+                    }
+                }
+            } else if (pkt->stream_index == audio_stream_idx && out_audio_idx >= 0) {
+                // Stream copy audio
+                if (pkt_time < clip.source_start || pkt_time > clip.source_end) {
+                    av_packet_unref(pkt);
+                    continue;
+                }
+                
+                AVStream* out_audio = out_ctx->streams[out_audio_idx];
+                AVStream* in_audio = in_ctx->streams[audio_stream_idx];
+                
+                double adjusted_time = (pkt_time - clip.source_start) + time_offset;
+                pkt->pts = (int64_t)(adjusted_time / av_q2d(out_audio->time_base));
+                pkt->dts = pkt->pts;
+                pkt->duration = av_rescale_q(pkt->duration, in_audio->time_base, out_audio->time_base);
+                pkt->stream_index = out_audio_idx;
+                pkt->pos = -1;
+                
+                av_interleaved_write_frame(out_ctx, pkt);
             }
             
-            if (pkt_time > clip.source_end) {
-                av_packet_unref(pkt);
-                break;
-            }
-            
-            progress = (float)((processed_time + (pkt_time - clip.source_start)) / total_duration);
-            
-            AVStream* out_stream = out_ctx->streams[stream_mapping[pkt->stream_index]];
-            
-            // Adjust timestamps: subtract clip start, add cumulative offset
-            double adjusted_time = (pkt_time - clip.source_start) + time_offset;
-            int64_t new_pts = (int64_t)(adjusted_time / av_q2d(out_stream->time_base));
-            
-            pkt->pts = new_pts;
-            pkt->dts = new_pts;  // For stream copy, dts = pts usually works
-            pkt->duration = av_rescale_q(pkt->duration, in_stream->time_base, out_stream->time_base);
-            pkt->stream_index = stream_mapping[pkt->stream_index];
-            pkt->pos = -1;
-            
-            av_interleaved_write_frame(out_ctx, pkt);
             av_packet_unref(pkt);
         }
         
@@ -461,11 +579,26 @@ bool export_clips(const std::string& input, const std::string& output, const std
         time_offset += clip.duration();
     }
     
+    // Flush encoder
+    avcodec_send_frame(enc_ctx, nullptr);
+    while (avcodec_receive_packet(enc_ctx, enc_pkt) >= 0) {
+        enc_pkt->stream_index = out_video_idx;
+        av_packet_rescale_ts(enc_pkt, enc_ctx->time_base, out_ctx->streams[out_video_idx]->time_base);
+        av_interleaved_write_frame(out_ctx, enc_pkt);
+        av_packet_unref(enc_pkt);
+    }
+    
     av_write_trailer(out_ctx);
     
+    // Cleanup
+    av_frame_free(&enc_frame);
+    av_frame_free(&frame);
+    av_packet_free(&enc_pkt);
     av_packet_free(&pkt);
+    sws_freeContext(sws_ctx);
+    avcodec_free_context(&enc_ctx);
+    avcodec_free_context(&dec_ctx);
     if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) avio_closep(&out_ctx->pb);
-    av_free(stream_mapping);
     avformat_free_context(out_ctx);
     avformat_close_input(&in_ctx);
     
