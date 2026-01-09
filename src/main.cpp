@@ -39,6 +39,7 @@ struct VideoPlayer {
     double framerate = 30.0;
     double time_base = 0.0;
     int64_t stream_start_pts = 0;  // Stream's start timestamp offset
+    double first_keyframe_time = 0.0;  // Time of first keyframe (for seek threshold)
     
     GLuint texture_id = 0;
     double current_time = 0.0;
@@ -147,7 +148,10 @@ struct VideoPlayer {
         trim_start = 0.0;
         trim_end = duration;
         
-        seek(0.0);
+        // Detect first keyframe position by doing an initial decode
+        decode_frame();
+        first_keyframe_time = current_time;
+        
         return true;
     }
     
@@ -169,6 +173,7 @@ struct VideoPlayer {
         duration = 0.0;
         current_time = 0.0;
         stream_start_pts = 0;
+        first_keyframe_time = 0.0;
         source_path.clear();
     }
     
@@ -204,9 +209,9 @@ struct VideoPlayer {
         time = std::clamp(time, 0.0, duration);
         int64_t target_ts = (int64_t)(time / time_base);
         
-        // For positions near the beginning, seek from start to avoid keyframe issues
+        // For positions before the first keyframe, seek from start
         // For other positions, use fast keyframe-based seeking
-        if (time < 2.0) {
+        if (time <= first_keyframe_time + 0.1) {
             // Seek to very beginning, then decode forward
             avformat_seek_file(format_ctx, video_stream, 0, 0, target_ts, 0);
         } else {
