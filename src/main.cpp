@@ -38,6 +38,7 @@ struct VideoPlayer {
     double duration = 0.0;
     double framerate = 30.0;
     double time_base = 0.0;
+    int64_t stream_start_pts = 0;  // Stream's start timestamp offset
     
     GLuint texture_id = 0;
     double current_time = 0.0;
@@ -55,7 +56,21 @@ struct VideoPlayer {
         close();
         source_path = path;
         
-        if (avformat_open_input(&format_ctx, path.c_str(), nullptr, nullptr) < 0) {
+        // Ignore edit list to avoid seeking issues with videos that have non-keyframe start points
+        AVDictionary* opts = nullptr;
+        av_dict_set(&opts, "ignore_editlist", "1", 0);
+        
+        int ret = avformat_open_input(&format_ctx, path.c_str(), nullptr, &opts);
+        
+        // Check if the option was consumed (recognized)
+        AVDictionaryEntry* e = av_dict_get(opts, "", nullptr, AV_DICT_IGNORE_SUFFIX);
+        while (e) {
+            std::printf("[WARN] Unrecognized option: %s=%s\n", e->key, e->value);
+            e = av_dict_get(opts, "", e, AV_DICT_IGNORE_SUFFIX);
+        }
+        av_dict_free(&opts);
+        
+        if (ret < 0) {
             std::fprintf(stderr, "Could not open file: %s\n", path.c_str());
             return false;
         }
@@ -101,6 +116,7 @@ struct VideoPlayer {
         height = codec_ctx->height;
         time_base = av_q2d(stream->time_base);
         duration = format_ctx->duration / (double)AV_TIME_BASE;
+        stream_start_pts = (stream->start_time != AV_NOPTS_VALUE) ? stream->start_time : 0;
         
         if (stream->avg_frame_rate.num && stream->avg_frame_rate.den) {
             framerate = av_q2d(stream->avg_frame_rate);
@@ -152,6 +168,7 @@ struct VideoPlayer {
         width = height = 0;
         duration = 0.0;
         current_time = 0.0;
+        stream_start_pts = 0;
         source_path.clear();
     }
     
@@ -163,7 +180,8 @@ struct VideoPlayer {
                         sws_scale(sws_ctx, frame->data, frame->linesize, 0, height,
                                   frame_rgb->data, frame_rgb->linesize);
                         
-                        current_time = frame->pts * time_base;
+                        // Subtract stream start offset to get time relative to 0
+                        current_time = (frame->pts - stream_start_pts) * time_base;
                         
                         glBindTexture(GL_TEXTURE_2D, texture_id);
                         glPixelStorei(GL_UNPACK_ROW_LENGTH, frame_rgb->linesize[0] / 3);
@@ -184,11 +202,20 @@ struct VideoPlayer {
         if (!loaded) return;
         
         time = std::clamp(time, 0.0, duration);
-        int64_t timestamp = (int64_t)(time / time_base);
+        int64_t target_ts = (int64_t)(time / time_base);
         
+        // For positions near the beginning, seek from start to avoid keyframe issues
+        // For other positions, use fast keyframe-based seeking
+        if (time < 2.0) {
+            // Seek to very beginning, then decode forward
+            avformat_seek_file(format_ctx, video_stream, 0, 0, target_ts, 0);
+        } else {
+            // Seek backward to nearest keyframe before target (fast)
+            avformat_seek_file(format_ctx, video_stream, 0, target_ts, target_ts, AVSEEK_FLAG_BACKWARD);
+        }
         avcodec_flush_buffers(codec_ctx);
-        av_seek_frame(format_ctx, video_stream, timestamp, AVSEEK_FLAG_BACKWARD);
         
+        // Decode forward to reach the exact target frame
         while (decode_frame()) {
             if (current_time >= time - 0.01) break;
         }
@@ -605,8 +632,8 @@ bool TrimTimeline(const char* label, float* current, float* trim_start, float* t
     }
     
     if (state.dragging != 0 && is_active) {
-        float rel_x = (mouse.x - bb_min.x) / size.x;
-        float time = std::clamp(rel_x * duration, 0.0f, duration);
+        float rel_x = std::clamp((mouse.x - bb_min.x) / size.x, 0.0f, 1.0f);
+        float time = rel_x * duration;
         
         if (state.dragging == 1) {
             float new_start = std::min(time, *trim_end - 0.1f);
@@ -617,7 +644,7 @@ bool TrimTimeline(const char* label, float* current, float* trim_start, float* t
             *trim_end = std::min(new_end, duration);
             changed = true;
         } else if (state.dragging == 3) {
-            *current = time;
+            *current = std::clamp(time, 0.0f, duration);
             changed = true;
         }
     }
@@ -724,14 +751,25 @@ int main() {
                 float ts = (float)player.trim_start;
                 float te = (float)player.trim_end;
                 
+                static float last_seek_target = -1.0f;  // Track last seek target to avoid re-seeking same position
+                
                 if (TrimTimeline("##trim_timeline", &curr, &ts, &te, (float)player.duration, 
                                  ImVec2(viewport->Size.x - 20, 30), timeline_state)) {
                     player.trim_start = ts;
                     player.trim_end = te;
-                    if (curr != (float)player.current_time) {
+                    
+                    // Only seek if the target position actually changed (not just because FFmpeg landed elsewhere)
+                    float target_diff = std::abs(curr - last_seek_target);
+                    if (target_diff > 0.001f && timeline_state.dragging == 3) {
+                        last_seek_target = curr;
                         player.pause();
                         player.seek(curr);
                     }
+                }
+                
+                // Reset seek target tracking when drag ends
+                if (timeline_state.dragging == 0) {
+                    last_seek_target = -1.0f;
                 }
                 
                 // Bottom row
