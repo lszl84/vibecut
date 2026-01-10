@@ -1000,7 +1000,7 @@ struct ClipsTimelineState {
     int dragging_clip = -1; // Which clip's handle we're dragging
 };
 
-// Timeline widget that shows multiple clips with individual trim handles
+// Modern Final Cut-style timeline widget
 // Returns true if anything changed
 bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, float source_duration, const ImVec2& size, ClipsTimelineState& state) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
@@ -1009,10 +1009,19 @@ bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, 
     ImVec2 bb_min = pos;
     ImVec2 bb_max = ImVec2(pos.x + size.x, pos.y + size.y);
     
-    // Background (dark, represents excluded areas)
-    draw_list->AddRectFilled(bb_min, bb_max, IM_COL32(30, 30, 35, 255), 4.0f);
+    float rounding = 12.0f;
+    float handle_w = 10.0f;
+    float clip_margin = 2.0f;
+    float playhead_head_size = 10.0f;
     
-    float handle_w = 6.0f;
+    // Background - dark with subtle inset look
+    draw_list->AddRectFilled(bb_min, bb_max, IM_COL32(25, 25, 28, 255), rounding);
+    draw_list->AddRect(bb_min, bb_max, IM_COL32(40, 40, 45, 255), rounding, 0, 1.0f);
+    
+    // Get mouse info for hover effects
+    ImVec2 mouse = ImGui::GetIO().MousePos;
+    bool mouse_in_timeline = (mouse.x >= bb_min.x && mouse.x <= bb_max.x && 
+                              mouse.y >= bb_min.y && mouse.y <= bb_max.y);
     
     // Draw each clip
     for (int i = 0; i < (int)clips.size(); i++) {
@@ -1020,25 +1029,73 @@ bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, 
         float start_x = bb_min.x + (clip.source_start / source_duration) * size.x;
         float end_x = bb_min.x + (clip.source_end / source_duration) * size.x;
         
-        // Clip region (alternating colors for visibility)
-        ImU32 clip_color = (i % 2 == 0) ? IM_COL32(70, 130, 180, 200) : IM_COL32(100, 149, 237, 200);
-        draw_list->AddRectFilled(ImVec2(start_x, bb_min.y), ImVec2(end_x, bb_max.y), clip_color, 2.0f);
+        // Clip bounds with margin
+        ImVec2 clip_min(start_x + clip_margin, bb_min.y + clip_margin);
+        ImVec2 clip_max(end_x - clip_margin, bb_max.y - clip_margin);
         
-        // Left handle (trim start of this clip)
-        draw_list->AddRectFilled(ImVec2(start_x, bb_min.y), ImVec2(start_x + handle_w, bb_max.y), IM_COL32(255, 200, 50, 255));
+        if (clip_max.x <= clip_min.x) continue;  // Skip if too small
         
-        // Right handle (trim end of this clip)
-        draw_list->AddRectFilled(ImVec2(end_x - handle_w, bb_min.y), ImVec2(end_x, bb_max.y), IM_COL32(255, 200, 50, 255));
+        // Check if mouse is over this clip
+        bool hover_clip = mouse_in_timeline && mouse.x >= start_x && mouse.x <= end_x;
+        bool hover_left = hover_clip && mouse.x <= start_x + handle_w + 4;
+        bool hover_right = hover_clip && mouse.x >= end_x - handle_w - 4;
         
-        // Draw split line between clips (except for last clip)
-        if (i < (int)clips.size() - 1) {
-            draw_list->AddLine(ImVec2(end_x, bb_min.y), ImVec2(end_x, bb_max.y), IM_COL32(255, 255, 255, 100), 2.0f);
+        // Clip colors - purple/blue tones like Final Cut
+        ImU32 clip_color = (i % 2 == 0) ? IM_COL32(85, 65, 125, 255) : IM_COL32(65, 85, 125, 255);
+        
+        // Draw clip with rounded corners
+        draw_list->AddRectFilled(clip_min, clip_max, clip_color, rounding);
+        
+        // Subtle highlight at top edge for depth
+        draw_list->AddLine(ImVec2(clip_min.x + rounding, clip_min.y + 1), 
+                          ImVec2(clip_max.x - rounding, clip_min.y + 1), 
+                          IM_COL32(255, 255, 255, 40), 1.0f);
+        
+        // Handle zones - subtle darker/lighter areas at edges
+        float handle_inner = handle_w;
+        
+        if (clip_max.x - clip_min.x > handle_w * 3) {
+            // Left handle zone
+            ImU32 left_handle_col = hover_left ? IM_COL32(255, 255, 255, 60) : IM_COL32(0, 0, 0, 30);
+            draw_list->AddRectFilled(clip_min, ImVec2(clip_min.x + handle_inner, clip_max.y), 
+                                     left_handle_col, rounding, ImDrawFlags_RoundCornersLeft);
+            
+            // Right handle zone
+            ImU32 right_handle_col = hover_right ? IM_COL32(255, 255, 255, 60) : IM_COL32(0, 0, 0, 30);
+            draw_list->AddRectFilled(ImVec2(clip_max.x - handle_inner, clip_min.y), clip_max, 
+                                     right_handle_col, rounding, ImDrawFlags_RoundCornersRight);
+        }
+        
+        // Clip duration text (if clip is wide enough)
+        float clip_width = clip_max.x - clip_min.x;
+        if (clip_width > 60) {
+            char time_str[32];
+            int secs = (int)clip.duration();
+            int frames = (int)((clip.duration() - secs) * 24);
+            snprintf(time_str, sizeof(time_str), "%d:%02d", secs, frames);
+            
+            ImVec2 text_size = ImGui::CalcTextSize(time_str);
+            ImVec2 text_pos((clip_min.x + clip_max.x - text_size.x) / 2, 
+                           (clip_min.y + clip_max.y - text_size.y) / 2);
+            draw_list->AddText(text_pos, IM_COL32(255, 255, 255, 180), time_str);
         }
     }
     
-    // Current position (playhead)
+    // Playhead - white line with triangular head
     float curr_x = bb_min.x + (*current / source_duration) * size.x;
-    draw_list->AddLine(ImVec2(curr_x, bb_min.y - 2), ImVec2(curr_x, bb_max.y + 2), IM_COL32(255, 255, 255, 255), 3.0f);
+    curr_x = std::clamp(curr_x, bb_min.x, bb_max.x);
+    
+    // Playhead line
+    draw_list->AddLine(ImVec2(curr_x, bb_min.y + playhead_head_size), 
+                       ImVec2(curr_x, bb_max.y), IM_COL32(255, 80, 80, 255), 2.0f);
+    
+    // Playhead head (triangle)
+    ImVec2 head_points[3] = {
+        ImVec2(curr_x, bb_min.y + playhead_head_size),
+        ImVec2(curr_x - playhead_head_size/2, bb_min.y),
+        ImVec2(curr_x + playhead_head_size/2, bb_min.y)
+    };
+    draw_list->AddTriangleFilled(head_points[0], head_points[1], head_points[2], IM_COL32(255, 80, 80, 255));
     
     // Invisible button for interaction
     ImGui::InvisibleButton(label, size);
@@ -1046,7 +1103,6 @@ bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, 
     bool is_active = ImGui::IsItemActive();
     
     bool changed = false;
-    ImVec2 mouse = ImGui::GetIO().MousePos;
     
     // Detect what we clicked on
     if (ImGui::IsItemClicked(0)) {
@@ -1060,8 +1116,8 @@ bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, 
             float start_x = bb_min.x + (clip.source_start / source_duration) * size.x;
             float end_x = bb_min.x + (clip.source_end / source_duration) * size.x;
             
-            bool on_left = (click_x >= start_x && click_x <= start_x + handle_w + 4);
-            bool on_right = (click_x >= end_x - handle_w - 4 && click_x <= end_x);
+            bool on_left = (click_x >= start_x && click_x <= start_x + handle_w + 6);
+            bool on_right = (click_x >= end_x - handle_w - 6 && click_x <= end_x);
             
             if (on_left && on_right) {
                 // Both handles overlapping - use closer one
@@ -1123,13 +1179,12 @@ bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, 
     
     // Change cursor when hovering handles
     if (is_hovered && state.dragging == 0) {
-        float hover_x = mouse.x;
         for (const Clip& clip : clips) {
             float start_x = bb_min.x + (clip.source_start / source_duration) * size.x;
             float end_x = bb_min.x + (clip.source_end / source_duration) * size.x;
             
-            bool over_left = (hover_x >= start_x && hover_x <= start_x + handle_w + 4);
-            bool over_right = (hover_x >= end_x - handle_w - 4 && hover_x <= end_x);
+            bool over_left = (mouse.x >= start_x && mouse.x <= start_x + handle_w + 6);
+            bool over_right = (mouse.x >= end_x - handle_w - 6 && mouse.x <= end_x);
             if (over_left || over_right) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
                 break;
@@ -1238,7 +1293,7 @@ int main() {
         return 1;
     }
 
-    WindowData main_window = create_window("VibeCut", 1280, 720);
+    WindowData main_window = create_window("VibeCut", 1400, 1000);
     if (!main_window.window) {
         std::fprintf(stderr, "Failed to create main window\n");
         glfwTerminate();
@@ -1290,7 +1345,7 @@ int main() {
                     ImGuiWindowFlags_NoScrollbar);
                 
                 float ui_scale = main_window.scale;
-                float controls_height = 100 * ui_scale;
+                float controls_height = 130 * ui_scale;
                 float scale_x = viewport->Size.x / player.width;
                 float scale_y = (viewport->Size.y - controls_height) / player.height;
                 float img_scale = std::min(scale_x, scale_y);
@@ -1329,7 +1384,7 @@ int main() {
                 static float last_seek_target = -1.0f;
                 
                 if (ClipsTimeline("##clips_timeline", &curr, player.clips, (float)player.duration, 
-                                 ImVec2(viewport->Size.x - 20, 25 * ui_scale), timeline_state)) {
+                                 ImVec2(viewport->Size.x - 20, 50 * ui_scale), timeline_state)) {
                     // Only seek if playhead moved
                     float target_diff = std::abs(curr - last_seek_target);
                     if (target_diff > 0.001f && timeline_state.dragging == 3) {
