@@ -1399,8 +1399,8 @@ int main() {
         });
 
         if (open_browser) {
-            int bw = (int)(500 * main_window.scale);
-            int bh = (int)(450 * main_window.scale);
+            int bw = (int)(450 * main_window.scale);
+            int bh = (int)(550 * main_window.scale);
             browser_window = create_window("Open File", bw, bh, main_window.window);
             browser.refresh();
         }
@@ -1416,13 +1416,16 @@ int main() {
                     ImGuiWindowFlags_NoTitleBar |
                     ImGuiWindowFlags_NoResize |
                     ImGuiWindowFlags_NoMove |
-                    ImGuiWindowFlags_NoCollapse);
+                    ImGuiWindowFlags_NoCollapse |
+                    ImGuiWindowFlags_NoScrollbar |
+                    ImGuiWindowFlags_NoScrollWithMouse);
 
                 ImGui::Text("Path: %s", browser.current_path.string().c_str());
                 ImGui::Separator();
 
+                float button_area_height = 35 * browser_window.scale;
                 ImVec2 list_size(ImGui::GetContentRegionAvail().x, 
-                                 ImGui::GetContentRegionAvail().y - 40);
+                                 ImGui::GetContentRegionAvail().y - button_area_height);
                 
                 if (ImGui::BeginListBox("##files", list_size)) {
                     bool first_is_parent = !browser.entries.empty() && 
