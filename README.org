@@ -88,6 +88,17 @@ Adding/changing code by hand, debugging, etc.
 
 Live Streams: https://www.youtube.com/@lukeatdevmindscape/streams
 
+** Day 5
+Claude blew my mind again. It fixed all the issues, and made the UI
+much prettier just by basically following a prompt like "make it more
+modern, like Final Cut or sth."
+
+Unbelievable stuff.
+
+The video editor is now starting to be actually useful. You can break
+a clip at the playhead by hitting B, and you can adjust the clip start
+and endpoints by dragging the clip handles. Then export the video.
+
 ** Day 4
 Claude managed to fix the bug after a few back-and-forth prompts.
 Think about this: with absolutely no visual feedback, no ability to
