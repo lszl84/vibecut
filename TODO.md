@@ -2,11 +2,10 @@
 
 ## Known Bugs
 
-### Bug #3: Export trims beginning/end incorrectly
-- Exporting from 0-5 seconds produces a 4 second video instead of 5
-- The beginning of the clip is cut off (starts later than indicated)
-- The playhead stops before reaching the end
-- Possibly related to FFmpeg seeking/timing issues during export
+### Bug #3: Export timing precision (partially fixed)
+- ~~Major issues with missing frames resolved~~
+- Precise frame-accurate timing may need further work
+- Will address with timeline navigation improvements
 
 ## Fixed Bugs
 
