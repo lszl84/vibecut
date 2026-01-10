@@ -907,7 +907,46 @@ WindowData create_window(const char* title, int width, int height, GLFWwindow* s
     io.Fonts->AddFontFromMemoryCompressedBase85TTF(RobotoMedium_compressed_data_base85, 16.0f * data.scale);
     
     ImGui::StyleColorsDark();
-    ImGui::GetStyle().ScaleAllSizes(data.scale);
+    
+    // Custom styling (before scaling)
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.FrameRounding = 4.0f;
+    style.FramePadding = ImVec2(8.0f, 4.0f);  // Slightly bigger buttons
+    style.ItemSpacing = ImVec2(8.0f, 6.0f);
+    style.WindowRounding = 6.0f;
+    style.GrabRounding = 4.0f;
+    style.WindowPadding = ImVec2(12.0f, 12.0f);
+    
+    // Dark grey color scheme
+    ImVec4 bg_dark = ImVec4(0.13f, 0.13f, 0.13f, 1.0f);      // #212121
+    ImVec4 bg_mid = ImVec4(0.18f, 0.18f, 0.18f, 1.0f);       // Slightly lighter
+    ImVec4 bg_light = ImVec4(0.25f, 0.25f, 0.25f, 1.0f);     // Hover
+    ImVec4 accent = ImVec4(0.35f, 0.35f, 0.35f, 1.0f);       // Active/pressed
+    ImVec4 text = ImVec4(0.95f, 0.95f, 0.95f, 1.0f);         // White text
+    
+    style.Colors[ImGuiCol_WindowBg] = bg_dark;
+    style.Colors[ImGuiCol_ChildBg] = bg_dark;
+    style.Colors[ImGuiCol_PopupBg] = bg_mid;
+    style.Colors[ImGuiCol_FrameBg] = bg_mid;
+    style.Colors[ImGuiCol_FrameBgHovered] = bg_light;
+    style.Colors[ImGuiCol_FrameBgActive] = accent;
+    style.Colors[ImGuiCol_TitleBg] = bg_dark;
+    style.Colors[ImGuiCol_TitleBgActive] = bg_mid;
+    style.Colors[ImGuiCol_Button] = bg_mid;
+    style.Colors[ImGuiCol_ButtonHovered] = bg_light;
+    style.Colors[ImGuiCol_ButtonActive] = accent;
+    style.Colors[ImGuiCol_Header] = bg_mid;
+    style.Colors[ImGuiCol_HeaderHovered] = bg_light;
+    style.Colors[ImGuiCol_HeaderActive] = accent;
+    style.Colors[ImGuiCol_SliderGrab] = bg_light;
+    style.Colors[ImGuiCol_SliderGrabActive] = accent;
+    style.Colors[ImGuiCol_Text] = text;
+    style.Colors[ImGuiCol_ScrollbarBg] = bg_dark;
+    style.Colors[ImGuiCol_ScrollbarGrab] = bg_light;
+    style.Colors[ImGuiCol_ScrollbarGrabHovered] = accent;
+    style.Colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.45f, 0.45f, 0.45f, 1.0f);
+    
+    style.ScaleAllSizes(data.scale);
     
     ImGui_ImplGlfw_InitForOpenGL(data.window, true);
     ImGui_ImplOpenGL3_Init("#version 460");
@@ -945,7 +984,7 @@ void render_window(WindowData& data, auto ui_func) {
     int display_w, display_h;
     glfwGetFramebufferSize(data.window, &display_w, &display_h);
     glViewport(0, 0, display_w, display_h);
-    glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
+    glClearColor(0.129f, 0.129f, 0.129f, 1.0f);  // #212121
     glClear(GL_COLOR_BUFFER_BIT);
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     
@@ -1250,13 +1289,14 @@ int main() {
                     ImGuiWindowFlags_NoBackground |
                     ImGuiWindowFlags_NoScrollbar);
                 
-                float controls_height = 130;
+                float ui_scale = main_window.scale;
+                float controls_height = 100 * ui_scale;
                 float scale_x = viewport->Size.x / player.width;
                 float scale_y = (viewport->Size.y - controls_height) / player.height;
-                float scale = std::min(scale_x, scale_y);
+                float img_scale = std::min(scale_x, scale_y);
                 
-                float img_w = player.width * scale;
-                float img_h = player.height * scale;
+                float img_w = player.width * img_scale;
+                float img_h = player.height * img_scale;
                 float img_x = (viewport->Size.x - img_w) / 2;
                 float img_y = (viewport->Size.y - controls_height - img_h) / 2;
                 
@@ -1266,7 +1306,7 @@ int main() {
                 // Controls
                 ImGui::SetCursorPos(ImVec2(10, viewport->Size.y - controls_height + 5));
                 
-                if (ImGui::Button(player.playing ? "Pause" : "Play", ImVec2(80, 30))) {
+                if (ImGui::Button(player.playing ? "Pause" : "Play", ImVec2(60 * ui_scale, 0))) {
                     player.toggle_play();
                 }
                 
@@ -1283,13 +1323,13 @@ int main() {
                 }
                 
                 // Timeline with clips
-                ImGui::SetCursorPos(ImVec2(10, viewport->Size.y - controls_height + 45));
+                ImGui::SetCursorPos(ImVec2(10, viewport->Size.y - controls_height + 35 * ui_scale));
                 float curr = (float)player.current_time;
                 
                 static float last_seek_target = -1.0f;
                 
                 if (ClipsTimeline("##clips_timeline", &curr, player.clips, (float)player.duration, 
-                                 ImVec2(viewport->Size.x - 20, 30), timeline_state)) {
+                                 ImVec2(viewport->Size.x - 20, 25 * ui_scale), timeline_state)) {
                     // Only seek if playhead moved
                     float target_diff = std::abs(curr - last_seek_target);
                     if (target_diff > 0.001f && timeline_state.dragging == 3) {
@@ -1305,15 +1345,15 @@ int main() {
                 }
                 
                 // Bottom row
-                ImGui::SetCursorPos(ImVec2(10, viewport->Size.y - 40));
+                ImGui::SetCursorPos(ImVec2(10, viewport->Size.y - 30 * ui_scale));
                 ImGui::Text("File: %s", path_display_name(fs::path(selected_file)).c_str());
                 
-                ImGui::SameLine(viewport->Size.x - 240);
+                ImGui::SameLine(viewport->Size.x - 180 * ui_scale);
                 
                 if (exporting) {
-                    ImGui::ProgressBar(export_progress, ImVec2(120, 0), "Exporting...");
+                    ImGui::ProgressBar(export_progress, ImVec2(80 * ui_scale, 0), "Exporting...");
                 } else {
-                    if (ImGui::Button("Export", ImVec2(80, 0))) {
+                    if (ImGui::Button("Export", ImVec2(0, 0))) {
                         fs::path src(selected_file);
                         std::string out_name = src.stem().string() + "_edited" + src.extension().string();
                         std::string out_path = (src.parent_path() / out_name).string();
@@ -1332,7 +1372,7 @@ int main() {
                 }
                 
                 ImGui::SameLine();
-                if (ImGui::Button("Open File...", ImVec2(110, 0))) {
+                if (ImGui::Button("Open File...", ImVec2(0, 0))) {
                     if (!browser_window.window) open_browser = true;
                 }
                 
@@ -1349,7 +1389,8 @@ int main() {
                     ImGuiWindowFlags_NoBackground |
                     ImGuiWindowFlags_AlwaysAutoResize);
 
-                if (ImGui::Button("Open File...", ImVec2(200, 60))) {
+                float scale = main_window.scale;
+                if (ImGui::Button("Open File...", ImVec2(160 * scale, 40 * scale))) {
                     if (!browser_window.window) open_browser = true;
                 }
 
@@ -1358,7 +1399,9 @@ int main() {
         });
 
         if (open_browser) {
-            browser_window = create_window("Open File", 600, 500, main_window.window);
+            int bw = (int)(500 * main_window.scale);
+            int bh = (int)(450 * main_window.scale);
+            browser_window = create_window("Open File", bw, bh, main_window.window);
             browser.refresh();
         }
 
@@ -1431,7 +1474,7 @@ int main() {
                 } catch (...) { can_open = false; }
                 
                 if (!can_open) ImGui::BeginDisabled();
-                if (ImGui::Button("Open", ImVec2(100, 0))) {
+                if (ImGui::Button("Open", ImVec2(80 * browser_window.scale, 0))) {
                     try {
                         selected_file = browser.entries[browser.selected_index].path().string();
                         pending_load = selected_file;
@@ -1441,7 +1484,7 @@ int main() {
                 if (!can_open) ImGui::EndDisabled();
                 
                 ImGui::SameLine();
-                if (ImGui::Button("Cancel", ImVec2(100, 0))) {
+                if (ImGui::Button("Cancel", ImVec2(80 * browser_window.scale, 0))) {
                     should_close = true;
                 }
 
