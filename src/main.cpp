@@ -154,14 +154,22 @@ struct VideoPlayer {
         current_time = 0.0;
         playing = false;
         
+        // Detect first keyframe position by doing an initial decode
+        decode_frame();
+        first_keyframe_time = current_time;
+        
+        // Adjust duration to account for first frame offset (some videos have frames starting later)
+        double actual_duration = duration - first_keyframe_time;
+        if (actual_duration > 0.1) {
+            duration = actual_duration;
+            std::printf("Adjusted duration from %.3f to %.3f (first frame offset: %.3f)\n", 
+                        duration + first_keyframe_time, duration, first_keyframe_time);
+        }
+        
         // Initialize with single clip covering entire video
         clips.clear();
         clips.push_back({0.0, duration});
         active_clip = 0;
-        
-        // Detect first keyframe position by doing an initial decode
-        decode_frame();
-        first_keyframe_time = current_time;
         
         return true;
     }
@@ -420,29 +428,36 @@ bool export_clips(const std::string& input, const std::string& output, const std
         return false;
     }
     
-    // Set up video encoder (H.264)
+    // Set up video encoder (H.264) - preserve source framerate
     const AVCodec* encoder = avcodec_find_encoder(AV_CODEC_ID_H264);
     if (!encoder) encoder = avcodec_find_encoder(in_video->codecpar->codec_id);
     
     AVStream* out_video = avformat_new_stream(out_ctx, nullptr);
     out_video_idx = out_video->index;
     
+    // Get source framerate
+    AVRational src_fps = av_guess_frame_rate(in_ctx, in_video, nullptr);
+    if (src_fps.num == 0 || src_fps.den == 0) {
+        src_fps = AVRational{30, 1};  // Fallback to 30fps
+    }
+    
     enc_ctx = avcodec_alloc_context3(encoder);
     enc_ctx->width = dec_ctx->width;
     enc_ctx->height = dec_ctx->height;
     enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-    enc_ctx->time_base = AVRational{1, 30};  // 30 fps output
-    enc_ctx->framerate = AVRational{30, 1};
-    enc_ctx->bit_rate = 4000000;  // 4 Mbps
-    enc_ctx->gop_size = 30;
-    enc_ctx->max_b_frames = 2;
+    enc_ctx->time_base = AVRational{1, 1000};  // Millisecond precision
+    enc_ctx->framerate = src_fps;
+    enc_ctx->bit_rate = 8000000;  // 8 Mbps for better quality
+    enc_ctx->gop_size = 12;  // Keyframe every 12 frames
+    enc_ctx->max_b_frames = 0;  // Disable B-frames for simpler encoding
     
     if (out_ctx->oformat->flags & AVFMT_GLOBALHEADER) {
         enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
     
     AVDictionary* enc_opts = nullptr;
-    av_dict_set(&enc_opts, "preset", "fast", 0);
+    av_dict_set(&enc_opts, "preset", "medium", 0);
+    av_dict_set(&enc_opts, "crf", "18", 0);  // High quality
     avcodec_open2(enc_ctx, encoder, &enc_opts);
     av_dict_free(&enc_opts);
     
@@ -504,54 +519,76 @@ bool export_clips(const std::string& input, const std::string& output, const std
     enc_frame->height = enc_ctx->height;
     av_frame_get_buffer(enc_frame, 0);
     
-    double time_offset = 0.0;
-    int64_t video_pts = 0;
-    int64_t audio_pts_offset = 0;
+    double time_offset = 0.0;  // Accumulated output time from previous clips
     double processed_time = 0.0;
+    int64_t video_pts = 0;  // Running PTS in milliseconds
+    int64_t audio_pts = 0;  // Running audio PTS
+    bool first_clip = true;
     
     for (const auto& clip : clips) {
         if (!exporting) break;
         
-        // Seek to before clip start - use different strategy for beginning vs middle
-        avcodec_flush_buffers(dec_ctx);
-        if (clip.source_start < 0.5) {
-            // For clips starting near the beginning, seek to absolute start
-            av_seek_frame(in_ctx, video_stream_idx, 0, AVSEEK_FLAG_BACKWARD);
+        std::printf("EXPORT: Processing clip [%.3f - %.3f], duration=%.3f\n", 
+                    clip.source_start, clip.source_end, clip.duration());
+        
+        // Seek to clip start (skip seeking for first clip starting at 0 to preserve all frames)
+        if (first_clip && clip.source_start < 0.1) {
+            std::printf("EXPORT: Starting from beginning (no seek)\n");
         } else {
-            // For other clips, seek to nearest keyframe before desired time
-            int64_t start_ts = (int64_t)(clip.source_start / av_q2d(in_video->time_base));
-            av_seek_frame(in_ctx, video_stream_idx, start_ts, AVSEEK_FLAG_BACKWARD);
+            avcodec_flush_buffers(dec_ctx);
+            int64_t start_ts = (int64_t)(clip.source_start * AV_TIME_BASE);
+            avformat_seek_file(in_ctx, -1, INT64_MIN, start_ts, start_ts, 0);
+            avcodec_flush_buffers(dec_ctx);
+            std::printf("EXPORT: Seeking to timestamp %.3f\n", clip.source_start);
         }
+        first_clip = false;
         
         bool reached_clip = false;
+        int frames_skipped = 0;
+        int frames_encoded = 0;
+        double first_frame_time = -1.0;  // Will be set when we get the first frame
         
         while (av_read_frame(in_ctx, pkt) >= 0 && exporting) {
             AVStream* in_stream = in_ctx->streams[pkt->stream_index];
             double pkt_time = pkt->pts * av_q2d(in_stream->time_base);
             
             if (pkt->stream_index == video_stream_idx) {
-                // Skip frames before clip start
-                if (pkt_time > clip.source_end) {
-                    av_packet_unref(pkt);
-                    break;
-                }
-                
                 // Decode frame
                 avcodec_send_packet(dec_ctx, pkt);
                 while (avcodec_receive_frame(dec_ctx, frame) >= 0) {
                     double frame_time = frame->pts * av_q2d(in_stream->time_base);
                     
-                    if (frame_time < clip.source_start) continue;
-                    if (frame_time > clip.source_end) break;
+                    // Track the first frame we receive after seeking
+                    if (first_frame_time < 0) {
+                        first_frame_time = frame_time;
+                        std::printf("EXPORT: First frame received at %.3f\n", first_frame_time);
+                    }
+                    
+                    // Calculate relative time: how far into the clip this frame is
+                    double relative_time = frame_time - first_frame_time;
+                    
+                    // Check if we've exceeded the clip duration
+                    if (relative_time >= clip.duration()) {
+                        std::printf("EXPORT: Frame at relative %.3f past clip duration %.3f, stopping\n", relative_time, clip.duration());
+                        av_packet_unref(pkt);
+                        goto done_with_clip;
+                    }
                     
                     reached_clip = true;
-                    progress = (float)((processed_time + (frame_time - clip.source_start)) / total_duration);
+                    frames_encoded++;
+                    
+                    // Calculate output time: relative time within clip + offset from previous clips
+                    double output_time = relative_time + time_offset;
+                    progress = (float)(output_time / total_duration);
                     
                     // Convert pixel format
                     sws_scale(sws_ctx, frame->data, frame->linesize, 0, frame->height,
                               enc_frame->data, enc_frame->linesize);
                     
-                    enc_frame->pts = video_pts++;
+                    // Use simple incrementing PTS in milliseconds (based on frame rate)
+                    double frame_duration_ms = 1000.0 * enc_ctx->framerate.den / enc_ctx->framerate.num;
+                    enc_frame->pts = video_pts;
+                    video_pts += (int64_t)frame_duration_ms;
                     
                     // Encode frame
                     avcodec_send_frame(enc_ctx, enc_frame);
@@ -562,9 +599,11 @@ bool export_clips(const std::string& input, const std::string& output, const std
                         av_packet_unref(enc_pkt);
                     }
                 }
-            } else if (pkt->stream_index == audio_stream_idx && out_audio_idx >= 0) {
-                // Stream copy audio
-                if (pkt_time < clip.source_start || pkt_time > clip.source_end) {
+            } else if (pkt->stream_index == audio_stream_idx && out_audio_idx >= 0 && first_frame_time >= 0) {
+                // Stream copy audio - use relative times based on first video frame
+                double audio_relative_time = pkt_time - first_frame_time;
+                
+                if (audio_relative_time < -0.1 || audio_relative_time > clip.duration() + 0.1) {
                     av_packet_unref(pkt);
                     continue;
                 }
@@ -572,10 +611,14 @@ bool export_clips(const std::string& input, const std::string& output, const std
                 AVStream* out_audio = out_ctx->streams[out_audio_idx];
                 AVStream* in_audio = in_ctx->streams[audio_stream_idx];
                 
-                double adjusted_time = (pkt_time - clip.source_start) + time_offset;
-                pkt->pts = (int64_t)(adjusted_time / av_q2d(out_audio->time_base));
+                // Keep original duration
+                int64_t orig_duration = pkt->duration;
+                
+                // Calculate output PTS based on relative time + accumulated offset
+                double audio_output_time = std::max(0.0, audio_relative_time) + time_offset;
+                pkt->pts = (int64_t)(audio_output_time / av_q2d(out_audio->time_base));
                 pkt->dts = pkt->pts;
-                pkt->duration = av_rescale_q(pkt->duration, in_audio->time_base, out_audio->time_base);
+                pkt->duration = av_rescale_q(orig_duration, in_audio->time_base, out_audio->time_base);
                 pkt->stream_index = out_audio_idx;
                 pkt->pos = -1;
                 
@@ -584,7 +627,9 @@ bool export_clips(const std::string& input, const std::string& output, const std
             
             av_packet_unref(pkt);
         }
+        done_with_clip:
         
+        std::printf("EXPORT: Clip done - skipped %d frames, encoded %d frames\n", frames_skipped, frames_encoded);
         processed_time += clip.duration();
         time_offset += clip.duration();
     }
