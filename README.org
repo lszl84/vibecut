@@ -53,14 +53,14 @@ git submodule update --init
 * Time Tracking
 
 #+BEGIN: clocktable :maxlevel nil :scope file :block nil
-#+CAPTION: Clock summary at [2026-01-10 Sat 13:28]
+#+CAPTION: Clock summary at [2026-01-11 Sun 11:15]
 | Headline          | Time |      |
 |-------------------+------+------|
-| *Total time*        | *3:11* |      |
+| *Total time*        | *4:22* |      |
 |-------------------+------+------|
-| Tasks             | 3:11 |      |
+| Tasks             | 4:22 |      |
 | \_  Initial Setup |      | 0:13 |
-| \_  Vibe coding   |      | 2:58 |
+| \_  Vibe coding   |      | 4:09 |
 #+END:
 
 * Tasks
@@ -73,6 +73,7 @@ CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
 :END:
 ** Vibe coding
 :LOGBOOK:
+CLOCK: [2026-01-11 Sun 10:04]--[2026-01-11 Sun 11:15] =>  1:11
 CLOCK: [2026-01-10 Sat 12:43]--[2026-01-10 Sat 13:28] =>  0:45
 CLOCK: [2026-01-09 Fri 17:45]--[2026-01-09 Fri 18:40] =>  0:55
 CLOCK: [2026-01-08 Thu 19:40]--[2026-01-08 Thu 20:14] =>  0:34
@@ -87,6 +88,15 @@ Adding/changing code by hand, debugging, etc.
 * Devlog
 
 Live Streams: https://www.youtube.com/@lukeatdevmindscape/streams
+
+** Day 6
+Added keyboard navigation between clips and frames, timeline zoom with
+gestures and a scrollbar, turned the timeline into FinalCut-like
+"magnetic timeline".
+
+Overall a good progress, with some minor bugs introduced along the
+way. I now have confidence in Claude that it will be able to fix these
+in the following sessions.
 
 ** Day 5
 Claude blew my mind again. It fixed all the issues, and made the UI
