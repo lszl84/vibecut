@@ -996,11 +996,16 @@ struct TrimTimelineState {
 };
 
 struct ClipsTimelineState {
-    int dragging = 0;       // 0=none, 1=left handle, 2=right handle, 3=playhead
+    int dragging = 0;       // 0=none, 1=left handle, 2=right handle, 3=playhead, 4=panning
     int dragging_clip = -1; // Which clip's handle we're dragging
+    float zoom = 1.0f;      // Zoom level (1.0 = fit all, higher = zoom in)
+    float scroll = 0.0f;    // Scroll position (0.0 to 1.0, normalized)
+    float pan_start_x = 0.0f; // For panning
+    float pan_start_scroll = 0.0f;
 };
 
-// Modern Final Cut-style timeline widget
+// Modern Final Cut-style magnetic timeline widget with zoom/scroll
+// Clips are always contiguous - no gaps allowed
 // Returns true if anything changed
 bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, float source_duration, const ImVec2& size, ClipsTimelineState& state) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
@@ -1014,24 +1019,70 @@ bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, 
     float clip_margin = 2.0f;
     float playhead_head_size = 10.0f;
     
+    // Calculate total timeline duration (sum of all clip durations)
+    float total_duration = 0.0f;
+    for (const auto& c : clips) total_duration += (float)c.duration();
+    if (total_duration < 0.01f) total_duration = source_duration;
+    
+    // Zoom and scroll calculations
+    float visible_duration = total_duration / state.zoom;
+    float max_scroll = std::max(0.0f, total_duration - visible_duration);
+    state.scroll = std::clamp(state.scroll, 0.0f, max_scroll);
+    float view_start = state.scroll;
+    float view_end = state.scroll + visible_duration;
+    
+    // Helper to convert timeline time to screen X
+    auto time_to_x = [&](float t) -> float {
+        return bb_min.x + ((t - view_start) / visible_duration) * size.x;
+    };
+    
+    // Helper to convert screen X to timeline time
+    auto x_to_time = [&](float x) -> float {
+        return view_start + ((x - bb_min.x) / size.x) * visible_duration;
+    };
+    
     // Background - dark with subtle inset look
     draw_list->AddRectFilled(bb_min, bb_max, IM_COL32(25, 25, 28, 255), rounding);
     draw_list->AddRect(bb_min, bb_max, IM_COL32(40, 40, 45, 255), rounding, 0, 1.0f);
     
-    // Get mouse info for hover effects
+    // Get mouse position early for scrollbar interaction
     ImVec2 mouse = ImGui::GetIO().MousePos;
+    
+    // Scrollbar dimensions - ALWAYS reserve space to prevent layout jumps
+    float scroll_bar_h = 12.0f;
+    float scroll_bar_y = bb_max.y - scroll_bar_h - 2;
+    bool scrollbar_active = state.zoom > 1.01f;  // Can actually scroll
+    
+    // Always leave room for scrollbar
+    float clip_area_bottom = scroll_bar_y - 4;
+    
+    // Track if mouse is over scrollbar area (for click priority)
+    bool mouse_over_scrollbar = (mouse.y >= scroll_bar_y - 2 && mouse.y <= bb_max.y &&
+                                  mouse.x >= bb_min.x && mouse.x <= bb_max.x);
+    
+    // Check if mouse is in timeline area
     bool mouse_in_timeline = (mouse.x >= bb_min.x && mouse.x <= bb_max.x && 
                               mouse.y >= bb_min.y && mouse.y <= bb_max.y);
     
-    // Draw each clip
+    // Draw each clip - positioned sequentially (magnetic/ripple style)
+    float timeline_pos = 0.0f;  // Current position on timeline
     for (int i = 0; i < (int)clips.size(); i++) {
         const Clip& clip = clips[i];
-        float start_x = bb_min.x + (clip.source_start / source_duration) * size.x;
-        float end_x = bb_min.x + (clip.source_end / source_duration) * size.x;
+        float clip_duration = (float)clip.duration();
         
-        // Clip bounds with margin
+        // Skip clips outside visible range
+        if (timeline_pos + clip_duration < view_start || timeline_pos > view_end) {
+            timeline_pos += clip_duration;
+            continue;
+        }
+        
+        // Calculate screen positions using zoom/scroll-aware conversion
+        float start_x = time_to_x(timeline_pos);
+        float end_x = time_to_x(timeline_pos + clip_duration);
+        
+        // Clip bounds with margin (leave room for scrollbar at bottom)
         ImVec2 clip_min(start_x + clip_margin, bb_min.y + clip_margin);
-        ImVec2 clip_max(end_x - clip_margin, bb_max.y - clip_margin);
+        ImVec2 clip_max(end_x - clip_margin, clip_area_bottom - clip_margin);
         
         if (clip_max.x <= clip_min.x) continue;  // Skip if too small
         
@@ -1079,23 +1130,50 @@ bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, 
                            (clip_min.y + clip_max.y - text_size.y) / 2);
             draw_list->AddText(text_pos, IM_COL32(255, 255, 255, 180), time_str);
         }
+        
+        timeline_pos += clip_duration;
     }
     
-    // Playhead - white line with triangular head
-    float curr_x = bb_min.x + (*current / source_duration) * size.x;
-    curr_x = std::clamp(curr_x, bb_min.x, bb_max.x);
+    // Convert current time (in source coordinates) to timeline position
+    float playhead_timeline_pos = 0.0f;
+    float remaining = *current;
+    for (const auto& c : clips) {
+        if (remaining <= c.source_start) break;
+        if (remaining < c.source_end) {
+            playhead_timeline_pos += (remaining - (float)c.source_start);
+            break;
+        }
+        playhead_timeline_pos += (float)c.duration();
+    }
     
-    // Playhead line
-    draw_list->AddLine(ImVec2(curr_x, bb_min.y + playhead_head_size), 
-                       ImVec2(curr_x, bb_max.y), IM_COL32(255, 80, 80, 255), 2.0f);
+    // Playhead - red line with triangular head (only if visible)
+    float curr_x = time_to_x(playhead_timeline_pos);
+    bool playhead_visible = (playhead_timeline_pos >= view_start - 0.1f && playhead_timeline_pos <= view_end + 0.1f);
     
-    // Playhead head (triangle)
-    ImVec2 head_points[3] = {
-        ImVec2(curr_x, bb_min.y + playhead_head_size),
-        ImVec2(curr_x - playhead_head_size/2, bb_min.y),
-        ImVec2(curr_x + playhead_head_size/2, bb_min.y)
-    };
-    draw_list->AddTriangleFilled(head_points[0], head_points[1], head_points[2], IM_COL32(255, 80, 80, 255));
+    if (playhead_visible) {
+        curr_x = std::clamp(curr_x, bb_min.x, bb_max.x);
+        
+        // Playhead line (stop above scrollbar)
+        draw_list->AddLine(ImVec2(curr_x, bb_min.y + playhead_head_size), 
+                           ImVec2(curr_x, clip_area_bottom), IM_COL32(255, 80, 80, 255), 2.0f);
+        
+        // Playhead head (triangle)
+        ImVec2 head_points[3] = {
+            ImVec2(curr_x, bb_min.y + playhead_head_size),
+            ImVec2(curr_x - playhead_head_size/2, bb_min.y),
+            ImVec2(curr_x + playhead_head_size/2, bb_min.y)
+        };
+        draw_list->AddTriangleFilled(head_points[0], head_points[1], head_points[2], IM_COL32(255, 80, 80, 255));
+    }
+    
+    // Zoom indicator (top-right corner) - show when not at 1x
+    if (state.zoom < 0.95f || state.zoom > 1.05f) {
+        char zoom_text[32];
+        snprintf(zoom_text, sizeof(zoom_text), "%.2fx", state.zoom);
+        ImVec2 text_size = ImGui::CalcTextSize(zoom_text);
+        draw_list->AddText(ImVec2(bb_max.x - text_size.x - 8, bb_min.y + 4), 
+                           IM_COL32(150, 150, 160, 200), zoom_text);
+    }
     
     // Invisible button for interaction
     ImGui::InvisibleButton(label, size);
@@ -1104,23 +1182,93 @@ bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, 
     
     bool changed = false;
     
-    // Detect what we clicked on
-    if (ImGui::IsItemClicked(0)) {
+    // Mouse wheel: Shift+wheel for scroll, plain wheel for zoom
+    // Also support horizontal scroll (touchpad, horizontal mouse wheel)
+    if (is_hovered) {
+        float wheel = ImGui::GetIO().MouseWheel;
+        float wheel_h = ImGui::GetIO().MouseWheelH;
+        
+        // Horizontal scroll (touchpad gesture or horizontal mouse wheel)
+        if (std::abs(wheel_h) > 0.01f && state.zoom > 1.01f) {
+            state.scroll -= wheel_h * visible_duration * 0.15f;
+            state.scroll = std::clamp(state.scroll, 0.0f, max_scroll);
+        }
+        
+        if (std::abs(wheel) > 0.01f) {
+            if (ImGui::GetIO().KeyShift && state.zoom > 1.01f) {
+                // Shift+wheel for horizontal scrolling
+                state.scroll -= wheel * visible_duration * 0.15f;
+                state.scroll = std::clamp(state.scroll, 0.0f, max_scroll);
+            } else {
+                // Plain wheel for zooming (centered on mouse position)
+                float mouse_time = x_to_time(mouse.x);
+                float old_zoom = state.zoom;
+                
+                state.zoom *= (wheel > 0) ? 1.2f : (1.0f / 1.2f);
+                state.zoom = std::clamp(state.zoom, 0.25f, 20.0f);
+                
+                // Adjust scroll to keep mouse position stable
+                if (state.zoom != old_zoom) {
+                    float new_visible = total_duration / state.zoom;
+                    state.scroll = mouse_time - (mouse.x - bb_min.x) / size.x * new_visible;
+                    state.scroll = std::clamp(state.scroll, 0.0f, std::max(0.0f, total_duration - new_visible));
+                }
+            }
+        }
+    }
+    
+    // Middle mouse button panning OR Alt+Left drag for panning
+    bool start_pan = is_hovered && (ImGui::IsMouseClicked(ImGuiMouseButton_Middle) || 
+                                    (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && ImGui::GetIO().KeyAlt));
+    if (start_pan && state.dragging == 0) {
+        state.dragging = 4;  // Panning mode
+        state.pan_start_x = mouse.x;
+        state.pan_start_scroll = state.scroll;
+    }
+    
+    if (state.dragging == 4) {
+        bool still_panning = ImGui::IsMouseDown(ImGuiMouseButton_Middle) || 
+                             (ImGui::IsMouseDown(ImGuiMouseButton_Left) && ImGui::GetIO().KeyAlt);
+        if (still_panning) {
+            float delta_x = mouse.x - state.pan_start_x;
+            float delta_time = -(delta_x / size.x) * visible_duration;
+            state.scroll = state.pan_start_scroll + delta_time;
+            state.scroll = std::clamp(state.scroll, 0.0f, max_scroll);
+        } else {
+            state.dragging = 0;
+        }
+    }
+    
+    
+    // Build clip screen positions for interaction (same logic as drawing)
+    struct ClipScreenPos { float start_x, end_x; int clip_idx; float timeline_start; };
+    std::vector<ClipScreenPos> clip_positions;
+    {
+        float tpos = 0.0f;
+        for (int i = 0; i < (int)clips.size(); i++) {
+            float dur = (float)clips[i].duration();
+            float sx = time_to_x(tpos);
+            float ex = time_to_x(tpos + dur);
+            clip_positions.push_back({sx, ex, i, tpos});
+            tpos += dur;
+        }
+    }
+    
+    // Detect what we clicked on (but not if clicking on scrollbar)
+    if (ImGui::IsItemClicked(0) && !mouse_over_scrollbar) {
         float click_x = mouse.x;
         state.dragging = 0;
         state.dragging_clip = -1;
         
         // Check each clip's handles
         for (int i = 0; i < (int)clips.size(); i++) {
-            const Clip& clip = clips[i];
-            float start_x = bb_min.x + (clip.source_start / source_duration) * size.x;
-            float end_x = bb_min.x + (clip.source_end / source_duration) * size.x;
+            float start_x = clip_positions[i].start_x;
+            float end_x = clip_positions[i].end_x;
             
             bool on_left = (click_x >= start_x && click_x <= start_x + handle_w + 6);
             bool on_right = (click_x >= end_x - handle_w - 6 && click_x <= end_x);
             
             if (on_left && on_right) {
-                // Both handles overlapping - use closer one
                 if (std::abs(click_x - start_x) < std::abs(click_x - end_x)) {
                     state.dragging = 1;
                 } else {
@@ -1145,33 +1293,54 @@ bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, 
         }
     }
     
-    if (!is_active) {
+    if (!is_active && state.dragging != 4) {  // Don't reset for middle-mouse panning
         state.dragging = 0;
         state.dragging_clip = -1;
     }
     
-    if (state.dragging != 0 && is_active) {
-        float rel_x = std::clamp((mouse.x - bb_min.x) / size.x, 0.0f, 1.0f);
-        float time = rel_x * source_duration;
+    if (state.dragging != 0 && state.dragging != 4 && is_active) {
+        // Use zoom-aware time conversion
+        float timeline_time = x_to_time(mouse.x);
+        timeline_time = std::clamp(timeline_time, 0.0f, total_duration);
         
         if (state.dragging == 3) {
-            // Moving playhead
-            *current = std::clamp(time, 0.0f, source_duration);
+            // Moving playhead - convert timeline position to source position
+            float tpos = 0.0f;
+            float source_time = 0.0f;
+            for (const auto& c : clips) {
+                float dur = (float)c.duration();
+                if (timeline_time < tpos + dur) {
+                    source_time = (float)c.source_start + (timeline_time - tpos);
+                    break;
+                }
+                tpos += dur;
+                source_time = (float)c.source_end;
+            }
+            *current = std::clamp(source_time, 0.0f, source_duration);
             changed = true;
         } else if (state.dragging_clip >= 0 && state.dragging_clip < (int)clips.size()) {
             Clip& clip = clips[state.dragging_clip];
             
+            // Use zoom-aware conversion for handle dragging
+            const auto& cp = clip_positions[state.dragging_clip];
+            
             if (state.dragging == 1) {
-                // Left handle - adjust source_start
-                float min_start = (state.dragging_clip > 0) ? clips[state.dragging_clip - 1].source_end : 0.0f;
-                float max_start = clip.source_end - 0.1f;
-                clip.source_start = std::clamp((double)time, (double)min_start, (double)max_start);
+                // Left handle - adjust source_start (trim beginning)
+                float delta_x = mouse.x - cp.start_x;
+                float delta_time = (delta_x / size.x) * visible_duration;
+                
+                double new_start = clip.source_start + delta_time;
+                new_start = std::clamp(new_start, 0.0, clip.source_end - 0.1);
+                clip.source_start = new_start;
                 changed = true;
             } else if (state.dragging == 2) {
-                // Right handle - adjust source_end
-                float min_end = clip.source_start + 0.1f;
-                float max_end = (state.dragging_clip < (int)clips.size() - 1) ? clips[state.dragging_clip + 1].source_start : source_duration;
-                clip.source_end = std::clamp((double)time, (double)min_end, (double)max_end);
+                // Right handle - adjust source_end (trim end)
+                float delta_x = mouse.x - cp.end_x;
+                float delta_time = (delta_x / size.x) * visible_duration;
+                
+                double new_end = clip.source_end + delta_time;
+                new_end = std::clamp(new_end, clip.source_start + 0.1, (double)source_duration);
+                clip.source_end = new_end;
                 changed = true;
             }
         }
@@ -1179,9 +1348,9 @@ bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, 
     
     // Change cursor when hovering handles
     if (is_hovered && state.dragging == 0) {
-        for (const Clip& clip : clips) {
-            float start_x = bb_min.x + (clip.source_start / source_duration) * size.x;
-            float end_x = bb_min.x + (clip.source_end / source_duration) * size.x;
+        for (int i = 0; i < (int)clip_positions.size(); i++) {
+            float start_x = clip_positions[i].start_x;
+            float end_x = clip_positions[i].end_x;
             
             bool over_left = (mouse.x >= start_x && mouse.x <= start_x + handle_w + 6);
             bool over_right = (mouse.x >= end_x - handle_w - 6 && mouse.x <= end_x);
@@ -1189,6 +1358,73 @@ bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, 
                 ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
                 break;
             }
+        }
+    }
+    
+    // Draw scrollbar AFTER clips (always visible to prevent layout jumps)
+    {
+        // Scrollbar track (always visible)
+        draw_list->AddRectFilled(ImVec2(bb_min.x + 2, scroll_bar_y), 
+                                 ImVec2(bb_max.x - 2, scroll_bar_y + scroll_bar_h), 
+                                 IM_COL32(15, 15, 18, 255), 6.0f);
+        
+        if (scrollbar_active) {
+            // Active scrollbar - show thumb
+            float scroll_width = std::max(30.0f, size.x / state.zoom);  // Minimum thumb width
+            float scroll_range = size.x - scroll_width;
+            float scroll_x = bb_min.x + (max_scroll > 0 ? (state.scroll / max_scroll) * scroll_range : 0);
+            
+            ImVec2 thumb_min(scroll_x, scroll_bar_y);
+            ImVec2 thumb_max(scroll_x + scroll_width, scroll_bar_y + scroll_bar_h);
+            bool thumb_hovered = (mouse.x >= thumb_min.x && mouse.x <= thumb_max.x &&
+                                  mouse.y >= thumb_min.y - 4 && mouse.y <= thumb_max.y + 4);
+            
+            // Thumb color
+            ImU32 thumb_color = IM_COL32(70, 70, 80, 255);
+            if (state.dragging == 5) {
+                thumb_color = IM_COL32(110, 110, 130, 255);
+            } else if (thumb_hovered) {
+                thumb_color = IM_COL32(90, 90, 105, 255);
+            }
+            
+            draw_list->AddRectFilled(thumb_min, thumb_max, thumb_color, 6.0f);
+            
+            // Handle scrollbar click/drag
+            if (mouse_over_scrollbar && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && state.dragging == 0) {
+                if (thumb_hovered) {
+                    state.dragging = 5;
+                    state.pan_start_x = mouse.x;
+                    state.pan_start_scroll = state.scroll;
+                } else {
+                    // Click on track - jump to that position
+                    float click_ratio = (mouse.x - bb_min.x - scroll_width/2) / scroll_range;
+                    state.scroll = click_ratio * max_scroll;
+                    state.scroll = std::clamp(state.scroll, 0.0f, max_scroll);
+                }
+            }
+            
+            // Cursor feedback
+            if (mouse_over_scrollbar && state.dragging == 0) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            }
+        } else {
+            // Not zoomed - show full-width greyed thumb
+            draw_list->AddRectFilled(ImVec2(bb_min.x + 2, scroll_bar_y), 
+                                     ImVec2(bb_max.x - 2, scroll_bar_y + scroll_bar_h), 
+                                     IM_COL32(40, 40, 45, 255), 6.0f);
+        }
+    }
+    
+    // Handle scrollbar dragging (continue even when mouse leaves scrollbar area)
+    if (state.dragging == 5) {
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            float delta_x = mouse.x - state.pan_start_x;
+            float delta_scroll = (delta_x / size.x) * total_duration;
+            state.scroll = state.pan_start_scroll + delta_scroll;
+            state.scroll = std::clamp(state.scroll, 0.0f, max_scroll);
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        } else {
+            state.dragging = 0;
         }
     }
     
@@ -1342,7 +1578,8 @@ int main() {
                     ImGuiWindowFlags_NoResize |
                     ImGuiWindowFlags_NoMove |
                     ImGuiWindowFlags_NoBackground |
-                    ImGuiWindowFlags_NoScrollbar);
+                    ImGuiWindowFlags_NoScrollbar |
+                    ImGuiWindowFlags_NoScrollWithMouse);
                 
                 float ui_scale = main_window.scale;
                 float controls_height = 130 * ui_scale;
