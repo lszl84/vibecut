@@ -354,8 +354,9 @@ struct VideoPlayer {
     std::string format_time(double t) {
         int minutes = (int)(t / 60);
         int seconds = (int)t % 60;
+        int frames = (int)((t - (int)t) * framerate);
         char buf[32];
-        std::snprintf(buf, sizeof(buf), "%d:%02d", minutes, seconds);
+        std::snprintf(buf, sizeof(buf), "%d:%02d:%02d", minutes, seconds, frames);
         return buf;
     }
     
@@ -1691,52 +1692,52 @@ int main() {
                 }
                 
                 // Up arrow: go to previous clip boundary
-                // Works like: start of clip 2 -> end of clip 1 -> start of clip 1 -> end of clip 0...
                 if (ImGui::IsKeyPressed(ImGuiKey_UpArrow) && !player.clips.empty()) {
                     player.pause();
-                    double target = 0.0;
                     
-                    // Find the previous clip boundary before current position
-                    for (int i = (int)player.clips.size() - 1; i >= 0; i--) {
-                        const Clip& c = player.clips[i];
-                        // Check if clip end is behind us
-                        if (c.source_end < player.current_time - nav_frame_dur * 0.5) {
-                            target = c.source_end - nav_frame_dur * 0.1;
-                            break;
-                        }
-                        // Check if clip start is behind us  
-                        if (c.source_start < player.current_time - nav_frame_dur * 0.5) {
-                            target = c.source_start;
-                            break;
+                    // Build list of all boundaries (clip starts and ends)
+                    std::vector<double> boundaries;
+                    for (const auto& c : player.clips) {
+                        boundaries.push_back(c.source_start);
+                        boundaries.push_back(c.source_end - nav_frame_dur * 0.1);  // End minus tiny bit
+                    }
+                    std::sort(boundaries.begin(), boundaries.end());
+                    
+                    // Find the largest boundary that's less than current position
+                    double target = boundaries.empty() ? 0.0 : boundaries[0];
+                    double threshold = nav_frame_dur * 0.3;
+                    for (double b : boundaries) {
+                        if (b < player.current_time - threshold) {
+                            target = b;
                         }
                     }
                     
-                    player.seek(target);
+                    player.seek(std::max(0.0, target));
                 }
                 
                 // Down arrow: go to next clip boundary
-                // Works like: end of clip 1 -> start of clip 2 -> end of clip 2 -> start of clip 3...
                 if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) && !player.clips.empty()) {
                     player.pause();
-                    double target = player.current_time;
                     
-                    // Find the next clip boundary after current position
-                    for (int i = 0; i < (int)player.clips.size(); i++) {
-                        const Clip& c = player.clips[i];
-                        // Check if clip start is ahead of us
-                        if (c.source_start > player.current_time + nav_frame_dur * 0.5) {
-                            target = c.source_start;
-                            break;
-                        }
-                        // Check if clip end is ahead of us
-                        if (c.source_end > player.current_time + nav_frame_dur * 0.5) {
-                            // Go to end (minus tiny bit to stay in clip)
-                            target = c.source_end - nav_frame_dur * 0.1;
+                    // Build list of all boundaries (clip starts and ends)
+                    std::vector<double> boundaries;
+                    for (const auto& c : player.clips) {
+                        boundaries.push_back(c.source_start);
+                        boundaries.push_back(c.source_end - nav_frame_dur * 0.1);  // End minus tiny bit
+                    }
+                    std::sort(boundaries.begin(), boundaries.end());
+                    
+                    // Find the smallest boundary that's greater than current position
+                    double target = boundaries.empty() ? player.duration : boundaries.back();
+                    double threshold = nav_frame_dur * 0.3;
+                    for (double b : boundaries) {
+                        if (b > player.current_time + threshold) {
+                            target = b;
                             break;
                         }
                     }
                     
-                    player.seek(target);
+                    player.seek(std::min(player.duration, target));
                 }
                 
                 // Timeline with clips

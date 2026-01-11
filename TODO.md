@@ -7,6 +7,11 @@
 - Precise frame-accurate timing may need further work
 - Will address with timeline navigation improvements
 
+### Bug #4: Up/Down arrow navigation inconsistent with very short clips
+- When clips are 1 frame each, up/down navigation behaves erratically
+- Sometimes moves by one frame, sometimes by whole clip
+- Need to debug boundary detection logic for edge cases
+
 ## Fixed Bugs
 
 ### ~~Bug #1: Playback gets stuck in middle clips (non-deterministic)~~ ✓ FIXED
