@@ -903,7 +903,8 @@ WindowData create_window(const char* title, int width, int height, GLFWwindow* s
     ImGui::SetCurrentContext(data.imgui_ctx);
     
     ImGuiIO& io = ImGui::GetIO();
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    // Don't enable keyboard nav - we use arrow keys for timeline navigation
+    // io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.Fonts->AddFontFromMemoryCompressedBase85TTF(RobotoMedium_compressed_data_base85, 16.0f * data.scale);
     
     ImGui::StyleColorsDark();
@@ -1618,9 +1619,80 @@ int main() {
                     player.clips.size(),
                     player.format_time(player.trimmed_duration()).c_str());
                 
+                // Spacebar to play/pause
+                if (ImGui::IsKeyPressed(ImGuiKey_Space)) {
+                    if (player.playing) {
+                        player.pause();
+                    } else {
+                        player.play();
+                    }
+                }
+                
                 // 'B' key to split clip at playhead
                 if (ImGui::IsKeyPressed(ImGuiKey_B) && !player.clips.empty()) {
                     player.split_at(player.current_time);
+                }
+                
+                // Arrow key navigation
+                double nav_frame_dur = 1.0 / player.framerate;
+                
+                // Left/Right arrows: move by one frame
+                if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
+                    player.pause();
+                    player.seek(std::max(0.0, player.current_time - nav_frame_dur));
+                }
+                if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) {
+                    player.pause();
+                    player.seek(std::min(player.duration, player.current_time + nav_frame_dur));
+                }
+                
+                // Up arrow: go to previous clip boundary
+                // Works like: start of clip 2 -> end of clip 1 -> start of clip 1 -> end of clip 0...
+                if (ImGui::IsKeyPressed(ImGuiKey_UpArrow) && !player.clips.empty()) {
+                    player.pause();
+                    double target = 0.0;
+                    
+                    // Find the previous clip boundary before current position
+                    for (int i = (int)player.clips.size() - 1; i >= 0; i--) {
+                        const Clip& c = player.clips[i];
+                        // Check if clip end is behind us
+                        if (c.source_end < player.current_time - nav_frame_dur * 0.5) {
+                            target = c.source_end - nav_frame_dur * 0.1;
+                            break;
+                        }
+                        // Check if clip start is behind us  
+                        if (c.source_start < player.current_time - nav_frame_dur * 0.5) {
+                            target = c.source_start;
+                            break;
+                        }
+                    }
+                    
+                    player.seek(target);
+                }
+                
+                // Down arrow: go to next clip boundary
+                // Works like: end of clip 1 -> start of clip 2 -> end of clip 2 -> start of clip 3...
+                if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) && !player.clips.empty()) {
+                    player.pause();
+                    double target = player.current_time;
+                    
+                    // Find the next clip boundary after current position
+                    for (int i = 0; i < (int)player.clips.size(); i++) {
+                        const Clip& c = player.clips[i];
+                        // Check if clip start is ahead of us
+                        if (c.source_start > player.current_time + nav_frame_dur * 0.5) {
+                            target = c.source_start;
+                            break;
+                        }
+                        // Check if clip end is ahead of us
+                        if (c.source_end > player.current_time + nav_frame_dur * 0.5) {
+                            // Go to end (minus tiny bit to stay in clip)
+                            target = c.source_end - nav_frame_dur * 0.1;
+                            break;
+                        }
+                    }
+                    
+                    player.seek(target);
                 }
                 
                 // Timeline with clips
