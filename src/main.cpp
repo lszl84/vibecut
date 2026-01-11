@@ -1007,7 +1007,7 @@ struct ClipsTimelineState {
 // Modern Final Cut-style magnetic timeline widget with zoom/scroll
 // Clips are always contiguous - no gaps allowed
 // Returns true if anything changed
-bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, float source_duration, const ImVec2& size, ClipsTimelineState& state) {
+bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, float source_duration, float frame_duration, const ImVec2& size, ClipsTimelineState& state) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     
@@ -1027,6 +1027,13 @@ bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, 
     // Zoom and scroll calculations - based on SOURCE duration for consistent pixel scaling
     // This means 1 second of video = same pixel width regardless of trimming
     float base_duration = source_duration;
+    
+    // Dynamic max zoom: at max zoom, one frame should be ~50 pixels wide
+    // visible_duration = base_duration / zoom, and we want visible_duration = frame_duration * (size.x / 50)
+    float pixels_per_frame_at_max = 50.0f;
+    float max_zoom = base_duration / (frame_duration * (size.x / pixels_per_frame_at_max));
+    max_zoom = std::max(max_zoom, 1.0f);  // At least 1x zoom
+    
     float visible_duration = base_duration / state.zoom;
     float max_scroll = std::max(0.0f, base_duration - visible_duration);
     state.scroll = std::clamp(state.scroll, 0.0f, max_scroll);
@@ -1207,7 +1214,7 @@ bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, 
                 float old_zoom = state.zoom;
                 
                 state.zoom *= (wheel > 0) ? 1.2f : (1.0f / 1.2f);
-                state.zoom = std::clamp(state.zoom, 0.25f, 20.0f);
+                state.zoom = std::clamp(state.zoom, 0.25f, max_zoom);
                 
                 // Adjust scroll to keep mouse position stable
                 if (state.zoom != old_zoom) {
@@ -1332,7 +1339,7 @@ bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, 
                 float delta_time = (delta_x / size.x) * visible_duration;
                 
                 double new_start = clip.source_start + delta_time;
-                new_start = std::clamp(new_start, 0.0, clip.source_end - 0.1);
+                new_start = std::clamp(new_start, 0.0, clip.source_end - (double)frame_duration);
                 clip.source_start = new_start;
                 changed = true;
             } else if (state.dragging == 2) {
@@ -1341,7 +1348,7 @@ bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, 
                 float delta_time = (delta_x / size.x) * visible_duration;
                 
                 double new_end = clip.source_end + delta_time;
-                new_end = std::clamp(new_end, clip.source_start + 0.1, (double)source_duration);
+                new_end = std::clamp(new_end, clip.source_start + (double)frame_duration, (double)source_duration);
                 clip.source_end = new_end;
                 changed = true;
             }
@@ -1622,7 +1629,8 @@ int main() {
                 
                 static float last_seek_target = -1.0f;
                 
-                if (ClipsTimeline("##clips_timeline", &curr, player.clips, (float)player.duration, 
+                float frame_dur = 1.0f / (float)player.framerate;
+                if (ClipsTimeline("##clips_timeline", &curr, player.clips, (float)player.duration, frame_dur,
                                  ImVec2(viewport->Size.x - 20, 50 * ui_scale), timeline_state)) {
                     // Only seek if playhead moved
                     float target_diff = std::abs(curr - last_seek_target);
