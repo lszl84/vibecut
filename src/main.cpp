@@ -1024,9 +1024,11 @@ bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, 
     for (const auto& c : clips) total_duration += (float)c.duration();
     if (total_duration < 0.01f) total_duration = source_duration;
     
-    // Zoom and scroll calculations
-    float visible_duration = total_duration / state.zoom;
-    float max_scroll = std::max(0.0f, total_duration - visible_duration);
+    // Zoom and scroll calculations - based on SOURCE duration for consistent pixel scaling
+    // This means 1 second of video = same pixel width regardless of trimming
+    float base_duration = source_duration;
+    float visible_duration = base_duration / state.zoom;
+    float max_scroll = std::max(0.0f, base_duration - visible_duration);
     state.scroll = std::clamp(state.scroll, 0.0f, max_scroll);
     float view_start = state.scroll;
     float view_end = state.scroll + visible_duration;
@@ -1209,9 +1211,9 @@ bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, 
                 
                 // Adjust scroll to keep mouse position stable
                 if (state.zoom != old_zoom) {
-                    float new_visible = total_duration / state.zoom;
+                    float new_visible = base_duration / state.zoom;
                     state.scroll = mouse_time - (mouse.x - bb_min.x) / size.x * new_visible;
-                    state.scroll = std::clamp(state.scroll, 0.0f, std::max(0.0f, total_duration - new_visible));
+                    state.scroll = std::clamp(state.scroll, 0.0f, std::max(0.0f, base_duration - new_visible));
                 }
             }
         }
@@ -1419,7 +1421,7 @@ bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, 
     if (state.dragging == 5) {
         if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
             float delta_x = mouse.x - state.pan_start_x;
-            float delta_scroll = (delta_x / size.x) * total_duration;
+            float delta_scroll = (delta_x / size.x) * base_duration;
             state.scroll = state.pan_start_scroll + delta_scroll;
             state.scroll = std::clamp(state.scroll, 0.0f, max_scroll);
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
