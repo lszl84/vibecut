@@ -1636,14 +1636,58 @@ int main() {
                 // Arrow key navigation
                 double nav_frame_dur = 1.0 / player.framerate;
                 
-                // Left/Right arrows: move by one frame
-                if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
+                // Left/Right arrows: move by one frame in EDITED timeline
+                // (skips over trimmed-out sections between clips)
+                if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) && !player.clips.empty()) {
                     player.pause();
-                    player.seek(std::max(0.0, player.current_time - nav_frame_dur));
+                    double new_time = player.current_time - nav_frame_dur;
+                    
+                    // Check if new_time is inside any clip
+                    bool in_clip = false;
+                    for (const auto& c : player.clips) {
+                        if (new_time >= c.source_start && new_time < c.source_end) {
+                            in_clip = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!in_clip) {
+                        // Find the end of the previous clip
+                        double best = 0.0;
+                        for (const auto& c : player.clips) {
+                            if (c.source_end <= player.current_time + nav_frame_dur * 0.5) {
+                                best = c.source_end - nav_frame_dur * 0.1;
+                            }
+                        }
+                        new_time = best;
+                    }
+                    
+                    player.seek(std::max(0.0, new_time));
                 }
-                if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) {
+                if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) && !player.clips.empty()) {
                     player.pause();
-                    player.seek(std::min(player.duration, player.current_time + nav_frame_dur));
+                    double new_time = player.current_time + nav_frame_dur;
+                    
+                    // Check if new_time is inside any clip
+                    bool in_clip = false;
+                    for (const auto& c : player.clips) {
+                        if (new_time >= c.source_start && new_time < c.source_end) {
+                            in_clip = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!in_clip) {
+                        // Find the start of the next clip
+                        for (const auto& c : player.clips) {
+                            if (c.source_start > player.current_time - nav_frame_dur * 0.5) {
+                                new_time = c.source_start;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    player.seek(std::min(player.duration, new_time));
                 }
                 
                 // Up arrow: go to previous clip boundary
