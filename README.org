@@ -53,14 +53,14 @@ git submodule update --init
 * Time Tracking
 
 #+BEGIN: clocktable :maxlevel nil :scope file :block nil
-#+CAPTION: Clock summary at [2026-01-11 Sun 11:15]
+#+CAPTION: Clock summary at [2026-01-13 Tue 20:29]
 | Headline          | Time |      |
 |-------------------+------+------|
-| *Total time*        | *4:22* |      |
+| *Total time*        | *6:37* |      |
 |-------------------+------+------|
-| Tasks             | 4:22 |      |
+| Tasks             | 6:37 |      |
 | \_  Initial Setup |      | 0:13 |
-| \_  Vibe coding   |      | 4:09 |
+| \_  Vibe coding   |      | 6:24 |
 #+END:
 
 * Tasks
@@ -73,6 +73,7 @@ CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
 :END:
 ** Vibe coding
 :LOGBOOK:
+CLOCK: [2026-01-13 Tue 18:14]--[2026-01-13 Tue 20:29] =>  2:15
 CLOCK: [2026-01-11 Sun 10:04]--[2026-01-11 Sun 11:15] =>  1:11
 CLOCK: [2026-01-10 Sat 12:43]--[2026-01-10 Sat 13:28] =>  0:45
 CLOCK: [2026-01-09 Fri 17:45]--[2026-01-09 Fri 18:40] =>  0:55
@@ -88,6 +89,23 @@ Adding/changing code by hand, debugging, etc.
 * Devlog
 
 Live Streams: https://www.youtube.com/@lukeatdevmindscape/streams
+
+** Day 7
+This one was pretty interesting. Claude could not seem to fix various
+problem with frame-by-frame navigation, until I suggested using
+integer-based frame indexing to avoid floating point errors.
+
+This is not something that a non-programmer would be able to come up
+with, so I think we're still not ready for full-blown vibe coding,
+where regular people can create complex software.
+
+At least not as of 13 Jan 2026 ;)
+
+After switching to integer-based indexing, Claude managed to fix some
+off-by-one errors and we made navigation between frames resemble more
+what FinalCut does. Still, there are some errors with exporting
+(missing frames?) - not sure if this is related to how video
+re-encoding works in general, or a bug in our code.
 
 ** Day 6
 Added keyboard navigation between clips and frames, timeline zoom with
