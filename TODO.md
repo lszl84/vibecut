@@ -7,10 +7,11 @@
 - Precise frame-accurate timing may need further work
 - Will address with timeline navigation improvements
 
-### Bug #4: Up/Down arrow navigation inconsistent with very short clips
+### ~~Bug #4: Up/Down arrow navigation inconsistent with very short clips~~ ✓ MOSTLY FIXED
 - When clips are 1 frame each, up/down navigation behaves erratically
-- Sometimes moves by one frame, sometimes by whole clip
-- Need to debug boundary detection logic for edge cases
+- **Fix**: Use 1.5x frame duration for left arrow to compensate for framerate metadata mismatches
+- Navigation now works correctly for all frame positions
+- See open/closed interval issue below for remaining edge case
 
 ## Fixed Bugs
 
@@ -31,3 +32,11 @@
 - Undo/redo functionality
 - Adjustable export quality/bitrate
 - Preview of clip transitions before export
+
+### Open/Closed Interval Issue
+- Current behavior: playhead can reach the exact clip end boundary (e.g., 0.082 for clip [0, 0.082])
+- With half-open intervals [start, end), position `end` is technically outside the clip
+- This causes a visual inconsistency where the playhead appears at the "closed" end
+- The last frame's timestamp equals the clip end, making it ambiguous
+- **Impact**: Minor visual/conceptual issue; navigation works correctly
+- **Future fix**: Consider adjusting clip end to be `last_frame_start + frame_duration` or display playhead at `end - epsilon`

@@ -275,8 +275,10 @@ struct VideoPlayer {
         if (idx < 0) return;
         
         Clip& clip = clips[idx];
-        // Don't split if too close to edges
-        if (source_time - clip.source_start < 0.1 || clip.source_end - source_time < 0.1) return;
+        // Don't split if too close to edges (use 1 frame as minimum)
+        double min_clip_duration = 1.0 / framerate;
+        if (source_time - clip.source_start < min_clip_duration * 0.9 || 
+            clip.source_end - source_time < min_clip_duration * 0.9) return;
         
         Clip new_clip = {source_time, clip.source_end};
         clip.source_end = source_time;
@@ -506,9 +508,16 @@ bool export_clips(const std::string& input, const std::string& output, const std
         return false;
     }
     
-    // Calculate total duration
+    // Calculate total duration and log clip structure
     double total_duration = 0.0;
-    for (const auto& clip : clips) total_duration += clip.duration();
+    std::printf("EXPORT: === Clip structure ===\n");
+    for (size_t i = 0; i < clips.size(); i++) {
+        std::printf("EXPORT: Clip %zu: [%.6f - %.6f] duration=%.6f\n", 
+                    i, clips[i].source_start, clips[i].source_end, clips[i].duration());
+        total_duration += clips[i].duration();
+    }
+    std::printf("EXPORT: Total duration: %.6f seconds\n", total_duration);
+    std::printf("EXPORT: =====================\n");
     
     AVPacket* pkt = av_packet_alloc();
     AVPacket* enc_pkt = av_packet_alloc();
@@ -547,7 +556,10 @@ bool export_clips(const std::string& input, const std::string& output, const std
         bool reached_clip = false;
         int frames_skipped = 0;
         int frames_encoded = 0;
-        double first_frame_time = -1.0;  // Will be set when we get the first frame
+        int frames_to_include = std::max(1, (int)std::round(clip.duration() * src_fps.num / src_fps.den));
+        
+        std::printf("EXPORT: Clip expects %d frames (duration=%.6f, fps=%d/%d)\n", 
+                    frames_to_include, clip.duration(), src_fps.num, src_fps.den);
         
         while (av_read_frame(in_ctx, pkt) >= 0 && exporting) {
             AVStream* in_stream = in_ctx->streams[pkt->stream_index];
@@ -559,18 +571,20 @@ bool export_clips(const std::string& input, const std::string& output, const std
                 while (avcodec_receive_frame(dec_ctx, frame) >= 0) {
                     double frame_time = frame->pts * av_q2d(in_stream->time_base);
                     
-                    // Track the first frame we receive after seeking
-                    if (first_frame_time < 0) {
-                        first_frame_time = frame_time;
-                        std::printf("EXPORT: First frame received at %.3f\n", first_frame_time);
+                    std::printf("EXPORT: Got frame at %.6f, clip=[%.6f, %.6f]\n", 
+                                frame_time, clip.source_start, clip.source_end);
+                    
+                    // Skip frames that are clearly before the clip start (with tolerance)
+                    double frame_dur = (double)src_fps.den / src_fps.num;
+                    if (frame_time < clip.source_start - frame_dur * 0.5) {
+                        frames_skipped++;
+                        std::printf("EXPORT: Skipping (before clip)\n");
+                        continue;
                     }
                     
-                    // Calculate relative time: how far into the clip this frame is
-                    double relative_time = frame_time - first_frame_time;
-                    
-                    // Check if we've exceeded the clip duration
-                    if (relative_time >= clip.duration()) {
-                        std::printf("EXPORT: Frame at relative %.3f past clip duration %.3f, stopping\n", relative_time, clip.duration());
+                    // Check if we've encoded enough frames for this clip
+                    if (frames_encoded >= frames_to_include) {
+                        std::printf("EXPORT: Encoded %d frames, stopping clip\n", frames_encoded);
                         av_packet_unref(pkt);
                         goto done_with_clip;
                     }
@@ -578,7 +592,8 @@ bool export_clips(const std::string& input, const std::string& output, const std
                     reached_clip = true;
                     frames_encoded++;
                     
-                    // Calculate output time: relative time within clip + offset from previous clips
+                    // Calculate output time: position within clip + offset from previous clips
+                    double relative_time = frame_time - clip.source_start;
                     double output_time = relative_time + time_offset;
                     progress = (float)(output_time / total_duration);
                     
@@ -600,14 +615,14 @@ bool export_clips(const std::string& input, const std::string& output, const std
                         av_packet_unref(enc_pkt);
                     }
                 }
-            } else if (pkt->stream_index == audio_stream_idx && out_audio_idx >= 0 && first_frame_time >= 0) {
-                // Stream copy audio - use relative times based on first video frame
-                double audio_relative_time = pkt_time - first_frame_time;
-                
-                if (audio_relative_time < -0.1 || audio_relative_time > clip.duration() + 0.1) {
+            } else if (pkt->stream_index == audio_stream_idx && out_audio_idx >= 0 && reached_clip) {
+                // Stream copy audio - check if within clip bounds
+                if (pkt_time < clip.source_start - 0.1 || pkt_time >= clip.source_end + 0.1) {
                     av_packet_unref(pkt);
                     continue;
                 }
+                
+                double audio_relative_time = pkt_time - clip.source_start;
                 
                 AVStream* out_audio = out_ctx->streams[out_audio_idx];
                 AVStream* in_audio = in_ctx->streams[audio_stream_idx];
@@ -1327,7 +1342,10 @@ bool ClipsTimeline(const char* label, float* current, std::vector<Clip>& clips, 
                 tpos += dur;
                 source_time = (float)c.source_end;
             }
-            *current = std::clamp(source_time, 0.0f, source_duration);
+            // Clamp to the start of the last valid frame (not past it)
+            float last_clip_end = clips.empty() ? source_duration : (float)clips.back().source_end;
+            float last_valid_pos = std::max(0.0f, last_clip_end - frame_duration);
+            *current = std::clamp(source_time, 0.0f, last_valid_pos);
             changed = true;
         } else if (state.dragging_clip >= 0 && state.dragging_clip < (int)clips.size()) {
             Clip& clip = clips[state.dragging_clip];
@@ -1641,7 +1659,11 @@ int main() {
                 // (skips over trimmed-out sections between clips)
                 if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) && !player.clips.empty()) {
                     player.pause();
-                    double new_time = player.current_time - nav_frame_dur;
+                    // Use 1.5x frame duration to ensure we land on previous frame
+                    // (compensates for framerate metadata mismatches)
+                    double new_time = player.current_time - nav_frame_dur * 1.5;
+                    
+                    double first_clip_start = player.clips.front().source_start;
                     
                     // Check if new_time is inside any clip
                     bool in_clip = false;
@@ -1654,7 +1676,7 @@ int main() {
                     
                     if (!in_clip) {
                         // Find the end of the previous clip
-                        double best = 0.0;
+                        double best = first_clip_start;
                         for (const auto& c : player.clips) {
                             if (c.source_end <= player.current_time + nav_frame_dur * 0.5) {
                                 best = c.source_end - nav_frame_dur * 0.1;
@@ -1663,11 +1685,13 @@ int main() {
                         new_time = best;
                     }
                     
-                    player.seek(std::max(0.0, new_time));
+                    player.seek(std::max(first_clip_start, new_time));
                 }
                 if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) && !player.clips.empty()) {
                     player.pause();
                     double new_time = player.current_time + nav_frame_dur;
+                    
+                    double last_clip_end = player.clips.back().source_end;
                     
                     // Check if new_time is inside any clip
                     bool in_clip = false;
@@ -1680,64 +1704,81 @@ int main() {
                     
                     if (!in_clip) {
                         // Find the start of the next clip
+                        bool found_next = false;
                         for (const auto& c : player.clips) {
-                            if (c.source_start > player.current_time - nav_frame_dur * 0.5) {
+                            if (c.source_start > player.current_time + nav_frame_dur * 0.1) {
                                 new_time = c.source_start;
+                                found_next = true;
                                 break;
                             }
                         }
-                    }
-                    
-                    player.seek(std::min(player.duration, new_time));
-                }
-                
-                // Up arrow: go to previous clip boundary
-                if (ImGui::IsKeyPressed(ImGuiKey_UpArrow) && !player.clips.empty()) {
-                    player.pause();
-                    
-                    // Build list of all boundaries (clip starts and ends)
-                    std::vector<double> boundaries;
-                    for (const auto& c : player.clips) {
-                        boundaries.push_back(c.source_start);
-                        boundaries.push_back(c.source_end - nav_frame_dur * 0.1);  // End minus tiny bit
-                    }
-                    std::sort(boundaries.begin(), boundaries.end());
-                    
-                    // Find the largest boundary that's less than current position
-                    double target = boundaries.empty() ? 0.0 : boundaries[0];
-                    double threshold = nav_frame_dur * 0.3;
-                    for (double b : boundaries) {
-                        if (b < player.current_time - threshold) {
-                            target = b;
+                        // If no next clip, clamp to last valid frame position
+                        if (!found_next) {
+                            double last_frame_start = last_clip_end - nav_frame_dur;
+                            new_time = std::max(last_frame_start, player.clips.back().source_start);
                         }
                     }
                     
-                    player.seek(std::max(0.0, target));
+                    // Clamp to valid range
+                    double last_frame_start = last_clip_end - nav_frame_dur;
+                    last_frame_start = std::max(last_frame_start, player.clips.back().source_start);
+                    new_time = std::min(last_frame_start, new_time);
+                    
+                    player.seek(new_time);
                 }
                 
-                // Down arrow: go to next clip boundary
-                if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) && !player.clips.empty()) {
+                // Up/Down arrows: navigate between clip boundaries
+                // Boundaries are clip starts plus the very end
+                std::vector<double> boundaries;
+                for (const auto& c : player.clips) {
+                    boundaries.push_back(c.source_start);
+                }
+                // Add the actual end of the last clip
+                if (!player.clips.empty()) {
+                    boundaries.push_back(player.clips.back().source_end);
+                }
+                std::sort(boundaries.begin(), boundaries.end());
+                
+                double epsilon = nav_frame_dur * 0.1;
+                
+                // Up arrow: go to previous boundary
+                if (ImGui::IsKeyPressed(ImGuiKey_UpArrow) && !boundaries.empty()) {
                     player.pause();
                     
-                    // Build list of all boundaries (clip starts and ends)
-                    std::vector<double> boundaries;
-                    for (const auto& c : player.clips) {
-                        boundaries.push_back(c.source_start);
-                        boundaries.push_back(c.source_end - nav_frame_dur * 0.1);  // End minus tiny bit
+                    // Find the largest boundary that's less than current position
+                    double target = boundaries[0];
+                    for (double b : boundaries) {
+                        if (b < player.current_time - epsilon) {
+                            target = b;
+                        }
                     }
-                    std::sort(boundaries.begin(), boundaries.end());
+                    player.seek(target);
+                }
+                
+                // Down arrow: go to next boundary
+                if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) && !boundaries.empty()) {
+                    player.pause();
+                    
+                    double last_clip_end = player.clips.back().source_end;
+                    double last_frame_start = last_clip_end - nav_frame_dur;
+                    last_frame_start = std::max(last_frame_start, player.clips.back().source_start);
                     
                     // Find the smallest boundary that's greater than current position
-                    double target = boundaries.empty() ? player.duration : boundaries.back();
-                    double threshold = nav_frame_dur * 0.3;
+                    // But clamp the last boundary to last_frame_start
+                    double target = last_frame_start;
                     for (double b : boundaries) {
-                        if (b > player.current_time + threshold) {
-                            target = b;
+                        if (b > player.current_time + epsilon) {
+                            // If this is the last boundary (end), use last_frame_start instead
+                            if (b >= last_clip_end - epsilon) {
+                                target = last_frame_start;
+                            } else {
+                                target = b;
+                            }
                             break;
                         }
                     }
                     
-                    player.seek(std::min(player.duration, target));
+                    player.seek(target);
                 }
                 
                 // Timeline with clips
