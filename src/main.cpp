@@ -1424,9 +1424,21 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
                 int64_t delta_frames = time_to_frame_local(std::abs(delta_time));
                 if (delta_time < 0) delta_frames = -delta_frames;
                 
+                int64_t old_start = clip.start_frame;
                 int64_t new_start = clip.start_frame + delta_frames;
-                new_start = std::clamp(new_start, (int64_t)0, clip.end_frame - 1);
+                
+                // Prevent overlap with previous clip
+                int64_t min_start = 0;
+                if (state.dragging_clip > 0) {
+                    min_start = clips[state.dragging_clip - 1].end_frame;
+                }
+                new_start = std::clamp(new_start, min_start, clip.end_frame - 1);
                 clip.start_frame = new_start;
+                
+                // If playhead was at the old start, follow the handle
+                if (*current_frame == old_start || *current_frame < new_start) {
+                    *current_frame = new_start;
+                }
                 changed = true;
             } else if (state.dragging == 2) {
                 // Right handle - adjust end_frame (trim end)
@@ -1435,9 +1447,52 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
                 int64_t delta_frames = time_to_frame_local(std::abs(delta_time));
                 if (delta_time < 0) delta_frames = -delta_frames;
                 
+                int64_t old_end = clip.end_frame;
                 int64_t new_end = clip.end_frame + delta_frames;
-                new_end = std::clamp(new_end, clip.start_frame + 1, total_source_frames);
+                
+                // Prevent overlap with next clip
+                int64_t max_end = total_source_frames;
+                if (state.dragging_clip < (int)clips.size() - 1) {
+                    max_end = clips[state.dragging_clip + 1].start_frame;
+                }
+                new_end = std::clamp(new_end, clip.start_frame + 1, max_end);
                 clip.end_frame = new_end;
+                
+                // If playhead was at the old last frame, follow the handle
+                if (*current_frame == old_end - 1 || *current_frame >= new_end) {
+                    *current_frame = new_end - 1;
+                }
+                changed = true;
+            }
+            
+            // After resizing, check if current_frame is now outside all clips
+            // If so, snap it to the nearest valid position
+            bool frame_in_clip = false;
+            for (const auto& c : clips) {
+                if (*current_frame >= c.start_frame && *current_frame < c.end_frame) {
+                    frame_in_clip = true;
+                    break;
+                }
+            }
+            if (!frame_in_clip && !clips.empty()) {
+                // Find the closest clip and snap to it
+                int64_t best_frame = clips[0].start_frame;
+                int64_t best_dist = std::abs(*current_frame - best_frame);
+                
+                for (const auto& c : clips) {
+                    int64_t dist_to_start = std::abs(*current_frame - c.start_frame);
+                    int64_t dist_to_end = std::abs(*current_frame - (c.end_frame - 1));
+                    
+                    if (dist_to_start < best_dist) {
+                        best_dist = dist_to_start;
+                        best_frame = c.start_frame;
+                    }
+                    if (dist_to_end < best_dist) {
+                        best_dist = dist_to_end;
+                        best_frame = c.end_frame - 1;
+                    }
+                }
+                *current_frame = best_frame;
                 changed = true;
             }
         }
@@ -1721,22 +1776,63 @@ int main() {
                 }
                 
                 // Frame-based arrow key navigation (simple and precise)
+                // Must handle case where current_frame is outside all clips (e.g., after resizing)
+                
+                // Helper: find which clip contains a frame, or -1 if none
+                auto find_clip_containing = [&](int64_t frame) -> int {
+                    for (size_t i = 0; i < player.clips.size(); i++) {
+                        if (frame >= player.clips[i].start_frame && frame < player.clips[i].end_frame) {
+                            return (int)i;
+                        }
+                    }
+                    return -1;
+                };
+                
+                // Helper: find the next clip that starts after a given frame
+                auto find_next_clip_after = [&](int64_t frame) -> int {
+                    for (size_t i = 0; i < player.clips.size(); i++) {
+                        if (player.clips[i].start_frame > frame) {
+                            return (int)i;
+                        }
+                    }
+                    return -1;
+                };
+                
+                // Helper: find the last clip that ends at or before a given frame
+                auto find_prev_clip_before = [&](int64_t frame) -> int {
+                    int result = -1;
+                    for (size_t i = 0; i < player.clips.size(); i++) {
+                        if (player.clips[i].end_frame <= frame) {
+                            result = (int)i;
+                        }
+                    }
+                    return result;
+                };
                 
                 // Left arrow: go to previous frame, respecting clip boundaries
                 if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) && !player.clips.empty()) {
                     player.pause();
-                    int64_t new_frame = player.current_frame - 1;
+                    int clip_idx = find_clip_containing(player.current_frame);
+                    int64_t new_frame;
                     
-                    // If we're at the start of a clip (not the first), jump to end of previous clip
-                    int clip_idx = player.clip_at_frame(player.current_frame);
-                    if (clip_idx > 0 && player.current_frame == player.clips[clip_idx].start_frame) {
-                        // Jump to last frame of previous clip
-                        new_frame = player.clips[clip_idx - 1].end_frame - 1;
-                    } else if (new_frame < player.clips[clip_idx >= 0 ? clip_idx : 0].start_frame) {
-                        // Would go before current clip, jump to previous clip if exists
-                        if (clip_idx > 0) {
-                            new_frame = player.clips[clip_idx - 1].end_frame - 1;
+                    if (clip_idx >= 0) {
+                        // We're inside a clip
+                        new_frame = player.current_frame - 1;
+                        if (new_frame < player.clips[clip_idx].start_frame) {
+                            // Would go before current clip, jump to previous clip if exists
+                            if (clip_idx > 0) {
+                                new_frame = player.clips[clip_idx - 1].end_frame - 1;
+                            } else {
+                                new_frame = player.clips.front().start_frame;
+                            }
+                        }
+                    } else {
+                        // We're outside all clips - find the previous clip
+                        int prev_idx = find_prev_clip_before(player.current_frame);
+                        if (prev_idx >= 0) {
+                            new_frame = player.clips[prev_idx].end_frame - 1;
                         } else {
+                            // No clip before us, go to first clip's start
                             new_frame = player.clips.front().start_frame;
                         }
                     }
@@ -1749,14 +1845,30 @@ int main() {
                 // Right arrow: go to next frame, respecting clip boundaries
                 if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) && !player.clips.empty()) {
                     player.pause();
-                    int64_t new_frame = player.current_frame + 1;
+                    int clip_idx = find_clip_containing(player.current_frame);
+                    int64_t new_frame;
                     
-                    // If we're at the end of a clip (not the last), jump to start of next clip
-                    int clip_idx = player.clip_at_frame(player.current_frame);
-                    if (clip_idx >= 0 && clip_idx < (int)player.clips.size() - 1 && 
-                        new_frame >= player.clips[clip_idx].end_frame) {
-                        // Jump to first frame of next clip
-                        new_frame = player.clips[clip_idx + 1].start_frame;
+                    if (clip_idx >= 0) {
+                        // We're inside a clip
+                        new_frame = player.current_frame + 1;
+                        if (new_frame >= player.clips[clip_idx].end_frame) {
+                            // Would go past current clip, jump to next clip if exists
+                            if (clip_idx < (int)player.clips.size() - 1) {
+                                new_frame = player.clips[clip_idx + 1].start_frame;
+                            } else {
+                                // Last clip, clamp to last valid frame
+                                new_frame = player.clips.back().end_frame - 1;
+                            }
+                        }
+                    } else {
+                        // We're outside all clips - find the next clip
+                        int next_idx = find_next_clip_after(player.current_frame);
+                        if (next_idx >= 0) {
+                            new_frame = player.clips[next_idx].start_frame;
+                        } else {
+                            // No clip after us, go to last clip's last frame
+                            new_frame = player.clips.back().end_frame - 1;
+                        }
                     }
                     
                     // Clamp to last valid frame
@@ -1813,9 +1925,10 @@ int main() {
                 
                 if (ClipsTimeline("##clips_timeline", &curr_frame, player.clips, player.total_frames, player.fps,
                                  ImVec2(viewport->Size.x - 20, 50 * ui_scale), timeline_state)) {
-                    // Only seek if playhead moved
-                    if (curr_frame != last_seek_frame && timeline_state.dragging == 3) {
+                    // Seek if frame changed AND there's active mouse interaction
+                    if (curr_frame != last_seek_frame && timeline_state.dragging != 0) {
                         last_seek_frame = curr_frame;
+                        player.current_frame = curr_frame;
                         player.pause();
                         player.seek_to_frame(curr_frame);
                     }
