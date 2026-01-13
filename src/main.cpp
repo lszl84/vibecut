@@ -251,12 +251,24 @@ struct VideoPlayer {
         return false;
     }
     
+    // Check if current_frame is at the end of the timeline (past all clips)
+    bool at_timeline_end() const {
+        if (clips.empty()) return false;
+        return current_frame >= clips.back().end_frame;
+    }
+    
     // Seek to a specific frame number
+    // Allows seeking to end_frame (one past last valid frame) - will display last frame
     void seek_to_frame(int64_t target_frame) {
         if (!loaded) return;
         
-        target_frame = std::clamp(target_frame, (int64_t)0, total_frames - 1);
-        double target_time = frame_to_time(target_frame);
+        // Allow target_frame to be at the end position (for "at end" state)
+        int64_t max_frame = clips.empty() ? total_frames : clips.back().end_frame;
+        target_frame = std::clamp(target_frame, (int64_t)0, max_frame);
+        
+        // For display, seek to the actual displayable frame
+        int64_t display_frame = std::min(target_frame, max_frame - 1);
+        double target_time = frame_to_time(display_frame);
         
         target_time = std::clamp(target_time, 0.0, duration);
         int64_t target_ts = (int64_t)(target_time / time_base);
@@ -277,7 +289,7 @@ struct VideoPlayer {
             if (current_time >= target_time - 0.01) break;
         }
         
-        // Set frame-based position (authoritative)
+        // Set frame-based position (authoritative) - can be at "end" position
         current_frame = target_frame;
         current_time = frame_to_time(target_frame);
         
@@ -492,7 +504,8 @@ bool export_clips(const std::string& input, const std::string& output, const std
     enc_ctx->width = dec_ctx->width;
     enc_ctx->height = dec_ctx->height;
     enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-    enc_ctx->time_base = AVRational{1, 1000};  // Millisecond precision
+    // Use high-precision time_base (90kHz is standard for MPEG)
+    enc_ctx->time_base = AVRational{1, 90000};
     enc_ctx->framerate = src_fps;
     enc_ctx->bit_rate = 8000000;  // 8 Mbps for better quality
     enc_ctx->gop_size = 12;  // Keyframe every 12 frames
@@ -580,7 +593,7 @@ bool export_clips(const std::string& input, const std::string& output, const std
     
     double time_offset = 0.0;  // Accumulated output time from previous clips
     double processed_time = 0.0;
-    int64_t video_pts = 0;  // Running PTS in milliseconds
+    int64_t video_frame_num = 0;  // Running frame number (used as PTS)
     int64_t audio_pts = 0;  // Running audio PTS
     bool first_clip = true;
     
@@ -654,10 +667,11 @@ bool export_clips(const std::string& input, const std::string& output, const std
                     sws_scale(sws_ctx, frame->data, frame->linesize, 0, frame->height,
                               enc_frame->data, enc_frame->linesize);
                     
-                    // Use simple incrementing PTS in milliseconds (based on frame rate)
-                    double frame_duration_ms = 1000.0 * enc_ctx->framerate.den / enc_ctx->framerate.num;
-                    enc_frame->pts = video_pts;
-                    video_pts += (int64_t)frame_duration_ms;
+                    // Calculate PTS based on frame number and 90kHz time_base
+                    // PTS = frame_number * 90000 / fps
+                    double pts_per_frame = 90000.0 * src_fps.den / src_fps.num;
+                    enc_frame->pts = (int64_t)(video_frame_num * pts_per_frame + 0.5);
+                    video_frame_num++;
                     
                     // Encode frame
                     avcodec_send_frame(enc_ctx, enc_frame);
@@ -1224,6 +1238,7 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
     // Convert current frame (in source coordinates) to timeline position
     float playhead_timeline_pos = 0.0f;
     int64_t current_source_frame = *current_frame;
+    bool at_end = false;
     for (const auto& c : clips) {
         if (current_source_frame < c.start_frame) break;
         if (current_source_frame < c.end_frame) {
@@ -1231,6 +1246,11 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
             break;
         }
         playhead_timeline_pos += frame_to_time(c.frame_count());
+    }
+    // Check if at the "end" position (past all clips)
+    if (!clips.empty() && current_source_frame >= clips.back().end_frame) {
+        playhead_timeline_pos = total_duration;  // At the very end
+        at_end = true;
     }
     
     // Playhead - red line with triangular head (only if visible)
@@ -1407,9 +1427,9 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
                 tpos += dur;
                 source_frame = c.end_frame;
             }
-            // Clamp to the last valid frame (end_frame - 1)
-            int64_t last_valid_frame = clips.empty() ? total_source_frames - 1 : clips.back().end_frame - 1;
-            *current_frame = std::clamp(source_frame, (int64_t)0, last_valid_frame);
+            // Allow the "end" position (one past last frame) when clicking at the very end
+            int64_t max_frame = clips.empty() ? total_source_frames : clips.back().end_frame;
+            *current_frame = std::clamp(source_frame, (int64_t)0, max_frame);
             changed = true;
         } else if (state.dragging_clip >= 0 && state.dragging_clip < (int)clips.size()) {
             Clip& clip = clips[state.dragging_clip];
@@ -1747,6 +1767,25 @@ int main() {
                 ImGui::SetCursorPos(ImVec2(img_x, img_y));
                 ImGui::Image((ImTextureID)(intptr_t)player.texture_id, ImVec2(img_w, img_h));
                 
+                // "END" overlay when at the end of the timeline
+                if (player.at_timeline_end()) {
+                    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+                    ImVec2 window_pos = ImGui::GetWindowPos();
+                    
+                    // Semi-transparent gray overlay on the right side
+                    float overlay_width = img_w * 0.12f;
+                    ImVec2 overlay_min(window_pos.x + img_x + img_w - overlay_width, window_pos.y + img_y);
+                    ImVec2 overlay_max(window_pos.x + img_x + img_w, window_pos.y + img_y + img_h);
+                    draw_list->AddRectFilled(overlay_min, overlay_max, IM_COL32(50, 50, 55, 180));
+                    
+                    // "END" text centered in the overlay
+                    const char* end_text = "END";
+                    ImVec2 text_size = ImGui::CalcTextSize(end_text);
+                    float text_x = window_pos.x + img_x + img_w - overlay_width/2 - text_size.x/2;
+                    float text_y = window_pos.y + img_y + img_h/2 - text_size.y/2;
+                    draw_list->AddText(ImVec2(text_x, text_y), IM_COL32(255, 255, 255, 220), end_text);
+                }
+                
                 // Controls
                 ImGui::SetCursorPos(ImVec2(10, viewport->Size.y - controls_height + 5));
                 
@@ -1843,12 +1882,17 @@ int main() {
                 }
                 
                 // Right arrow: go to next frame, respecting clip boundaries
+                // Allows moving to the "end" position (one past last frame) for the last clip
                 if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) && !player.clips.empty()) {
                     player.pause();
                     int clip_idx = find_clip_containing(player.current_frame);
                     int64_t new_frame;
+                    int64_t timeline_end = player.clips.back().end_frame;
                     
-                    if (clip_idx >= 0) {
+                    if (player.current_frame >= timeline_end) {
+                        // Already at or past the end, don't move
+                        new_frame = timeline_end;
+                    } else if (clip_idx >= 0) {
                         // We're inside a clip
                         new_frame = player.current_frame + 1;
                         if (new_frame >= player.clips[clip_idx].end_frame) {
@@ -1856,8 +1900,8 @@ int main() {
                             if (clip_idx < (int)player.clips.size() - 1) {
                                 new_frame = player.clips[clip_idx + 1].start_frame;
                             } else {
-                                // Last clip, clamp to last valid frame
-                                new_frame = player.clips.back().end_frame - 1;
+                                // Last clip - allow going to "end" position
+                                new_frame = timeline_end;
                             }
                         }
                     } else {
@@ -1866,25 +1910,25 @@ int main() {
                         if (next_idx >= 0) {
                             new_frame = player.clips[next_idx].start_frame;
                         } else {
-                            // No clip after us, go to last clip's last frame
-                            new_frame = player.clips.back().end_frame - 1;
+                            // No clip after us, go to end
+                            new_frame = timeline_end;
                         }
                     }
                     
-                    // Clamp to last valid frame
-                    int64_t last_valid = player.clips.back().end_frame - 1;
-                    new_frame = std::min(new_frame, last_valid);
+                    // Clamp to timeline end (allows "end" position)
+                    new_frame = std::min(new_frame, timeline_end);
                     player.seek_to_frame(new_frame);
                 }
                 
                 // Up/Down arrows: navigate between clip boundaries (frame-based)
+                // Boundaries include: clip starts and the end position (skip last frame - left/right handles that)
                 std::vector<int64_t> boundaries;
                 for (const auto& c : player.clips) {
                     boundaries.push_back(c.start_frame);
                 }
-                // Add the last valid frame of the last clip
                 if (!player.clips.empty()) {
-                    boundaries.push_back(player.clips.back().end_frame - 1);
+                    // Add end position (not last frame - that's for left/right arrows)
+                    boundaries.push_back(player.clips.back().end_frame);  // "End" position
                 }
                 std::sort(boundaries.begin(), boundaries.end());
                 

@@ -2,10 +2,12 @@
 
 ## Known Bugs
 
-### Bug #3: Export timing precision (partially fixed)
-- ~~Major issues with missing frames resolved~~
-- Precise frame-accurate timing may need further work
-- Will address with timeline navigation improvements
+### Bug #3: Export timing/frame issues
+- Exported video has incorrect framerate metadata (e.g., 24.20 fps instead of 24.00 fps)
+- Some frames appear duplicated in exported video (e.g., frame 90 duplicated)
+- Frame count is correct but timing/content is off
+- Likely issue with PTS calculation or encoder time_base configuration
+- Need to investigate H.264 encoding settings and container muxing
 
 ### ~~Bug #4: Up/Down arrow navigation inconsistent with very short clips~~ ✓ MOSTLY FIXED
 - When clips are 1 frame each, up/down navigation behaves erratically
