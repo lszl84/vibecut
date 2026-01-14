@@ -53,14 +53,14 @@ git submodule update --init
 * Time Tracking
 
 #+BEGIN: clocktable :maxlevel nil :scope file :block nil
-#+CAPTION: Clock summary at [2026-01-13 Tue 20:29]
+#+CAPTION: Clock summary at [2026-01-14 Wed 09:37]
 | Headline          | Time |      |
 |-------------------+------+------|
-| *Total time*        | *6:37* |      |
+| *Total time*        | *7:34* |      |
 |-------------------+------+------|
-| Tasks             | 6:37 |      |
+| Tasks             | 7:34 |      |
 | \_  Initial Setup |      | 0:13 |
-| \_  Vibe coding   |      | 6:24 |
+| \_  Vibe coding   |      | 7:21 |
 #+END:
 
 * Tasks
@@ -73,6 +73,7 @@ CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
 :END:
 ** Vibe coding
 :LOGBOOK:
+CLOCK: [2026-01-14 Wed 08:40]--[2026-01-14 Wed 09:37] =>  0:57
 CLOCK: [2026-01-13 Tue 18:14]--[2026-01-13 Tue 20:29] =>  2:15
 CLOCK: [2026-01-11 Sun 10:04]--[2026-01-11 Sun 11:15] =>  1:11
 CLOCK: [2026-01-10 Sat 12:43]--[2026-01-10 Sat 13:28] =>  0:45
@@ -89,6 +90,15 @@ Adding/changing code by hand, debugging, etc.
 * Devlog
 
 Live Streams: https://www.youtube.com/@lukeatdevmindscape/streams
+
+** Day 8
+This session was so disappointing. One hour of back and forth and
+Claude still wasn't able to do a proper export. It wrote an export to
+PNG frames, and that export function is correct, but it wasn't able to
+map that to a correct MP4 export without missing frames.
+
+I guess I'll have to fix it manually. Let's see how much time it takes
+me.
 
 ** Day 7
 This one was pretty interesting. Claude could not seem to fix various
