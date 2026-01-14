@@ -3,42 +3,20 @@
 ## Known Bugs
 
 ### Bug #3: Export timing/frame issues
-- Exported video has incorrect framerate metadata (e.g., 24.20 fps instead of 24.00 fps)
-- Some frames appear duplicated in exported video (e.g., frame 90 duplicated)
-- Frame count is correct but timing/content is off
-- Likely issue with PTS calculation or encoder time_base configuration
-- Need to investigate H.264 encoding settings and container muxing
 
-### ~~Bug #4: Up/Down arrow navigation inconsistent with very short clips~~ ✓ MOSTLY FIXED
-- When clips are 1 frame each, up/down navigation behaves erratically
-- **Fix**: Use 1.5x frame duration for left arrow to compensate for framerate metadata mismatches
-- Navigation now works correctly for all frame positions
-- See open/closed interval issue below for remaining edge case
+EXPORT: Buffered frame 118 (buffer size: 1)
+EXPORT: Encoding source frame 118 as output frame 118
+EXPORT: Writing packet #117 PTS=59904 DTS=59904
+EXPORT: Got frame PTS=60928 time=4.958333 source_idx=119, want [0, 120)
+EXPORT: Buffered frame 119 (buffer size: 1)
+EXPORT: Encoding source frame 119 as output frame 119
+EXPORT: Writing packet #118 PTS=60416 DTS=60416
+EXPORT: Flushing decoder for remaining frames...
+EXPORT: Clip done - skipped 0 frames, encoded 120 frames
+EXPORT: Flush packet PTS=60928 DTS=60928
 
-## Fixed Bugs
+why are we writing packet #118 as the last packet? what happens with received source frame no 119? The last flush "EXPORT: Flush packet PTS=60928 DTS=60928" - flushes the NULL data, so we are missing the last frame here? race condition?
 
-### ~~Bug #1: Playback gets stuck in middle clips (non-deterministic)~~ ✓ FIXED
-- **Fix**: Track `active_clip` explicitly during playback instead of deriving from current_time
-- Set active_clip when play() is called based on current position
-- Use active_clip index in update() to check clip boundaries
+Try to write the PNGs when reading ("EXPORT: Buffered Frame...") and writing ("EXPORT: Writing packet.../EXPORT: Flush packet...") to see what actuall gets read and written.
 
-### ~~Bug #2: Blocky transitions when exporting multiple clips~~ ✓ FIXED
-- **Fix**: Re-encode video instead of stream copy
-- Decode source frames and encode to H.264 with proper keyframes
-- Audio is still stream-copied (no keyframe issues with audio)
-- Output is clean at all clip boundaries
-
-## Future Improvements
-- Delete clips (not just trim them)
-- Drag clips to reorder
-- Undo/redo functionality
-- Adjustable export quality/bitrate
-- Preview of clip transitions before export
-
-### Open/Closed Interval Issue
-- Current behavior: playhead can reach the exact clip end boundary (e.g., 0.082 for clip [0, 0.082])
-- With half-open intervals [start, end), position `end` is technically outside the clip
-- This causes a visual inconsistency where the playhead appears at the "closed" end
-- The last frame's timestamp equals the clip end, making it ambiguous
-- **Impact**: Minor visual/conceptual issue; navigation works correctly
-- **Future fix**: Consider adjusting clip end to be `last_frame_start + frame_duration` or display playhead at `end - epsilon`
+But that might not be the culprit - also frame 91 content is duplicated in the exported video. So exporting read/written PNGs should help with investigation.

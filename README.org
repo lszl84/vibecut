@@ -53,14 +53,15 @@ git submodule update --init
 * Time Tracking
 
 #+BEGIN: clocktable :maxlevel nil :scope file :block nil
-#+CAPTION: Clock summary at [2026-01-14 Wed 09:37]
+#+CAPTION: Clock summary at [2026-01-14 Wed 10:32]
 | Headline          | Time |      |
 |-------------------+------+------|
-| *Total time*        | *7:34* |      |
+| *Total time*        | *8:12* |      |
 |-------------------+------+------|
-| Tasks             | 7:34 |      |
+| Tasks             | 8:12 |      |
 | \_  Initial Setup |      | 0:13 |
 | \_  Vibe coding   |      | 7:21 |
+| \_  Manual coding |      | 0:38 |
 #+END:
 
 * Tasks
@@ -85,6 +86,9 @@ CLOCK: [2026-01-04 Sun 15:19]--[2026-01-04 Sun 15:22] =>  0:03
 Typing or speaking prompts, babysiting Agents, testing the features
 implemented by agents, etc.
 ** Manual coding
+:LOGBOOK:
+CLOCK: [2026-01-14 Wed 09:54]--[2026-01-14 Wed 10:32] =>  0:38
+:END:
 Adding/changing code by hand, debugging, etc.
 
 * Devlog
@@ -99,6 +103,9 @@ map that to a correct MP4 export without missing frames.
 
 I guess I'll have to fix it manually. Let's see how much time it takes
 me.
+
+UPDATE: I did some manual debugging and added TODO notes to check with
+Claude tomorrow.
 
 ** Day 7
 This one was pretty interesting. Claude could not seem to fix various
