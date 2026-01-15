@@ -53,14 +53,14 @@ git submodule update --init
 * Time Tracking
 
 #+BEGIN: clocktable :maxlevel nil :scope file :block nil
-#+CAPTION: Clock summary at [2026-01-14 Wed 10:32]
+#+CAPTION: Clock summary at [2026-01-15 Thu 12:23]
 | Headline          | Time |      |
 |-------------------+------+------|
-| *Total time*        | *8:12* |      |
+| *Total time*        | *8:35* |      |
 |-------------------+------+------|
-| Tasks             | 8:12 |      |
+| Tasks             | 8:35 |      |
 | \_  Initial Setup |      | 0:13 |
-| \_  Vibe coding   |      | 7:21 |
+| \_  Vibe coding   |      | 7:44 |
 | \_  Manual coding |      | 0:38 |
 #+END:
 
@@ -74,6 +74,7 @@ CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
 :END:
 ** Vibe coding
 :LOGBOOK:
+CLOCK: [2026-01-15 Thu 12:00]--[2026-01-15 Thu 12:23] =>  0:23
 CLOCK: [2026-01-14 Wed 08:40]--[2026-01-14 Wed 09:37] =>  0:57
 CLOCK: [2026-01-13 Tue 18:14]--[2026-01-13 Tue 20:29] =>  2:15
 CLOCK: [2026-01-11 Sun 10:04]--[2026-01-11 Sun 11:15] =>  1:11
@@ -94,6 +95,17 @@ Adding/changing code by hand, debugging, etc.
 * Devlog
 
 Live Streams: https://www.youtube.com/@lukeatdevmindscape/streams
+
+** Day 9
+This is just annoying at this point. After reviewing the code and
+debugging it a little bit, I decided to give Claude one last chance to
+fix the bug, because I realized it's gonna take me a lot of time to
+learn libAV API to be able to fix the problem manually.
+
+But the LLM failed again and now I don't see any other choice than to
+learn ffmpeg, experiment with it, and write my own encoding logic.
+This will probably take me a few days, so I will be back with live
+streams when I'm ready for vibe coding again.
 
 ** Day 8
 This session was so disappointing. One hour of back and forth and
