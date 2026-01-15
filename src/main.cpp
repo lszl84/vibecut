@@ -611,508 +611,281 @@ bool export_frames_as_png(const std::string& input, const std::string& output_fo
     return true;
 }
 
-// fps is needed to convert frame numbers to times for seeking
+// SIMPLIFIED LINEAR EXPORT: decode → encode → write immediately, no buffering
 bool export_clips(const std::string& input, const std::string& output, const std::vector<Clip>& clips, double fps, std::atomic<bool>& exporting, std::atomic<float>& progress) {
     if (clips.empty()) {
         exporting = false;
         return false;
     }
     
+    std::printf("EXPORT: === SIMPLIFIED LINEAR EXPORT ===\n");
+    
+    // Calculate total frames
+    int64_t total_frames = 0;
+    for (const auto& clip : clips) {
+        total_frames += clip.frame_count();
+    }
+    std::printf("EXPORT: Total frames to export: %lld\n", (long long)total_frames);
+    
+    // Open input
     AVFormatContext* in_ctx = nullptr;
-    AVFormatContext* out_ctx = nullptr;
-    AVCodecContext* dec_ctx = nullptr;
-    AVCodecContext* enc_ctx = nullptr;
-    SwsContext* sws_ctx = nullptr;
-    
-    int video_stream_idx = -1;
-    int audio_stream_idx = -1;
-    int out_video_idx = -1;
-    int out_audio_idx = -1;
-    
-    // Open input with ignore_editlist to prevent skipping initial frames
     AVDictionary* opts = nullptr;
     av_dict_set(&opts, "ignore_editlist", "1", 0);
-    int ret = avformat_open_input(&in_ctx, input.c_str(), nullptr, &opts);
+    if (avformat_open_input(&in_ctx, input.c_str(), nullptr, &opts) < 0) {
+        av_dict_free(&opts);
+        exporting = false;
+        return false;
+    }
     av_dict_free(&opts);
-    if (ret < 0) {
-        exporting = false;
-        return false;
-    }
+    avformat_find_stream_info(in_ctx, nullptr);
     
-    if (avformat_find_stream_info(in_ctx, nullptr) < 0) {
-        avformat_close_input(&in_ctx);
-        exporting = false;
-        return false;
-    }
-    
-    // Find video and audio streams
+    // Find video stream
+    int video_idx = -1;
     for (unsigned i = 0; i < in_ctx->nb_streams; i++) {
-        if (in_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && video_stream_idx < 0) {
-            video_stream_idx = i;
-        } else if (in_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && audio_stream_idx < 0) {
-            audio_stream_idx = i;
+        if (in_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            video_idx = i;
+            break;
         }
     }
-    
-    if (video_stream_idx < 0) {
+    if (video_idx < 0) {
         avformat_close_input(&in_ctx);
         exporting = false;
         return false;
     }
     
-    // Set up video decoder
-    AVStream* in_video = in_ctx->streams[video_stream_idx];
+    AVStream* in_video = in_ctx->streams[video_idx];
+    
+    // Set up decoder (single-threaded)
     const AVCodec* decoder = avcodec_find_decoder(in_video->codecpar->codec_id);
-    dec_ctx = avcodec_alloc_context3(decoder);
+    AVCodecContext* dec_ctx = avcodec_alloc_context3(decoder);
     avcodec_parameters_to_context(dec_ctx, in_video->codecpar);
+    dec_ctx->thread_count = 1;  // Single-threaded decoding
     avcodec_open2(dec_ctx, decoder, nullptr);
     
-    // Create output context
-    if (avformat_alloc_output_context2(&out_ctx, nullptr, nullptr, output.c_str()) < 0) {
-        avcodec_free_context(&dec_ctx);
-        avformat_close_input(&in_ctx);
-        exporting = false;
-        return false;
-    }
+    // Create output
+    AVFormatContext* out_ctx = nullptr;
+    avformat_alloc_output_context2(&out_ctx, nullptr, nullptr, output.c_str());
     
-    // Set up video encoder - H.264 via VA-API hardware
-    AVBufferRef* hw_device_ctx = nullptr;
-    AVBufferRef* hw_frames_ref = nullptr;
-    bool using_vaapi = false;
-    
-    const AVCodec* encoder = avcodec_find_encoder_by_name("h264_vaapi");
-    if (encoder) {
-        if (av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_VAAPI, nullptr, nullptr, 0) == 0) {
-            using_vaapi = true;
-            std::printf("EXPORT: VA-API hardware device created\n");
-        } else {
-            std::printf("EXPORT: VA-API not available, falling back to software\n");
-            encoder = nullptr;
-        }
-    }
-    
-    if (!encoder) {
-        encoder = avcodec_find_encoder_by_name("libx264");
-        if (!encoder) encoder = avcodec_find_encoder(AV_CODEC_ID_H264);
-    }
-    
-    if (!encoder) {
-        std::printf("EXPORT: No H.264 encoder available!\n");
-        if (hw_device_ctx) av_buffer_unref(&hw_device_ctx);
-        exporting = false;
-        return false;
-    }
+    // Set up encoder (software only, single-threaded)
+    const AVCodec* encoder = avcodec_find_encoder_by_name("libx264");
+    if (!encoder) encoder = avcodec_find_encoder(AV_CODEC_ID_H264);
     
     AVStream* out_video = avformat_new_stream(out_ctx, nullptr);
-    out_video_idx = out_video->index;
-    
-    // Get source framerate
-    AVRational src_fps = av_guess_frame_rate(in_ctx, in_video, nullptr);
-    if (src_fps.num == 0 || src_fps.den == 0) {
-        src_fps = AVRational{24, 1};
-    }
-    
-    enc_ctx = avcodec_alloc_context3(encoder);
+    AVCodecContext* enc_ctx = avcodec_alloc_context3(encoder);
     enc_ctx->width = dec_ctx->width;
     enc_ctx->height = dec_ctx->height;
-    enc_ctx->time_base = AVRational{1, src_fps.num / src_fps.den};
-    enc_ctx->framerate = src_fps;
-    enc_ctx->gop_size = 1;
-    enc_ctx->max_b_frames = 0;
-    
-    if (using_vaapi) {
-        enc_ctx->pix_fmt = AV_PIX_FMT_VAAPI;
-        
-        // Create hardware frames context
-        hw_frames_ref = av_hwframe_ctx_alloc(hw_device_ctx);
-        AVHWFramesContext* frames_ctx = (AVHWFramesContext*)hw_frames_ref->data;
-        frames_ctx->format = AV_PIX_FMT_VAAPI;
-        frames_ctx->sw_format = AV_PIX_FMT_NV12;
-        frames_ctx->width = enc_ctx->width;
-        frames_ctx->height = enc_ctx->height;
-        frames_ctx->initial_pool_size = 20;
-        
-        if (av_hwframe_ctx_init(hw_frames_ref) < 0) {
-            std::printf("EXPORT: Failed to init VA-API frames, falling back to software\n");
-            av_buffer_unref(&hw_frames_ref);
-            av_buffer_unref(&hw_device_ctx);
-            using_vaapi = false;
-            hw_frames_ref = nullptr;
-            hw_device_ctx = nullptr;
-            
-            avcodec_free_context(&enc_ctx);
-            encoder = avcodec_find_encoder_by_name("libx264");
-            if (!encoder) encoder = avcodec_find_encoder(AV_CODEC_ID_H264);
-            enc_ctx = avcodec_alloc_context3(encoder);
-            enc_ctx->width = dec_ctx->width;
-            enc_ctx->height = dec_ctx->height;
-            enc_ctx->time_base = AVRational{1, src_fps.num / src_fps.den};
-            enc_ctx->framerate = src_fps;
-            enc_ctx->gop_size = 1;
-            enc_ctx->max_b_frames = 0;
-            enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-        } else {
-            enc_ctx->hw_frames_ctx = av_buffer_ref(hw_frames_ref);
-        }
-    } else {
-        enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-    }
+    enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    enc_ctx->time_base = AVRational{1, (int)fps};
+    enc_ctx->framerate = AVRational{(int)fps, 1};
+    enc_ctx->gop_size = 1;      // All I-frames
+    enc_ctx->max_b_frames = 0;  // No B-frames
+    enc_ctx->thread_count = 1;  // Single-threaded encoding
     
     if (out_ctx->oformat->flags & AVFMT_GLOBALHEADER) {
         enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
     
     AVDictionary* enc_opts = nullptr;
-    if (!using_vaapi) {
-        av_dict_set(&enc_opts, "preset", "ultrafast", 0);
-        av_dict_set(&enc_opts, "crf", "18", 0);
-    }
-    
-    if (avcodec_open2(enc_ctx, encoder, &enc_opts) < 0) {
-        std::printf("EXPORT: Failed to open encoder\n");
-        av_dict_free(&enc_opts);
-        if (hw_frames_ref) av_buffer_unref(&hw_frames_ref);
-        if (hw_device_ctx) av_buffer_unref(&hw_device_ctx);
-        exporting = false;
-        return false;
-    }
+    av_dict_set(&enc_opts, "preset", "ultrafast", 0);
+    av_dict_set(&enc_opts, "tune", "zerolatency", 0);  // Minimize latency/buffering
+    avcodec_open2(enc_ctx, encoder, &enc_opts);
     av_dict_free(&enc_opts);
-    
-    std::printf("EXPORT: Using encoder: %s (%s)\n", encoder->name, using_vaapi ? "VA-API HW" : "software");
     
     avcodec_parameters_from_context(out_video->codecpar, enc_ctx);
     out_video->time_base = enc_ctx->time_base;
     
-    // Copy audio stream (stream copy for audio is fine)
-    if (audio_stream_idx >= 0) {
-        AVStream* in_audio = in_ctx->streams[audio_stream_idx];
-        AVStream* out_audio = avformat_new_stream(out_ctx, nullptr);
-        out_audio_idx = out_audio->index;
-        avcodec_parameters_copy(out_audio->codecpar, in_audio->codecpar);
-        out_audio->codecpar->codec_tag = 0;
-        out_audio->time_base = in_audio->time_base;
-    }
+    std::printf("EXPORT: Encoder: %s, single-threaded, gop=1, no B-frames, zerolatency\n", encoder->name);
     
-    // Set up pixel format converter (NV12 for VA-API, YUV420P for software)
-    AVPixelFormat target_sw_fmt = using_vaapi ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P;
-    sws_ctx = sws_getContext(
+    // Pixel format converter
+    SwsContext* sws_ctx = sws_getContext(
         dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
-        enc_ctx->width, enc_ctx->height, target_sw_fmt,
+        enc_ctx->width, enc_ctx->height, AV_PIX_FMT_YUV420P,
         SWS_BILINEAR, nullptr, nullptr, nullptr
     );
     
-    // Open output file
-    if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) {
-        if (avio_open(&out_ctx->pb, output.c_str(), AVIO_FLAG_WRITE) < 0) {
-            sws_freeContext(sws_ctx);
-            avcodec_free_context(&enc_ctx);
-            avcodec_free_context(&dec_ctx);
-            avformat_free_context(out_ctx);
-            avformat_close_input(&in_ctx);
-            exporting = false;
-            return false;
+    // Debug output setup
+    fs::path debug_dir = fs::path(output).parent_path() / "export_debug";
+    fs::create_directories(debug_dir);
+    SwsContext* debug_sws = sws_getContext(
+        dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
+        dec_ctx->width, dec_ctx->height, AV_PIX_FMT_RGB24,
+        SWS_BILINEAR, nullptr, nullptr, nullptr
+    );
+    AVFrame* debug_rgb = av_frame_alloc();
+    debug_rgb->format = AV_PIX_FMT_RGB24;
+    debug_rgb->width = dec_ctx->width;
+    debug_rgb->height = dec_ctx->height;
+    av_frame_get_buffer(debug_rgb, 0);
+    
+    // Convert to RGB and save PPM - returns the RGB frame for encoding
+    auto convert_and_save_ppm = [&](AVFrame* src, const std::string& name) -> AVFrame* {
+        av_frame_make_writable(debug_rgb);
+        sws_scale(debug_sws, src->data, src->linesize, 0, src->height, debug_rgb->data, debug_rgb->linesize);
+        std::string path = (debug_dir / (name + ".ppm")).string();
+        FILE* f = fopen(path.c_str(), "wb");
+        if (f) {
+            fprintf(f, "P6\n%d %d\n255\n", debug_rgb->width, debug_rgb->height);
+            for (int y = 0; y < debug_rgb->height; y++)
+                fwrite(debug_rgb->data[0] + y * debug_rgb->linesize[0], 1, debug_rgb->width * 3, f);
+            fclose(f);
         }
-    }
+        return debug_rgb;  // Return the RGB frame we just created
+    };
     
-    std::printf("EXPORT: Before write_header - stream time_base: %d/%d, enc time_base: %d/%d\n",
-                out_video->time_base.num, out_video->time_base.den,
-                enc_ctx->time_base.num, enc_ctx->time_base.den);
+    // Open output file
+    avio_open(&out_ctx->pb, output.c_str(), AVIO_FLAG_WRITE);
+    avformat_write_header(out_ctx, nullptr);
     
-    if (avformat_write_header(out_ctx, nullptr) < 0) {
-        if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) avio_closep(&out_ctx->pb);
-        sws_freeContext(sws_ctx);
-        avcodec_free_context(&enc_ctx);
-        avcodec_free_context(&dec_ctx);
-        avformat_free_context(out_ctx);
-        avformat_close_input(&in_ctx);
-        exporting = false;
-        return false;
-    }
-    
-    std::printf("EXPORT: After write_header - stream time_base: %d/%d\n",
-                out_video->time_base.num, out_video->time_base.den);
-    
-    // Helper to convert frames to time
-    auto frame_to_time = [fps](int64_t f) -> double { return f / fps; };
-    
-    // Calculate total frames and log clip structure
-    int64_t total_frames = 0;
-    std::printf("EXPORT: === Clip structure ===\n");
-    for (size_t i = 0; i < clips.size(); i++) {
-        std::printf("EXPORT: Clip %zu: frames [%lld - %lld) count=%lld\n", 
-                    i, (long long)clips[i].start_frame, (long long)clips[i].end_frame, 
-                    (long long)clips[i].frame_count());
-        total_frames += clips[i].frame_count();
-    }
-    double total_duration = frame_to_time(total_frames);
-    std::printf("EXPORT: Total frames: %lld (%.3f seconds)\n", (long long)total_frames, total_duration);
-    std::printf("EXPORT: =====================\n");
+    std::printf("EXPORT: Output time_base: %d/%d\n", out_video->time_base.num, out_video->time_base.den);
     
     AVPacket* pkt = av_packet_alloc();
     AVPacket* enc_pkt = av_packet_alloc();
-    AVFrame* frame = av_frame_alloc();
-    AVFrame* enc_frame = av_frame_alloc();
+    AVFrame* dec_frame = av_frame_alloc();
     
-    enc_frame->format = enc_ctx->pix_fmt;
-    enc_frame->width = enc_ctx->width;
-    enc_frame->height = enc_ctx->height;
-    av_frame_get_buffer(enc_frame, 0);
+    int64_t output_frame = 0;
+    int packet_num = 0;
     
-    double time_offset = 0.0;  // Accumulated output time from previous clips
-    double processed_time = 0.0;
-    int64_t video_frame_num = 0;  // Running frame number (used as PTS)
-    int64_t audio_pts = 0;  // Running audio PTS
-    bool first_clip = true;
+    // Create RGB→YUV converter (we'll encode from the same RGB data used for PPM)
+    SwsContext* rgb_to_yuv = sws_getContext(
+        enc_ctx->width, enc_ctx->height, AV_PIX_FMT_RGB24,
+        enc_ctx->width, enc_ctx->height, AV_PIX_FMT_YUV420P,
+        SWS_BILINEAR, nullptr, nullptr, nullptr
+    );
     
-    for (const auto& clip : clips) {
-        if (!exporting) break;
+    // Helper to encode from the SAME RGB data we save to PPM
+    auto encode_from_rgb = [&](AVFrame* rgb_frame, int64_t pts) {
+        // Allocate fresh YUV frame
+        AVFrame* yuv = av_frame_alloc();
+        yuv->format = AV_PIX_FMT_YUV420P;
+        yuv->width = enc_ctx->width;
+        yuv->height = enc_ctx->height;
+        av_frame_get_buffer(yuv, 0);
         
-        double clip_start_time = frame_to_time(clip.start_frame);
-        double clip_end_time = frame_to_time(clip.end_frame);
-        int64_t clip_frame_count = clip.frame_count();
+        // Convert RGB (the exact same data as PPM) to YUV
+        sws_scale(rgb_to_yuv, rgb_frame->data, rgb_frame->linesize, 0, rgb_frame->height,
+                  yuv->data, yuv->linesize);
         
-        std::printf("EXPORT: Processing clip frames [%lld - %lld), time [%.3f - %.3f], %lld frames\n", 
-                    (long long)clip.start_frame, (long long)clip.end_frame,
-                    clip_start_time, clip_end_time, (long long)clip_frame_count);
+        yuv->pts = pts;
         
-        // Seek to clip start (skip seeking for first clip starting at frame 0 to preserve all frames)
-        if (first_clip && clip.start_frame == 0) {
-            std::printf("EXPORT: Starting from beginning (no seek)\n");
-        } else {
-            avcodec_flush_buffers(dec_ctx);
-            int64_t start_ts = (int64_t)(clip_start_time * AV_TIME_BASE);
-            avformat_seek_file(in_ctx, -1, INT64_MIN, start_ts, start_ts, 0);
-            avcodec_flush_buffers(dec_ctx);
-            std::printf("EXPORT: Seeking to frame %lld (time %.3f)\n", (long long)clip.start_frame, clip_start_time);
+        // Send to encoder
+        int ret = avcodec_send_frame(enc_ctx, yuv);
+        std::printf("EXPORT: Sent frame PTS=%lld to encoder (ret=%d)\n", (long long)pts, ret);
+        
+        av_frame_free(&yuv);
+        
+        // Get all available packets
+        while (avcodec_receive_packet(enc_ctx, enc_pkt) >= 0) {
+            enc_pkt->stream_index = 0;
+            av_packet_rescale_ts(enc_pkt, enc_ctx->time_base, out_video->time_base);
+            std::printf("EXPORT: Wrote packet #%d, PTS=%lld\n", packet_num++, (long long)enc_pkt->pts);
+            av_write_frame(out_ctx, enc_pkt);
+            av_packet_unref(enc_pkt);
         }
-        first_clip = false;
+    };
+    
+    // Process each clip
+    for (const auto& clip : clips) {
+        std::printf("EXPORT: Processing clip [%lld, %lld)\n", (long long)clip.start_frame, (long long)clip.end_frame);
         
-        bool reached_clip = false;
-        int frames_skipped = 0;
-        int frames_encoded = 0;
-        int frames_to_include = (int)clip_frame_count;
+        // Seek to clip start
+        double start_time = clip.start_frame / fps;
+        avcodec_flush_buffers(dec_ctx);
+        avformat_seek_file(in_ctx, -1, INT64_MIN, (int64_t)(start_time * AV_TIME_BASE), (int64_t)(start_time * AV_TIME_BASE), 0);
+        avcodec_flush_buffers(dec_ctx);
         
-        // Buffer to reorder frames (B-frames cause out-of-order decoding)
-        std::map<int64_t, AVFrame*> frame_buffer;
-        int64_t next_frame_to_encode = clip.start_frame;
+        int64_t frames_needed = clip.frame_count();
+        int64_t frames_got = 0;
         
-        std::printf("EXPORT: Clip expects %d frames (source frames %lld to %lld)\n", 
-                    frames_to_include, (long long)clip.start_frame, (long long)clip.end_frame - 1);
-        
-        // Lambda to encode buffered frames in order
-        auto encode_ready_frames = [&]() {
-            while (frame_buffer.count(next_frame_to_encode)) {
-                AVFrame* buffered = frame_buffer[next_frame_to_encode];
-                frame_buffer.erase(next_frame_to_encode);
-                
-                std::printf("EXPORT: Encoding source frame %lld as output frame %lld\n",
-                            (long long)next_frame_to_encode, (long long)video_frame_num);
-                
-                double relative_time = (next_frame_to_encode - clip.start_frame) / fps;
-                double output_time = relative_time + time_offset;
-                progress = (float)(output_time / total_duration);
-                
-                AVFrame* frame_to_encode = nullptr;
-                
-                if (using_vaapi) {
-                    // For VA-API: convert to NV12 software frame, then upload to hardware
-                    AVFrame* sw_frame = av_frame_alloc();
-                    sw_frame->format = AV_PIX_FMT_NV12;
-                    sw_frame->width = enc_ctx->width;
-                    sw_frame->height = enc_ctx->height;
-                    av_frame_get_buffer(sw_frame, 0);
-                    
-                    sws_scale(sws_ctx, buffered->data, buffered->linesize, 0, buffered->height,
-                              sw_frame->data, sw_frame->linesize);
-                    
-                    // Allocate hardware frame
-                    AVFrame* hw_frame = av_frame_alloc();
-                    if (av_hwframe_get_buffer(enc_ctx->hw_frames_ctx, hw_frame, 0) < 0) {
-                        std::printf("EXPORT: Failed to get HW frame buffer\n");
-                        av_frame_free(&sw_frame);
-                        av_frame_free(&hw_frame);
-                        av_frame_free(&buffered);
-                        next_frame_to_encode++;
-                        continue;
-                    }
-                    
-                    // Upload software frame to hardware
-                    if (av_hwframe_transfer_data(hw_frame, sw_frame, 0) < 0) {
-                        std::printf("EXPORT: Failed to upload frame to HW\n");
-                        av_frame_free(&sw_frame);
-                        av_frame_free(&hw_frame);
-                        av_frame_free(&buffered);
-                        next_frame_to_encode++;
-                        continue;
-                    }
-                    
-                    av_frame_free(&sw_frame);
-                    frame_to_encode = hw_frame;
-                } else {
-                    // Software encoding: convert to YUV420P
-                    AVFrame* sw_frame = av_frame_alloc();
-                    sw_frame->format = AV_PIX_FMT_YUV420P;
-                    sw_frame->width = enc_ctx->width;
-                    sw_frame->height = enc_ctx->height;
-                    av_frame_get_buffer(sw_frame, 0);
-                    
-                    sws_scale(sws_ctx, buffered->data, buffered->linesize, 0, buffered->height,
-                              sw_frame->data, sw_frame->linesize);
-                    
-                    frame_to_encode = sw_frame;
-                }
-                
-                frame_to_encode->pts = video_frame_num;
-                video_frame_num++;
-                frames_encoded++;
-                
-                avcodec_send_frame(enc_ctx, frame_to_encode);
-                av_frame_free(&frame_to_encode);
-                
-                while (avcodec_receive_packet(enc_ctx, enc_pkt) >= 0) {
-                    enc_pkt->stream_index = out_video_idx;
-                    av_packet_rescale_ts(enc_pkt, enc_ctx->time_base, out_ctx->streams[out_video_idx]->time_base);
-                    
-                    static int packet_count = 0;
-                    std::printf("EXPORT: Writing packet #%d PTS=%lld DTS=%lld\n", 
-                                packet_count++, (long long)enc_pkt->pts, (long long)enc_pkt->dts);
-                    av_interleaved_write_frame(out_ctx, enc_pkt);
-                    av_packet_unref(enc_pkt);
-                }
-                
-                av_frame_free(&buffered);
-                next_frame_to_encode++;
-            }
-        };
-        
-        // Lambda to process a decoded frame
-        auto process_decoded_frame = [&](AVFrame* decoded_frame) -> bool {
-            AVStream* in_stream = in_ctx->streams[video_stream_idx];
-            int64_t frame_pts = decoded_frame->best_effort_timestamp != AV_NOPTS_VALUE 
-                                ? decoded_frame->best_effort_timestamp : decoded_frame->pts;
-            double frame_time = frame_pts * av_q2d(in_stream->time_base);
-            int64_t source_frame_idx = (int64_t)(frame_time * fps + 0.5);
-            
-            std::printf("EXPORT: Got frame PTS=%lld time=%.6f source_idx=%lld, want [%lld, %lld)\n", 
-                        (long long)frame_pts, frame_time, (long long)source_frame_idx,
-                        (long long)clip.start_frame, (long long)clip.end_frame);
-            
-            if (source_frame_idx < clip.start_frame) {
-                frames_skipped++;
-                return false; // Continue processing
+        // Decode frames one by one
+        while (av_read_frame(in_ctx, pkt) >= 0 && frames_got < frames_needed) {
+            if (pkt->stream_index != video_idx) {
+                av_packet_unref(pkt);
+                continue;
             }
             
-            if (source_frame_idx >= clip.end_frame) {
-                std::printf("EXPORT: Frame %lld >= clip end %lld\n", 
-                            (long long)source_frame_idx, (long long)clip.end_frame);
-                encode_ready_frames();
-                return next_frame_to_encode >= clip.end_frame; // Return true if done
-            }
+            avcodec_send_packet(dec_ctx, pkt);
+            av_packet_unref(pkt);
             
-            reached_clip = true;
-            AVFrame* cloned = av_frame_clone(decoded_frame);
-            frame_buffer[source_frame_idx] = cloned;
-            std::printf("EXPORT: Buffered frame %lld (buffer size: %zu)\n", 
-                        (long long)source_frame_idx, frame_buffer.size());
-            encode_ready_frames();
-            return false; // Continue processing
-        };
-        
-        bool clip_done = false;
-        while (av_read_frame(in_ctx, pkt) >= 0 && exporting && !clip_done) {
-            AVStream* in_stream = in_ctx->streams[pkt->stream_index];
-            double pkt_time = pkt->pts * av_q2d(in_stream->time_base);
-            
-            if (pkt->stream_index == video_stream_idx) {
-                avcodec_send_packet(dec_ctx, pkt);
-                while (avcodec_receive_frame(dec_ctx, frame) >= 0) {
-                    if (process_decoded_frame(frame)) {
-                        clip_done = true;
-                        break;
-                    }
-                }
-            } else if (pkt->stream_index == audio_stream_idx && out_audio_idx >= 0 && reached_clip) {
-                if (pkt_time < clip_start_time - 0.1 || pkt_time >= clip_end_time + 0.1) {
-                    av_packet_unref(pkt);
+            while (avcodec_receive_frame(dec_ctx, dec_frame) >= 0 && frames_got < frames_needed) {
+                // Calculate source frame index
+                int64_t pts = dec_frame->best_effort_timestamp != AV_NOPTS_VALUE 
+                              ? dec_frame->best_effort_timestamp : dec_frame->pts;
+                double frame_time = pts * av_q2d(in_video->time_base);
+                int64_t src_frame = (int64_t)(frame_time * fps + 0.5);
+                
+                // Skip frames before clip start
+                if (src_frame < clip.start_frame) {
+                    std::printf("EXPORT: Skip frame %lld (before clip)\n", (long long)src_frame);
                     continue;
                 }
                 
-                double audio_relative_time = pkt_time - clip_start_time;
-                AVStream* out_audio = out_ctx->streams[out_audio_idx];
-                AVStream* in_audio = in_ctx->streams[audio_stream_idx];
-                int64_t orig_duration = pkt->duration;
-                double audio_output_time = std::max(0.0, audio_relative_time) + time_offset;
-                pkt->pts = (int64_t)(audio_output_time / av_q2d(out_audio->time_base));
-                pkt->dts = pkt->pts;
-                pkt->duration = av_rescale_q(orig_duration, in_audio->time_base, out_audio->time_base);
-                pkt->stream_index = out_audio_idx;
-                pkt->pos = -1;
-                av_interleaved_write_frame(out_ctx, pkt);
-            }
-            
-            av_packet_unref(pkt);
-        }
-        
-        // CRITICAL: Flush decoder to get any remaining buffered frames!
-        if (!clip_done && exporting) {
-            std::printf("EXPORT: Flushing decoder for remaining frames...\n");
-            avcodec_send_packet(dec_ctx, nullptr);  // Send NULL to flush
-            while (avcodec_receive_frame(dec_ctx, frame) >= 0) {
-                if (process_decoded_frame(frame)) {
-                    clip_done = true;
+                // Stop if past clip end
+                if (src_frame >= clip.end_frame) {
+                    std::printf("EXPORT: Frame %lld past clip end, done with clip\n", (long long)src_frame);
                     break;
                 }
+                
+                std::printf("EXPORT: Decode src=%lld -> encode out=%lld\n", (long long)src_frame, (long long)output_frame);
+                
+                // Convert to RGB and save PPM - get the SAME RGB data for encoding
+                AVFrame* rgb = convert_and_save_ppm(dec_frame, "frame_" + std::to_string(output_frame) + "_src" + std::to_string(src_frame));
+                
+                // Encode from the EXACT SAME RGB data we just saved to PPM
+                encode_from_rgb(rgb, output_frame);
+                
+                output_frame++;
+                frames_got++;
+                progress = (float)output_frame / total_frames;
             }
-            // Encode any remaining buffered frames after flush
-            encode_ready_frames();
         }
         
-        done_with_clip:
-        
-        // Clean up any remaining buffered frames
-        for (auto& [idx, f] : frame_buffer) {
-            av_frame_free(&f);
+        // Flush decoder for this clip
+        avcodec_send_packet(dec_ctx, nullptr);
+        while (avcodec_receive_frame(dec_ctx, dec_frame) >= 0 && frames_got < frames_needed) {
+            int64_t pts = dec_frame->best_effort_timestamp != AV_NOPTS_VALUE 
+                          ? dec_frame->best_effort_timestamp : dec_frame->pts;
+            double frame_time = pts * av_q2d(in_video->time_base);
+            int64_t src_frame = (int64_t)(frame_time * fps + 0.5);
+            
+            if (src_frame < clip.start_frame || src_frame >= clip.end_frame) continue;
+            
+            std::printf("EXPORT: (flush) Decode src=%lld -> encode out=%lld\n", (long long)src_frame, (long long)output_frame);
+            AVFrame* rgb = convert_and_save_ppm(dec_frame, "frame_" + std::to_string(output_frame) + "_src" + std::to_string(src_frame));
+            encode_from_rgb(rgb, output_frame);
+            
+            output_frame++;
+            frames_got++;
         }
-        frame_buffer.clear();
         
-        std::printf("EXPORT: Clip done - skipped %d frames, encoded %d frames\n", frames_skipped, frames_encoded);
-        double clip_duration = frame_to_time(clip_frame_count);
-        processed_time += clip_duration;
-        time_offset += clip_duration;
+        std::printf("EXPORT: Clip done, got %lld/%lld frames\n", (long long)frames_got, (long long)frames_needed);
     }
     
     // Flush encoder
+    std::printf("EXPORT: Flushing encoder...\n");
     avcodec_send_frame(enc_ctx, nullptr);
     while (avcodec_receive_packet(enc_ctx, enc_pkt) >= 0) {
-        enc_pkt->stream_index = out_video_idx;
-        av_packet_rescale_ts(enc_pkt, enc_ctx->time_base, out_ctx->streams[out_video_idx]->time_base);
-        std::printf("EXPORT: Flush packet PTS=%lld DTS=%lld\n", 
-                    (long long)enc_pkt->pts, (long long)enc_pkt->dts);
-        av_interleaved_write_frame(out_ctx, enc_pkt);
+        enc_pkt->stream_index = 0;
+        av_packet_rescale_ts(enc_pkt, enc_ctx->time_base, out_video->time_base);
+        std::printf("EXPORT: Flush wrote packet #%d, PTS=%lld\n", packet_num++, (long long)enc_pkt->pts);
+        av_write_frame(out_ctx, enc_pkt);
         av_packet_unref(enc_pkt);
     }
     
-    // Set stream duration explicitly (total frames + 1 frame duration for proper container metadata)
-    // This ensures the container duration reflects all frames including the last one
-    AVStream* final_video = out_ctx->streams[out_video_idx];
-    final_video->duration = av_rescale_q(video_frame_num, enc_ctx->time_base, final_video->time_base);
-    std::printf("EXPORT: Set stream duration to %lld (time_base %d/%d) = %.3f sec for %lld frames\n",
-                (long long)final_video->duration, final_video->time_base.num, final_video->time_base.den,
-                final_video->duration * av_q2d(final_video->time_base), (long long)video_frame_num);
+    std::printf("EXPORT: Total: %lld frames encoded, %d packets written\n", (long long)output_frame, packet_num);
     
     av_write_trailer(out_ctx);
     
     // Cleanup
-    av_frame_free(&enc_frame);
-    av_frame_free(&frame);
+    av_frame_free(&debug_rgb);
+    sws_freeContext(debug_sws);
+    sws_freeContext(rgb_to_yuv);
+    av_frame_free(&dec_frame);
     av_packet_free(&enc_pkt);
     av_packet_free(&pkt);
     sws_freeContext(sws_ctx);
     avcodec_free_context(&enc_ctx);
     avcodec_free_context(&dec_ctx);
-    if (hw_frames_ref) av_buffer_unref(&hw_frames_ref);
-    if (hw_device_ctx) av_buffer_unref(&hw_device_ctx);
-    if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) avio_closep(&out_ctx->pb);
+    avio_closep(&out_ctx->pb);
     avformat_free_context(out_ctx);
     avformat_close_input(&in_ctx);
     

@@ -2,21 +2,47 @@
 
 ## Known Bugs
 
-### Bug #3: Export timing/frame issues
+### Bug #3: Export produces incorrect video despite correct frame data
 
-EXPORT: Buffered frame 118 (buffer size: 1)
-EXPORT: Encoding source frame 118 as output frame 118
-EXPORT: Writing packet #117 PTS=59904 DTS=59904
-EXPORT: Got frame PTS=60928 time=4.958333 source_idx=119, want [0, 120)
-EXPORT: Buffered frame 119 (buffer size: 1)
-EXPORT: Encoding source frame 119 as output frame 119
-EXPORT: Writing packet #118 PTS=60416 DTS=60416
-EXPORT: Flushing decoder for remaining frames...
-EXPORT: Clip done - skipped 0 frames, encoded 120 frames
-EXPORT: Flush packet PTS=60928 DTS=60928
+**Status:** Unsolved after extensive debugging
 
-why are we writing packet #118 as the last packet? what happens with received source frame no 119? The last flush "EXPORT: Flush packet PTS=60928 DTS=60928" - flushes the NULL data, so we are missing the last frame here? race condition?
+**Symptoms:**
+- Exported PPM frames are 100% correct
+- Exported video has wrong frames (missing last frame, frame 91 duplicated)
+- Same RGB data used for both PPM and video encoding
 
-Try to write the PNGs when reading ("EXPORT: Buffered Frame...") and writing ("EXPORT: Writing packet.../EXPORT: Flush packet...") to see what actuall gets read and written.
+**What we tried:**
+1. Frame buffer reordering - didn't help
+2. Decoder flush at EOF - didn't help
+3. Single-threaded decode/encode - didn't help
+4. Fresh frame allocation per encode - didn't help
+5. av_write_frame instead of av_interleaved_write_frame - didn't help
+6. zerolatency tune, gop_size=1, no B-frames - didn't help
+7. Encoding from exact same RGB bytes as PPM - didn't help
+8. VA-API hardware encoding - didn't help
+9. Various containers (MP4, MKV, MOV) - didn't help
+10. Various codecs (H.264, FFV1, ProRes) - didn't help
 
-But that might not be the culprit - also frame 91 content is duplicated in the exported video. So exporting read/written PNGs should help with investigation.
+**Current state:**
+- PPM export works perfectly (correct frames saved)
+- Video export uses the SAME RGB data but produces wrong video
+- The issue is somewhere in: RGB→YUV conversion, libx264 encoder, or MP4 muxer
+
+**Next steps to try:**
+- Use MJPEG codec (each frame is independent JPEG)
+- Write raw YUV file and encode with ffmpeg CLI
+- Try different FFmpeg version
+- Check if issue is specific to the test video
+
+**Log sample:**
+```
+EXPORT: Decode src=118 -> encode out=118
+EXPORT: Sent frame PTS=118 to encoder (ret=0)
+EXPORT: Wrote packet #117, PTS=...
+EXPORT: Decode src=119 -> encode out=119  
+EXPORT: Sent frame PTS=119 to encoder (ret=0)
+EXPORT: Wrote packet #118, PTS=...
+EXPORT: Flushing encoder...
+EXPORT: Flush wrote packet #119, PTS=...
+```
+Despite all 120 frames being sent and 120 packets written, the output video is incorrect.
