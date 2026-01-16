@@ -4,3 +4,10 @@
 
 - Export issues were traced to preview/loading; export pipeline is correct.
 - Non-integer FPS (e.g. 24.2) required timestamp→frame mapping to use floor rounding.
+
+## TODO
+
+- Test export for missing/incorrect last frame (manual verification)
+- Improve drag-to-end reordering UX (hard to place at end)
+- Add visual indicator while dragging a clip
+- Manual test pass for clip reordering + play/seek/resize
