@@ -29,6 +29,7 @@ namespace fs = std::filesystem;
 struct Clip {
     int64_t start_frame;  // First frame included (0-indexed)
     int64_t end_frame;    // First frame NOT included
+    int color_id = 0;
     
     int64_t frame_count() const { return end_frame - start_frame; }
 };
@@ -56,11 +57,14 @@ struct VideoPlayer {
     // Frame-based tracking (primary representation)
     int64_t total_frames = 0;       // Total frames in source video
     int64_t current_frame = 0;      // Current frame number (0-indexed)
+    int64_t current_timeline_frame = 0;  // Current frame in timeline order
+    int next_clip_color_id = 0;
     
     GLuint texture_id = 0;
     double current_time = 0.0;      // For FFmpeg seeking (derived from current_frame)
     double play_start_time = 0.0;
     int64_t play_start_frame = 0;
+    int64_t play_start_timeline_frame = 0;
     bool playing = false;
     bool loaded = false;
     
@@ -97,6 +101,37 @@ struct VideoPlayer {
         int64_t total = 0;
         for (const auto& clip : clips) total += clip.frame_count();
         return total;
+    }
+    
+    int64_t timeline_to_source_frame(int64_t timeline_frame) const {
+        if (clips.empty()) return 0;
+        int64_t total = total_timeline_frames();
+        if (timeline_frame < 0) timeline_frame = 0;
+        if (timeline_frame >= total) {
+            return clips.back().end_frame;  // end position
+        }
+        for (const auto& c : clips) {
+            int64_t count = c.frame_count();
+            if (timeline_frame < count) {
+                return c.start_frame + timeline_frame;
+            }
+            timeline_frame -= count;
+        }
+        return clips.back().end_frame;
+    }
+    
+    int64_t source_to_timeline_frame(int64_t source_frame) const {
+        int64_t tframe = 0;
+        for (const auto& c : clips) {
+            if (source_frame >= c.start_frame && source_frame < c.end_frame) {
+                return tframe + (source_frame - c.start_frame);
+            }
+            tframe += c.frame_count();
+        }
+        if (!clips.empty() && source_frame == clips.back().end_frame) {
+            return tframe;  // end position
+        }
+        return 0;
     }
     
     bool open(const std::string& path) {
@@ -225,9 +260,11 @@ struct VideoPlayer {
         
         // Initialize with single clip covering entire video [0, total_frames)
         clips.clear();
-        clips.push_back({0, total_frames});
+        next_clip_color_id = 0;
+        clips.push_back({0, total_frames, next_clip_color_id++});
         active_clip = 0;
         current_frame = 0;
+        current_timeline_frame = 0;
         
         return true;
     }
@@ -255,6 +292,8 @@ struct VideoPlayer {
         first_keyframe_time = 0.0;
         clips.clear();
         active_clip = 0;
+        current_timeline_frame = 0;
+        next_clip_color_id = 0;
         source_path.clear();
     }
     
@@ -294,16 +333,17 @@ struct VideoPlayer {
     // Check if current_frame is at the end of the timeline (past all clips)
     bool at_timeline_end() const {
         if (clips.empty()) return false;
-        return current_frame >= clips.back().end_frame;
+        if (clip_at_frame(current_frame) >= 0) return false;
+        return current_frame == clips.back().end_frame;
     }
     
     // Seek to a specific frame number
     // Allows seeking to end_frame (one past last valid frame) - will display last frame
-    void seek_to_frame(int64_t target_frame) {
+    void seek_to_frame(int64_t target_frame, bool reset_play_clock = true, bool update_timeline_frame = true) {
         if (!loaded) return;
         
         // Allow target_frame to be at the end position (for "at end" state)
-        int64_t max_frame = clips.empty() ? total_frames : clips.back().end_frame;
+        int64_t max_frame = total_frames;
         target_frame = std::clamp(target_frame, (int64_t)0, max_frame);
         
         // For display, seek to the actual displayable frame
@@ -332,16 +372,29 @@ struct VideoPlayer {
         // Set frame-based position (authoritative) - can be at "end" position
         current_frame = target_frame;
         current_time = frame_to_time(target_frame);
+        if (update_timeline_frame) {
+            current_timeline_frame = source_to_timeline_frame(current_frame);
+        }
         
-        if (playing) {
+        if (playing && reset_play_clock) {
             play_start_time = glfwGetTime();
             play_start_frame = current_frame;
+            play_start_timeline_frame = current_timeline_frame;
         }
     }
     
     // Legacy seek by time (converts to frame, then seeks)
     void seek(double time) {
         seek_to_frame(time_to_frame(time));
+    }
+    
+    // Seek by timeline frame (clip order)
+    void seek_to_timeline_frame(int64_t timeline_frame, bool reset_play_clock = true) {
+        if (clips.empty()) return;
+        int64_t max_timeline = total_timeline_frames();
+        timeline_frame = std::clamp(timeline_frame, (int64_t)0, max_timeline);
+        current_timeline_frame = timeline_frame;
+        seek_to_frame(timeline_to_source_frame(timeline_frame), reset_play_clock, false);
     }
     
     // Find which clip index contains a given source frame, returns -1 if not in any clip
@@ -363,7 +416,7 @@ struct VideoPlayer {
         // Don't split if too close to edges (need at least 1 frame per clip)
         if (frame - clip.start_frame < 1 || clip.end_frame - frame < 1) return;
         
-        Clip new_clip = {frame, clip.end_frame};
+        Clip new_clip = {frame, clip.end_frame, next_clip_color_id++};
         clip.end_frame = frame;
         clips.insert(clips.begin() + idx + 1, new_clip);
     }
@@ -375,24 +428,11 @@ struct VideoPlayer {
     
     void play() {
         if (!loaded || clips.empty()) return;
-        
-        // Find which clip we're starting in
-        active_clip = clip_at_frame(current_frame);
-        if (active_clip < 0) {
-            // Not in any clip - find the next clip after current position
-            active_clip = 0;
-            for (int i = 0; i < (int)clips.size(); i++) {
-                if (clips[i].start_frame >= current_frame) {
-                    active_clip = i;
-                    seek_to_frame(clips[i].start_frame);
-                    break;
-                }
-            }
-        }
-        
+        int64_t max_timeline = total_timeline_frames();
+        current_timeline_frame = std::clamp(current_timeline_frame, (int64_t)0, max_timeline);
         playing = true;
         play_start_time = glfwGetTime();
-        play_start_frame = current_frame;
+        play_start_timeline_frame = current_timeline_frame;
     }
     
     void pause() {
@@ -406,39 +446,16 @@ struct VideoPlayer {
     
     void update() {
         if (!loaded || !playing || clips.empty()) return;
-        if (active_clip < 0 || active_clip >= (int)clips.size()) active_clip = 0;
-        
         double elapsed = glfwGetTime() - play_start_time;
-        int64_t target_frame = play_start_frame + (int64_t)(elapsed * fps);
-        
-        // Check if we've reached end of current clip
-        const Clip& clip = clips[active_clip];
-        if (current_frame >= clip.end_frame - 1 || target_frame >= clip.end_frame) {
-            // Move to next clip or stop
-            if (active_clip + 1 < (int)clips.size()) {
-                active_clip++;
-                seek_to_frame(clips[active_clip].start_frame);
-                play_start_time = glfwGetTime();
-                play_start_frame = clips[active_clip].start_frame;
-                return;
-            } else {
-                // End of all clips - go back to start
-                active_clip = 0;
-                seek_to_frame(clips[0].start_frame);
-                pause();
-                return;
-            }
+        int64_t target_timeline = play_start_timeline_frame + (int64_t)(elapsed * fps);
+        int64_t max_timeline = total_timeline_frames();
+        if (target_timeline >= max_timeline) {
+            seek_to_timeline_frame(max_timeline);
+            pause();
+            return;
         }
-        
-        // Decode frames to catch up to target frame
-        while (current_frame < target_frame) {
-            if (!decode_frame()) {
-                pause();
-                return;
-            }
-            // Safety: don't decode past clip end
-            if (current_frame >= clip.end_frame) break;
-        }
+        if (target_timeline == current_timeline_frame) return;
+        seek_to_timeline_frame(target_timeline, false);
     }
     
     std::string format_time(int64_t frame) const {
@@ -1275,8 +1292,12 @@ struct TrimTimelineState {
 };
 
 struct ClipsTimelineState {
-    int dragging = 0;       // 0=none, 1=left handle, 2=right handle, 3=playhead, 4=panning
+    int dragging = 0;       // 0=none, 1=left handle, 2=right handle, 3=playhead, 4=panning, 5=clip drag
     int dragging_clip = -1; // Which clip's handle we're dragging
+    int pending_clip = -1;  // Clip clicked (waiting to see if it becomes a drag)
+    bool pending_click = false;
+    float pending_click_x = 0.0f;
+    ImVec2 pending_mouse_start{0.0f, 0.0f};
     float zoom = 1.0f;      // Zoom level (1.0 = fit all, higher = zoom in)
     float scroll = 0.0f;    // Scroll position (0.0 to 1.0, normalized)
     float pan_start_x = 0.0f; // For panning
@@ -1286,7 +1307,7 @@ struct ClipsTimelineState {
 // Modern Final Cut-style magnetic timeline widget with zoom/scroll
 // Clips are frame-based for precision
 // Returns true if anything changed
-bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>& clips, int64_t total_source_frames, double fps, const ImVec2& size, ClipsTimelineState& state) {
+bool ClipsTimeline(const char* label, int64_t* current_source_frame, int64_t* current_timeline_frame, std::vector<Clip>& clips, int64_t total_source_frames, double fps, const ImVec2& size, ClipsTimelineState& state) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     
@@ -1360,6 +1381,18 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
     bool mouse_in_timeline = (mouse.x >= bb_min.x && mouse.x <= bb_max.x && 
                               mouse.y >= bb_min.y && mouse.y <= bb_max.y);
     
+    auto clip_color_for = [](int color_id) -> ImU32 {
+        static const ImU32 palette[] = {
+            IM_COL32(85, 65, 125, 255),
+            IM_COL32(65, 85, 125, 255),
+            IM_COL32(90, 70, 95, 255),
+            IM_COL32(70, 95, 95, 255),
+            IM_COL32(95, 75, 70, 255),
+            IM_COL32(70, 95, 75, 255)
+        };
+        return palette[color_id % (int)(sizeof(palette) / sizeof(palette[0]))];
+    };
+    
     // Draw each clip - positioned sequentially (magnetic/ripple style)
     float timeline_pos = 0.0f;  // Current position on timeline (in time units)
     for (int i = 0; i < (int)clips.size(); i++) {
@@ -1387,8 +1420,8 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
         bool hover_left = hover_clip && mouse.x <= start_x + handle_w + 4;
         bool hover_right = hover_clip && mouse.x >= end_x - handle_w - 4;
         
-        // Clip colors - purple/blue tones like Final Cut
-        ImU32 clip_color = (i % 2 == 0) ? IM_COL32(85, 65, 125, 255) : IM_COL32(65, 85, 125, 255);
+        // Stable clip colors based on clip identity
+        ImU32 clip_color = clip_color_for(clip.color_id);
         
         // Draw clip with rounded corners
         draw_list->AddRectFilled(clip_min, clip_max, clip_color, rounding);
@@ -1429,21 +1462,12 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
         timeline_pos += clip_dur_time;
     }
     
-    // Convert current frame (in source coordinates) to timeline position
+    // Convert current timeline frame to timeline position
     float playhead_timeline_pos = 0.0f;
-    int64_t current_source_frame = *current_frame;
     bool at_end = false;
-    for (const auto& c : clips) {
-        if (current_source_frame < c.start_frame) break;
-        if (current_source_frame < c.end_frame) {
-            playhead_timeline_pos += frame_to_time(current_source_frame - c.start_frame);
-            break;
-        }
-        playhead_timeline_pos += frame_to_time(c.frame_count());
-    }
-    // Check if at the "end" position (past all clips)
-    if (!clips.empty() && current_source_frame >= clips.back().end_frame) {
-        playhead_timeline_pos = total_duration;  // At the very end
+    int64_t clamped_timeline = std::clamp(*current_timeline_frame, (int64_t)0, total_timeline_frames);
+    playhead_timeline_pos = frame_to_time(clamped_timeline);
+    if (!clips.empty() && clamped_timeline == total_timeline_frames) {
         at_end = true;
     }
     
@@ -1557,21 +1581,30 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
         }
     }
     
-    // Helper: map timeline time to source frame
-    auto timeline_time_to_source_frame = [&](float timeline_time) -> int64_t {
-        float tpos = 0.0f;
-        int64_t source_frame = 0;
-        for (const auto& c : clips) {
-            float dur = frame_to_time(c.frame_count());
-            if (timeline_time < tpos + dur) {
-                int64_t frame_offset = time_to_frame_local(timeline_time - tpos);
-                source_frame = c.start_frame + frame_offset;
-                return source_frame;
-            }
-            tpos += dur;
-            source_frame = c.end_frame;
+    // Detect if clips are in source order (needed for safe trim constraints)
+    bool clips_in_source_order = true;
+    for (int i = 1; i < (int)clips.size(); i++) {
+        if (clips[i].start_frame < clips[i - 1].start_frame) {
+            clips_in_source_order = false;
+            break;
         }
-        return source_frame;
+    }
+    
+    // Helper: map timeline frame to source frame
+    auto timeline_frame_to_source_frame = [&](int64_t timeline_frame) -> int64_t {
+        if (clips.empty()) return 0;
+        if (timeline_frame < 0) timeline_frame = 0;
+        if (timeline_frame >= total_timeline_frames) {
+            return clips.back().end_frame;  // end position
+        }
+        for (const auto& c : clips) {
+            int64_t count = c.frame_count();
+            if (timeline_frame < count) {
+                return c.start_frame + timeline_frame;
+            }
+            timeline_frame -= count;
+        }
+        return clips.back().end_frame;
     };
     
     // Hover playhead (temporary) - follows mouse, does not move real playhead
@@ -1579,23 +1612,10 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
         float hover_time = x_to_time(mouse.x);
         hover_time = std::clamp(hover_time, 0.0f, total_duration);
         
-        // Snap hover playhead to discrete frame positions
-        int64_t hover_source_frame = timeline_time_to_source_frame(hover_time);
-        int64_t max_frame = clips.empty() ? total_source_frames : clips.back().end_frame;
-        hover_source_frame = std::clamp(hover_source_frame, (int64_t)0, max_frame);
-        
-        float hover_timeline_pos = 0.0f;
-        for (const auto& c : clips) {
-            if (hover_source_frame < c.start_frame) break;
-            if (hover_source_frame < c.end_frame) {
-                hover_timeline_pos += frame_to_time(hover_source_frame - c.start_frame);
-                break;
-            }
-            hover_timeline_pos += frame_to_time(c.frame_count());
-        }
-        if (!clips.empty() && hover_source_frame >= clips.back().end_frame) {
-            hover_timeline_pos = total_duration;
-        }
+        // Snap hover playhead to discrete timeline frames
+        int64_t hover_timeline_frame = time_to_frame_local(hover_time);
+        hover_timeline_frame = std::clamp<int64_t>(hover_timeline_frame, 0, total_timeline_frames);
+        float hover_timeline_pos = frame_to_time(hover_timeline_frame);
         
         float hover_x = time_to_x(hover_timeline_pos);
         hover_x = std::clamp(hover_x, bb_min.x, bb_max.x);
@@ -1615,14 +1635,17 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
         float click_x = mouse.x;
         state.dragging = 0;
         state.dragging_clip = -1;
+        state.pending_clip = -1;
+        state.pending_click = false;
         
-        // Check each clip's handles
+        // Check each clip's handles or body
         for (int i = 0; i < (int)clips.size(); i++) {
             float start_x = clip_positions[i].start_x;
             float end_x = clip_positions[i].end_x;
             
             bool on_left = (click_x >= start_x && click_x <= start_x + handle_w + 6);
             bool on_right = (click_x >= end_x - handle_w - 6 && click_x <= end_x);
+            bool on_body = (click_x > start_x + handle_w + 6 && click_x < end_x - handle_w - 6);
             
             if (on_left && on_right) {
                 if (std::abs(click_x - start_x) < std::abs(click_x - end_x)) {
@@ -1640,16 +1663,32 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
                 state.dragging = 2;
                 state.dragging_clip = i;
                 break;
+            } else if (on_body && !ImGui::GetIO().KeyAlt) {
+                state.pending_clip = i;
+                state.pending_click = true;
+                state.pending_click_x = click_x;
+                state.pending_mouse_start = mouse;
+                
+                // Click moves playhead immediately; drag can take over if it starts
+                float timeline_time = x_to_time(click_x);
+                timeline_time = std::clamp(timeline_time, 0.0f, total_duration);
+                int64_t timeline_frame = time_to_frame_local(timeline_time);
+                timeline_frame = std::clamp<int64_t>(timeline_frame, 0, total_timeline_frames);
+                *current_timeline_frame = timeline_frame;
+                *current_source_frame = timeline_frame_to_source_frame(timeline_frame);
+                changed = true;
+                break;
             }
         }
         
-        // If didn't hit any handle, move playhead to the clicked position
+        // If didn't hit any handle or clip, move playhead to the clicked position
         if (state.dragging == 0 && !ImGui::GetIO().KeyAlt) {
             float timeline_time = x_to_time(click_x);
             timeline_time = std::clamp(timeline_time, 0.0f, total_duration);
-            int64_t source_frame = timeline_time_to_source_frame(timeline_time);
-            int64_t max_frame = clips.empty() ? total_source_frames : clips.back().end_frame;
-            *current_frame = std::clamp(source_frame, (int64_t)0, max_frame);
+            int64_t timeline_frame = time_to_frame_local(timeline_time);
+            timeline_frame = std::clamp<int64_t>(timeline_frame, 0, total_timeline_frames);
+            *current_timeline_frame = timeline_frame;
+            *current_source_frame = timeline_frame_to_source_frame(timeline_frame);
             changed = true;
         }
     }
@@ -1657,6 +1696,21 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
     if (!is_active && state.dragging != 4) {  // Don't reset for middle-mouse panning
         state.dragging = 0;
         state.dragging_clip = -1;
+        state.pending_clip = -1;
+        state.pending_click = false;
+    }
+
+    // Promote click to drag if mouse moves past threshold
+    if (is_active && state.pending_click && state.pending_clip >= 0) {
+        float dx = mouse.x - state.pending_mouse_start.x;
+        float dy = mouse.y - state.pending_mouse_start.y;
+        float dist2 = dx * dx + dy * dy;
+        float thresh = ImGui::GetIO().MouseDragThreshold;
+        if (dist2 >= thresh * thresh) {
+            state.dragging = 5;
+            state.dragging_clip = state.pending_clip;
+            state.pending_click = false;
+        }
     }
     
     if (state.dragging != 0 && state.dragging != 4 && is_active) {
@@ -1664,7 +1718,29 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
         float timeline_time = x_to_time(mouse.x);
         timeline_time = std::clamp(timeline_time, 0.0f, total_duration);
         
-        if (state.dragging_clip >= 0 && state.dragging_clip < (int)clips.size()) {
+        if (state.dragging == 5 && state.dragging_clip >= 0 && state.dragging_clip < (int)clips.size()) {
+            // Dragging a clip to reorder
+            const Clip dragged = clips[state.dragging_clip];
+            int insert_index = 0;
+            float tpos = 0.0f;
+            for (int i = 0; i < (int)clips.size(); i++) {
+                if (i == state.dragging_clip) continue;
+                float dur = frame_to_time(clips[i].frame_count());
+                float mid = tpos + dur * 0.5f;
+                if (timeline_time < mid) break;
+                tpos += dur;
+                insert_index++;
+            }
+            
+            int old_index = state.dragging_clip;
+            if (insert_index != old_index) {
+                clips.erase(clips.begin() + old_index);
+                if (insert_index > old_index) insert_index--;
+                clips.insert(clips.begin() + insert_index, dragged);
+                state.dragging_clip = insert_index;
+                changed = true;
+            }
+        } else if (state.dragging_clip >= 0 && state.dragging_clip < (int)clips.size()) {
             Clip& clip = clips[state.dragging_clip];
             
             // Use zoom-aware conversion for handle dragging
@@ -1680,18 +1756,22 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
                 int64_t old_start = clip.start_frame;
                 int64_t new_start = clip.start_frame + delta_frames;
                 
-                // Prevent overlap with previous clip
                 int64_t min_start = 0;
-                if (state.dragging_clip > 0) {
+                if (clips_in_source_order && state.dragging_clip > 0) {
                     min_start = clips[state.dragging_clip - 1].end_frame;
                 }
-                new_start = std::clamp(new_start, min_start, clip.end_frame - 1);
+                int64_t max_start = clip.end_frame - 1;
+                if (min_start > max_start) {
+                    min_start = max_start;
+                }
+                new_start = std::clamp(new_start, min_start, max_start);
                 clip.start_frame = new_start;
                 
                 // If playhead was at the old start, follow the handle
-                if (*current_frame == old_start || *current_frame < new_start) {
-                    *current_frame = new_start;
-                }
+                int64_t max_timeline = 0;
+                for (const auto& c : clips) max_timeline += c.frame_count();
+                *current_timeline_frame = std::clamp(*current_timeline_frame, (int64_t)0, max_timeline);
+                *current_source_frame = timeline_frame_to_source_frame(*current_timeline_frame);
                 changed = true;
             } else if (state.dragging == 2) {
                 // Right handle - adjust end_frame (trim end)
@@ -1703,50 +1783,32 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
                 int64_t old_end = clip.end_frame;
                 int64_t new_end = clip.end_frame + delta_frames;
                 
-                // Prevent overlap with next clip
                 int64_t max_end = total_source_frames;
-                if (state.dragging_clip < (int)clips.size() - 1) {
+                if (clips_in_source_order && state.dragging_clip < (int)clips.size() - 1) {
                     max_end = clips[state.dragging_clip + 1].start_frame;
                 }
-                new_end = std::clamp(new_end, clip.start_frame + 1, max_end);
+                int64_t min_end = clip.start_frame + 1;
+                if (max_end < min_end) {
+                    max_end = min_end;
+                }
+                new_end = std::clamp(new_end, min_end, max_end);
                 clip.end_frame = new_end;
                 
                 // If playhead was at the old last frame, follow the handle
-                if (*current_frame == old_end - 1 || *current_frame >= new_end) {
-                    *current_frame = new_end - 1;
-                }
+                int64_t max_timeline = 0;
+                for (const auto& c : clips) max_timeline += c.frame_count();
+                *current_timeline_frame = std::clamp(*current_timeline_frame, (int64_t)0, max_timeline);
+                *current_source_frame = timeline_frame_to_source_frame(*current_timeline_frame);
                 changed = true;
             }
             
             // After resizing, check if current_frame is now outside all clips
             // If so, snap it to the nearest valid position
-            bool frame_in_clip = false;
-            for (const auto& c : clips) {
-                if (*current_frame >= c.start_frame && *current_frame < c.end_frame) {
-                    frame_in_clip = true;
-                    break;
-                }
-            }
-            if (!frame_in_clip && !clips.empty()) {
-                // Find the closest clip and snap to it
-                int64_t best_frame = clips[0].start_frame;
-                int64_t best_dist = std::abs(*current_frame - best_frame);
-                
-                for (const auto& c : clips) {
-                    int64_t dist_to_start = std::abs(*current_frame - c.start_frame);
-                    int64_t dist_to_end = std::abs(*current_frame - (c.end_frame - 1));
-                    
-                    if (dist_to_start < best_dist) {
-                        best_dist = dist_to_start;
-                        best_frame = c.start_frame;
-                    }
-                    if (dist_to_end < best_dist) {
-                        best_dist = dist_to_end;
-                        best_frame = c.end_frame - 1;
-                    }
-                }
-                *current_frame = best_frame;
-                changed = true;
+            if (!clips.empty()) {
+                int64_t max_timeline = 0;
+                for (const auto& c : clips) max_timeline += c.frame_count();
+                *current_timeline_frame = std::clamp(*current_timeline_frame, (int64_t)0, max_timeline);
+                *current_source_frame = timeline_frame_to_source_frame(*current_timeline_frame);
             }
         }
     }
@@ -1759,8 +1821,12 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
             
             bool over_left = (mouse.x >= start_x && mouse.x <= start_x + handle_w + 6);
             bool over_right = (mouse.x >= end_x - handle_w - 6 && mouse.x <= end_x);
+            bool over_body = (mouse.x > start_x + handle_w + 6 && mouse.x < end_x - handle_w - 6);
             if (over_left || over_right) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                break;
+            } else if (over_body) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
                 break;
             }
         }
@@ -2050,163 +2116,76 @@ int main() {
                 // Frame-based arrow key navigation (simple and precise)
                 // Must handle case where current_frame is outside all clips (e.g., after resizing)
                 
-                // Helper: find which clip contains a frame, or -1 if none
-                auto find_clip_containing = [&](int64_t frame) -> int {
-                    for (size_t i = 0; i < player.clips.size(); i++) {
-                        if (frame >= player.clips[i].start_frame && frame < player.clips[i].end_frame) {
-                            return (int)i;
-                        }
-                    }
-                    return -1;
-                };
-                
-                // Helper: find the next clip that starts after a given frame
-                auto find_next_clip_after = [&](int64_t frame) -> int {
-                    for (size_t i = 0; i < player.clips.size(); i++) {
-                        if (player.clips[i].start_frame > frame) {
-                            return (int)i;
-                        }
-                    }
-                    return -1;
-                };
-                
-                // Helper: find the last clip that ends at or before a given frame
-                auto find_prev_clip_before = [&](int64_t frame) -> int {
-                    int result = -1;
-                    for (size_t i = 0; i < player.clips.size(); i++) {
-                        if (player.clips[i].end_frame <= frame) {
-                            result = (int)i;
-                        }
-                    }
-                    return result;
-                };
-                
-                // Left arrow: go to previous frame, respecting clip boundaries
-                if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) && !player.clips.empty()) {
-                    player.pause();
-                    int clip_idx = find_clip_containing(player.current_frame);
-                    int64_t new_frame;
-                    
-                    if (clip_idx >= 0) {
-                        // We're inside a clip
-                        new_frame = player.current_frame - 1;
-                        if (new_frame < player.clips[clip_idx].start_frame) {
-                            // Would go before current clip, jump to previous clip if exists
-                            if (clip_idx > 0) {
-                                new_frame = player.clips[clip_idx - 1].end_frame - 1;
-                            } else {
-                                new_frame = player.clips.front().start_frame;
-                            }
-                        }
-                    } else {
-                        // We're outside all clips - find the previous clip
-                        int prev_idx = find_prev_clip_before(player.current_frame);
-                        if (prev_idx >= 0) {
-                            new_frame = player.clips[prev_idx].end_frame - 1;
-                        } else {
-                            // No clip before us, go to first clip's start
-                            new_frame = player.clips.front().start_frame;
-                        }
-                    }
-                    
-                    // Clamp to first frame
-                    new_frame = std::max(new_frame, player.clips.front().start_frame);
-                    player.seek_to_frame(new_frame);
-                }
-                
-                // Right arrow: go to next frame, respecting clip boundaries
-                // Allows moving to the "end" position (one past last frame) for the last clip
-                if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) && !player.clips.empty()) {
-                    player.pause();
-                    int clip_idx = find_clip_containing(player.current_frame);
-                    int64_t new_frame;
-                    int64_t timeline_end = player.clips.back().end_frame;
-                    
-                    if (player.current_frame >= timeline_end) {
-                        // Already at or past the end, don't move
-                        new_frame = timeline_end;
-                    } else if (clip_idx >= 0) {
-                        // We're inside a clip
-                        new_frame = player.current_frame + 1;
-                        if (new_frame >= player.clips[clip_idx].end_frame) {
-                            // Would go past current clip, jump to next clip if exists
-                            if (clip_idx < (int)player.clips.size() - 1) {
-                                new_frame = player.clips[clip_idx + 1].start_frame;
-                            } else {
-                                // Last clip - allow going to "end" position
-                                new_frame = timeline_end;
-                            }
-                        }
-                    } else {
-                        // We're outside all clips - find the next clip
-                        int next_idx = find_next_clip_after(player.current_frame);
-                        if (next_idx >= 0) {
-                            new_frame = player.clips[next_idx].start_frame;
-                        } else {
-                            // No clip after us, go to end
-                            new_frame = timeline_end;
-                        }
-                    }
-                    
-                    // Clamp to timeline end (allows "end" position)
-                    new_frame = std::min(new_frame, timeline_end);
-                    player.seek_to_frame(new_frame);
-                }
-                
-                // Up/Down arrows: navigate between clip boundaries (frame-based)
-                // Boundaries include: clip starts and the end position (skip last frame - left/right handles that)
-                std::vector<int64_t> boundaries;
-                for (const auto& c : player.clips) {
-                    boundaries.push_back(c.start_frame);
-                }
+                // Frame-based arrow key navigation using timeline order (works after reordering)
                 if (!player.clips.empty()) {
-                    // Add end position (not last frame - that's for left/right arrows)
-                    boundaries.push_back(player.clips.back().end_frame);  // "End" position
-                }
-                std::sort(boundaries.begin(), boundaries.end());
-                
-                // Up arrow: go to previous boundary
-                if (ImGui::IsKeyPressed(ImGuiKey_UpArrow) && !boundaries.empty()) {
-                    player.pause();
+                    int64_t total_timeline = player.total_timeline_frames();
+                    int64_t timeline_frame = std::clamp(player.current_timeline_frame, (int64_t)0, total_timeline);
                     
-                    // Find the largest boundary that's less than current frame
-                    int64_t target = boundaries[0];
-                    for (int64_t b : boundaries) {
-                        if (b < player.current_frame) {
-                            target = b;
-                        }
+                    // Left arrow: previous timeline frame
+                    if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
+                        player.pause();
+                        if (timeline_frame > 0) timeline_frame--;
+                        player.seek_to_timeline_frame(timeline_frame);
                     }
-                    player.seek_to_frame(target);
-                }
-                
-                // Down arrow: go to next boundary
-                if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) && !boundaries.empty()) {
-                    player.pause();
                     
-                    // Find the smallest boundary that's greater than current frame
-                    int64_t target = boundaries.back();
-                    for (int64_t b : boundaries) {
-                        if (b > player.current_frame) {
-                            target = b;
-                            break;
-                        }
+                    // Right arrow: next timeline frame (allows end position)
+                    if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) {
+                        player.pause();
+                        if (timeline_frame < total_timeline) timeline_frame++;
+                        player.seek_to_timeline_frame(timeline_frame);
                     }
-                    player.seek_to_frame(target);
+                    
+                    // Up/Down arrows: navigate between clip boundaries in timeline order
+                    std::vector<int64_t> boundaries;
+                    boundaries.reserve(player.clips.size() + 2);
+                    int64_t tpos = 0;
+                    boundaries.push_back(0);
+                    for (const auto& c : player.clips) {
+                        boundaries.push_back(tpos);
+                        tpos += c.frame_count();
+                    }
+                    boundaries.push_back(total_timeline);
+                    std::sort(boundaries.begin(), boundaries.end());
+                    boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+                    
+                    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow) && !boundaries.empty()) {
+                        player.pause();
+                        int64_t target = boundaries.front();
+                        for (int64_t b : boundaries) {
+                            if (b < timeline_frame) {
+                                target = b;
+                            }
+                        }
+                        player.seek_to_timeline_frame(target);
+                    }
+                    
+                    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) && !boundaries.empty()) {
+                        player.pause();
+                        int64_t target = boundaries.back();
+                        for (int64_t b : boundaries) {
+                            if (b > timeline_frame) {
+                                target = b;
+                                break;
+                            }
+                        }
+                        player.seek_to_timeline_frame(target);
+                    }
                 }
                 
                 // Timeline with clips
                 ImGui::SetCursorPos(ImVec2(10, viewport->Size.y - controls_height + 35 * ui_scale));
                 int64_t curr_frame = player.current_frame;
+                int64_t curr_timeline_frame = player.current_timeline_frame;
                 
                 static int64_t last_seek_frame = -1;
                 
-                if (ClipsTimeline("##clips_timeline", &curr_frame, player.clips, player.total_frames, player.fps,
+                if (ClipsTimeline("##clips_timeline", &curr_frame, &curr_timeline_frame, player.clips, player.total_frames, player.fps,
                                  ImVec2(viewport->Size.x - 20, 50 * ui_scale), timeline_state)) {
-                    if (curr_frame != last_seek_frame) {
-                        last_seek_frame = curr_frame;
-                        player.current_frame = curr_frame;
+                    if (curr_timeline_frame != last_seek_frame) {
+                        last_seek_frame = curr_timeline_frame;
+                        player.current_timeline_frame = curr_timeline_frame;
                         player.pause();
-                        player.seek_to_frame(curr_frame);
+                        player.seek_to_timeline_frame(curr_timeline_frame);
                     }
                 }
                 
