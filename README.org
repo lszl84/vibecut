@@ -53,15 +53,15 @@ git submodule update --init
 * Time Tracking
 
 #+BEGIN: clocktable :maxlevel nil :scope file :block nil
-#+CAPTION: Clock summary at [2026-01-15 Thu 12:23]
+#+CAPTION: Clock summary at [2026-01-16 Fri 10:32]
 | Headline          | Time |      |
 |-------------------+------+------|
-| *Total time*        | *8:35* |      |
+| *Total time*        | *9:56* |      |
 |-------------------+------+------|
-| Tasks             | 8:35 |      |
+| Tasks             | 9:56 |      |
 | \_  Initial Setup |      | 0:13 |
-| \_  Vibe coding   |      | 7:44 |
-| \_  Manual coding |      | 0:38 |
+| \_  Vibe coding   |      | 8:50 |
+| \_  Manual coding |      | 0:53 |
 #+END:
 
 * Tasks
@@ -74,6 +74,8 @@ CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
 :END:
 ** Vibe coding
 :LOGBOOK:
+CLOCK: [2026-01-16 Fri 09:21]--[2026-01-16 Fri 10:27] =>  1:06
+CLOCK: [2026-01-16 Fri 09:21]--[2026-01-16 Fri 09:21] =>  0:00
 CLOCK: [2026-01-15 Thu 12:00]--[2026-01-15 Thu 12:23] =>  0:23
 CLOCK: [2026-01-14 Wed 08:40]--[2026-01-14 Wed 09:37] =>  0:57
 CLOCK: [2026-01-13 Tue 18:14]--[2026-01-13 Tue 20:29] =>  2:15
@@ -88,6 +90,7 @@ Typing or speaking prompts, babysiting Agents, testing the features
 implemented by agents, etc.
 ** Manual coding
 :LOGBOOK:
+CLOCK: [2026-01-16 Fri 09:06]--[2026-01-16 Fri 09:21] =>  0:15
 CLOCK: [2026-01-14 Wed 09:54]--[2026-01-14 Wed 10:32] =>  0:38
 :END:
 Adding/changing code by hand, debugging, etc.
@@ -95,6 +98,27 @@ Adding/changing code by hand, debugging, etc.
 * Devlog
 
 Live Streams: https://www.youtube.com/@lukeatdevmindscape/streams
+
+** Day 10
+So I set out to fix the export issue, started a new ffmpeg project
+(with the help of AI of course), and then I noticed that it wasn't our
+export function that's incorrect!
+
+It turned out the bug is in the video loading for weird fps. So that
+was fixed pretty quickly by AI (I moved to the recently released Codex
+5.2 from Claude Opus 4.5 btw). That's a nice win, because I want to
+keep the manual coding to the minimum in this project, so that we can
+really test how viable pure or almost pure vibe coding is.
+
+After fixing the decoding we moved on to clip reordering, which is a
+huge UX change from the architectural POV. Codex struggled a bit, but
+was able to create someting more or less working in like 40 minutes,
+so not bad overall.
+
+Tomorrow we will continue fixing the remaining bugs. The next big
+feature is loading other videos to the project, so that we can add
+more clips to the timeline. This will be a huge feature, moving us
+closer towards a working NLE.
 
 ** Day 9
 This is just annoying at this point. After reviewing the code and
