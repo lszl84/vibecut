@@ -47,7 +47,9 @@ struct VideoPlayer {
     int height = 0;
     double duration = 0.0;
     double fps = 30.0;              // Frames per second
+    AVRational fps_q{0, 1};
     double time_base = 0.0;
+    AVRational stream_time_base{0, 1};
     int64_t stream_start_pts = 0;   // Stream's start timestamp offset
     double first_keyframe_time = 0.0;  // Time of first keyframe (for seek threshold)
     
@@ -62,6 +64,7 @@ struct VideoPlayer {
     bool playing = false;
     bool loaded = false;
     
+    
     std::vector<Clip> clips;  // Timeline clips (frame-based)
     int active_clip = 0;      // Currently selected/playing clip
     
@@ -70,6 +73,24 @@ struct VideoPlayer {
     // Convert between frames and time
     double frame_to_time(int64_t frame) const { return frame / fps; }
     int64_t time_to_frame(double time) const { return (int64_t)(time * fps + 0.5); }
+    
+    int64_t ts_to_frame(int64_t ts) const {
+        if (ts == AV_NOPTS_VALUE || fps_q.num == 0 || fps_q.den == 0) {
+            return 0;
+        }
+        const AVRational frame_tb{fps_q.den, fps_q.num}; // seconds per frame
+        const auto rounding = static_cast<AVRounding>(AV_ROUND_DOWN | AV_ROUND_PASS_MINMAX);
+        return av_rescale_q_rnd(ts, stream_time_base, frame_tb, rounding);
+    }
+    
+    int64_t frame_to_ts(int64_t frame) const {
+        if (fps_q.num == 0 || fps_q.den == 0) {
+            return 0;
+        }
+        const AVRational frame_tb{fps_q.den, fps_q.num}; // seconds per frame
+        const auto rounding = static_cast<AVRounding>(AV_ROUND_DOWN | AV_ROUND_PASS_MINMAX);
+        return av_rescale_q_rnd(frame, frame_tb, stream_time_base, rounding);
+    }
     
     // Total frames across all clips in the edited timeline
     int64_t total_timeline_frames() const {
@@ -140,12 +161,24 @@ struct VideoPlayer {
         
         width = codec_ctx->width;
         height = codec_ctx->height;
-        time_base = av_q2d(stream->time_base);
-        duration = format_ctx->duration / (double)AV_TIME_BASE;
+        stream_time_base = stream->time_base;
+        time_base = av_q2d(stream_time_base);
+        duration = (stream->duration != AV_NOPTS_VALUE)
+            ? (stream->duration * time_base)
+            : (format_ctx->duration / (double)AV_TIME_BASE);
         stream_start_pts = (stream->start_time != AV_NOPTS_VALUE) ? stream->start_time : 0;
         
         if (stream->avg_frame_rate.num && stream->avg_frame_rate.den) {
-            fps = av_q2d(stream->avg_frame_rate);
+            fps_q = stream->avg_frame_rate;
+        } else if (stream->r_frame_rate.num && stream->r_frame_rate.den) {
+            fps_q = stream->r_frame_rate;
+        } else if (codec_ctx->framerate.num && codec_ctx->framerate.den) {
+            fps_q = codec_ctx->framerate;
+        }
+        if (fps_q.num && fps_q.den) {
+            fps = av_q2d(fps_q);
+        } else {
+            fps_q = { (int)(fps * 1000.0 + 0.5), 1000 };
         }
         
         frame = av_frame_alloc();
@@ -176,20 +209,19 @@ struct VideoPlayer {
         decode_frame();
         first_keyframe_time = current_time;
         
-        // Adjust duration to account for first frame offset (some videos have frames starting later)
-        double actual_duration = duration - first_keyframe_time;
-        if (actual_duration > 0.1) {
-            duration = actual_duration;
-            std::printf("Adjusted duration from %.3f to %.3f (first frame offset: %.3f)\n", 
-                        duration + first_keyframe_time, duration, first_keyframe_time);
-        }
-        
         // Calculate total frames
-        total_frames = (int64_t)(duration * fps + 0.5);
+        if (stream->nb_frames > 0) {
+            total_frames = stream->nb_frames;
+        } else if (stream->duration != AV_NOPTS_VALUE && fps_q.num && fps_q.den) {
+            total_frames = ts_to_frame(stream->duration);
+        } else {
+            total_frames = (int64_t)(duration * fps + 0.5);
+        }
         if (total_frames < 1) total_frames = 1;
         
-        std::printf("Video: %d x %d, %.2f fps, %lld frames, %.2f sec\n",
-                    width, height, fps, (long long)total_frames, duration);
+        std::printf("Video: %d x %d, %.5f fps, %lld frames, %.3f sec (tb=%d/%d, fps_q=%d/%d)\n",
+                    width, height, fps, (long long)total_frames, duration,
+                    stream_time_base.num, stream_time_base.den, fps_q.num, fps_q.den);
         
         // Initialize with single clip covering entire video [0, total_frames)
         clips.clear();
@@ -234,8 +266,15 @@ struct VideoPlayer {
                         sws_scale(sws_ctx, frame->data, frame->linesize, 0, height,
                                   frame_rgb->data, frame_rgb->linesize);
                         
-                        // Subtract stream start offset to get time relative to 0
-                        current_time = (frame->pts - stream_start_pts) * time_base;
+                        // Use best-effort timestamp to avoid B-frame reordering issues
+                        int64_t ts = frame->best_effort_timestamp;
+                        if (ts == AV_NOPTS_VALUE) ts = frame->pts;
+                        if (ts == AV_NOPTS_VALUE) ts = stream_start_pts;
+                        ts = ts - stream_start_pts;
+                
+                        current_frame = ts_to_frame(ts);
+                        current_time = frame_to_time(current_frame);
+                        
                         
                         glBindTexture(GL_TEXTURE_2D, texture_id);
                         glPixelStorei(GL_UNPACK_ROW_LENGTH, frame_rgb->linesize[0] / 3);
@@ -270,9 +309,9 @@ struct VideoPlayer {
         // For display, seek to the actual displayable frame
         int64_t display_frame = std::min(target_frame, max_frame - 1);
         double target_time = frame_to_time(display_frame);
-        
         target_time = std::clamp(target_time, 0.0, duration);
-        int64_t target_ts = (int64_t)(target_time / time_base);
+        int64_t target_ts = stream_start_pts + frame_to_ts(display_frame);
+        
         
         // For positions before the first keyframe, seek from start
         // For other positions, use fast keyframe-based seeking
@@ -287,7 +326,7 @@ struct VideoPlayer {
         
         // Decode forward to reach the exact target frame
         while (decode_frame()) {
-            if (current_time >= target_time - 0.01) break;
+            if (current_frame >= display_frame) break;
         }
         
         // Set frame-based position (authoritative) - can be at "end" position
@@ -397,7 +436,6 @@ struct VideoPlayer {
                 pause();
                 return;
             }
-            current_frame = time_to_frame(current_time);
             // Safety: don't decode past clip end
             if (current_frame >= clip.end_frame) break;
         }
@@ -733,8 +771,16 @@ bool export_clips(const std::string& input, const std::string& output, const std
     };
     
     // Open output file
-    avio_open(&out_ctx->pb, output.c_str(), AVIO_FLAG_WRITE);
-    avformat_write_header(out_ctx, nullptr);
+    if (avio_open(&out_ctx->pb, output.c_str(), AVIO_FLAG_WRITE) < 0) {
+        std::fprintf(stderr, "EXPORT: Failed to open output file: %s\n", output.c_str());
+        exporting = false;
+        return false;
+    }
+    if (avformat_write_header(out_ctx, nullptr) < 0) {
+        std::fprintf(stderr, "EXPORT: Failed to write output header\n");
+        exporting = false;
+        return false;
+    }
     
     std::printf("EXPORT: Output time_base: %d/%d\n", out_video->time_base.num, out_video->time_base.den);
     
