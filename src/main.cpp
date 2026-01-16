@@ -1557,6 +1557,59 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
         }
     }
     
+    // Helper: map timeline time to source frame
+    auto timeline_time_to_source_frame = [&](float timeline_time) -> int64_t {
+        float tpos = 0.0f;
+        int64_t source_frame = 0;
+        for (const auto& c : clips) {
+            float dur = frame_to_time(c.frame_count());
+            if (timeline_time < tpos + dur) {
+                int64_t frame_offset = time_to_frame_local(timeline_time - tpos);
+                source_frame = c.start_frame + frame_offset;
+                return source_frame;
+            }
+            tpos += dur;
+            source_frame = c.end_frame;
+        }
+        return source_frame;
+    };
+    
+    // Hover playhead (temporary) - follows mouse, does not move real playhead
+    if (mouse_in_timeline && !mouse_over_scrollbar) {
+        float hover_time = x_to_time(mouse.x);
+        hover_time = std::clamp(hover_time, 0.0f, total_duration);
+        
+        // Snap hover playhead to discrete frame positions
+        int64_t hover_source_frame = timeline_time_to_source_frame(hover_time);
+        int64_t max_frame = clips.empty() ? total_source_frames : clips.back().end_frame;
+        hover_source_frame = std::clamp(hover_source_frame, (int64_t)0, max_frame);
+        
+        float hover_timeline_pos = 0.0f;
+        for (const auto& c : clips) {
+            if (hover_source_frame < c.start_frame) break;
+            if (hover_source_frame < c.end_frame) {
+                hover_timeline_pos += frame_to_time(hover_source_frame - c.start_frame);
+                break;
+            }
+            hover_timeline_pos += frame_to_time(c.frame_count());
+        }
+        if (!clips.empty() && hover_source_frame >= clips.back().end_frame) {
+            hover_timeline_pos = total_duration;
+        }
+        
+        float hover_x = time_to_x(hover_timeline_pos);
+        hover_x = std::clamp(hover_x, bb_min.x, bb_max.x);
+        
+        draw_list->AddLine(ImVec2(hover_x, bb_min.y + playhead_head_size), 
+                           ImVec2(hover_x, clip_area_bottom), IM_COL32(255, 255, 255, 180), 1.0f);
+        ImVec2 head_points[3] = {
+            ImVec2(hover_x, bb_min.y + playhead_head_size),
+            ImVec2(hover_x - playhead_head_size/2, bb_min.y),
+            ImVec2(hover_x + playhead_head_size/2, bb_min.y)
+        };
+        draw_list->AddTriangleFilled(head_points[0], head_points[1], head_points[2], IM_COL32(255, 255, 255, 180));
+    }
+    
     // Detect what we clicked on (but not if clicking on scrollbar)
     if (ImGui::IsItemClicked(0) && !mouse_over_scrollbar) {
         float click_x = mouse.x;
@@ -1590,9 +1643,14 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
             }
         }
         
-        // If didn't hit any handle, move playhead
-        if (state.dragging == 0) {
-            state.dragging = 3;
+        // If didn't hit any handle, move playhead to the clicked position
+        if (state.dragging == 0 && !ImGui::GetIO().KeyAlt) {
+            float timeline_time = x_to_time(click_x);
+            timeline_time = std::clamp(timeline_time, 0.0f, total_duration);
+            int64_t source_frame = timeline_time_to_source_frame(timeline_time);
+            int64_t max_frame = clips.empty() ? total_source_frames : clips.back().end_frame;
+            *current_frame = std::clamp(source_frame, (int64_t)0, max_frame);
+            changed = true;
         }
     }
     
@@ -1606,26 +1664,7 @@ bool ClipsTimeline(const char* label, int64_t* current_frame, std::vector<Clip>&
         float timeline_time = x_to_time(mouse.x);
         timeline_time = std::clamp(timeline_time, 0.0f, total_duration);
         
-        if (state.dragging == 3) {
-            // Moving playhead - convert timeline position to source frame
-            float tpos = 0.0f;
-            int64_t source_frame = 0;
-            for (const auto& c : clips) {
-                float dur = frame_to_time(c.frame_count());
-                if (timeline_time < tpos + dur) {
-                    // Convert time offset within clip to frame offset
-                    int64_t frame_offset = time_to_frame_local(timeline_time - tpos);
-                    source_frame = c.start_frame + frame_offset;
-                    break;
-                }
-                tpos += dur;
-                source_frame = c.end_frame;
-            }
-            // Allow the "end" position (one past last frame) when clicking at the very end
-            int64_t max_frame = clips.empty() ? total_source_frames : clips.back().end_frame;
-            *current_frame = std::clamp(source_frame, (int64_t)0, max_frame);
-            changed = true;
-        } else if (state.dragging_clip >= 0 && state.dragging_clip < (int)clips.size()) {
+        if (state.dragging_clip >= 0 && state.dragging_clip < (int)clips.size()) {
             Clip& clip = clips[state.dragging_clip];
             
             // Use zoom-aware conversion for handle dragging
@@ -2163,8 +2202,7 @@ int main() {
                 
                 if (ClipsTimeline("##clips_timeline", &curr_frame, player.clips, player.total_frames, player.fps,
                                  ImVec2(viewport->Size.x - 20, 50 * ui_scale), timeline_state)) {
-                    // Seek if frame changed AND there's active mouse interaction
-                    if (curr_frame != last_seek_frame && timeline_state.dragging != 0) {
+                    if (curr_frame != last_seek_frame) {
                         last_seek_frame = curr_frame;
                         player.current_frame = curr_frame;
                         player.pause();
