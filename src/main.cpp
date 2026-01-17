@@ -1344,6 +1344,9 @@ struct ClipsTimelineState {
     bool pending_click = false;
     float pending_click_x = 0.0f;
     ImVec2 pending_mouse_start{0.0f, 0.0f};
+    float pending_grab_offset_time = 0.0f; // Mouse offset into clip (timeline time)
+    float drag_grab_offset_time = 0.0f;    // Active drag offset (timeline time)
+    float drag_start_mouse_time = 0.0f;    // Timeline time when drag started
     float zoom = 1.0f;      // Zoom level (1.0 = fit all, higher = zoom in)
     float scroll = 0.0f;    // Scroll position (0.0 to 1.0, normalized)
     float pan_start_x = 0.0f; // For panning
@@ -1683,6 +1686,8 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int64_t* cu
         state.dragging_clip = -1;
         state.pending_clip = -1;
         state.pending_click = false;
+        state.pending_grab_offset_time = 0.0f;
+        state.drag_start_mouse_time = 0.0f;
         
         // Check each clip's handles or body
         for (int i = 0; i < (int)clips.size(); i++) {
@@ -1714,6 +1719,9 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int64_t* cu
                 state.pending_click = true;
                 state.pending_click_x = click_x;
                 state.pending_mouse_start = mouse;
+                // Store grab offset so dragging uses the clip's actual center.
+                float grab_offset = (click_x - start_x) / size.x * visible_duration;
+                state.pending_grab_offset_time = std::clamp(grab_offset, 0.0f, frame_to_time(clips[i].frame_count()));
                 
                 // Click moves playhead immediately; drag can take over if it starts
                 float timeline_time = x_to_time(click_x);
@@ -1744,6 +1752,9 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int64_t* cu
         state.dragging_clip = -1;
         state.pending_clip = -1;
         state.pending_click = false;
+        state.pending_grab_offset_time = 0.0f;
+        state.drag_grab_offset_time = 0.0f;
+        state.drag_start_mouse_time = 0.0f;
     }
 
     // Promote click to drag if mouse moves past threshold
@@ -1756,6 +1767,10 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int64_t* cu
             state.dragging = 5;
             state.dragging_clip = state.pending_clip;
             state.pending_click = false;
+            state.drag_grab_offset_time = state.pending_grab_offset_time;
+            state.drag_start_mouse_time = x_to_time(state.pending_mouse_start.x);
+            std::printf("REORDER: start drag clip=%d mouse_time=%.4f grab_offset=%.4f\n",
+                        state.dragging_clip, state.drag_start_mouse_time, state.drag_grab_offset_time);
         }
     }
     
@@ -1768,20 +1783,24 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int64_t* cu
             // Dragging a clip to reorder
             const Clip dragged = clips[state.dragging_clip];
             int insert_index = 0;
-            float tpos = 0.0f;
+            float drag_cursor_time = timeline_time;
             for (int i = 0; i < (int)clips.size(); i++) {
                 if (i == state.dragging_clip) continue;
+                float tpos = clip_positions[i].timeline_start;
                 float dur = frame_to_time(clips[i].frame_count());
-                float mid = tpos + dur * 0.5f;
-                if (timeline_time < mid) break;
-                tpos += dur;
+                // Drop only after crossing the midpoint of the target clip.
+                float drop_threshold = tpos + dur * 0.5f;
+                std::printf("REORDER: drag_cursor=%.4f clip=%d tpos=%.4f dur=%.4f threshold=%.4f\n",
+                            drag_cursor_time, i, tpos, dur, drop_threshold);
+                if (drag_cursor_time < drop_threshold) break;
                 insert_index++;
             }
             
             int old_index = state.dragging_clip;
             if (insert_index != old_index) {
+                std::printf("REORDER: move clip=%d -> %d (cursor=%.4f)\n",
+                            old_index, insert_index, drag_cursor_time);
                 clips.erase(clips.begin() + old_index);
-                if (insert_index > old_index) insert_index--;
                 clips.insert(clips.begin() + insert_index, dragged);
                 state.dragging_clip = insert_index;
                 changed = true;
