@@ -378,22 +378,38 @@ struct VideoPlayer {
             if (src.audio_pcm.empty()) {
                 decode_audio_for_source(src);
             }
-            if (src.audio_pcm.empty()) continue;
-            const int64_t source_frames = static_cast<int64_t>(src.audio_pcm.size() / src.audio_channels);
             double start_time = clip.start_frame / src.fps;
             double end_time = clip.end_frame / src.fps;
             int64_t start_sample = static_cast<int64_t>(start_time * audio.sample_rate);
             int64_t end_sample = static_cast<int64_t>(end_time * audio.sample_rate);
+            int64_t clip_samples = std::max<int64_t>(0, end_sample - start_sample);
+            if (clip_samples == 0) continue;
+            if (src.audio_pcm.empty()) {
+                audio.timeline_pcm.insert(audio.timeline_pcm.end(),
+                                          static_cast<size_t>(clip_samples) * audio.channels, 0.0f);
+                continue;
+            }
+            const int64_t source_frames = static_cast<int64_t>(src.audio_pcm.size() / src.audio_channels);
             start_sample = std::clamp<int64_t>(start_sample, 0, source_frames);
             end_sample = std::clamp<int64_t>(end_sample, 0, source_frames);
-            if (end_sample <= start_sample) continue;
-            size_t begin = static_cast<size_t>(start_sample) * audio.channels;
-            size_t end = static_cast<size_t>(end_sample) * audio.channels;
-            audio.timeline_pcm.insert(audio.timeline_pcm.end(),
-                                      src.audio_pcm.begin() + begin,
-                                      src.audio_pcm.begin() + end);
+            int64_t available = std::max<int64_t>(0, end_sample - start_sample);
+            if (available > 0) {
+                size_t begin = static_cast<size_t>(start_sample) * audio.channels;
+                size_t end = static_cast<size_t>(end_sample) * audio.channels;
+                audio.timeline_pcm.insert(audio.timeline_pcm.end(),
+                                          src.audio_pcm.begin() + begin,
+                                          src.audio_pcm.begin() + end);
+            }
+            if (available < clip_samples) {
+                int64_t pad_samples = clip_samples - available;
+                audio.timeline_pcm.insert(audio.timeline_pcm.end(),
+                                          static_cast<size_t>(pad_samples) * audio.channels, 0.0f);
+            }
         }
         audio_loaded = !audio.timeline_pcm.empty();
+        if (audio_loaded && !audio.device_initialized) {
+            init_audio_device();
+        }
         set_audio_playhead_from_timeline(current_timeline_frame);
     }
     
@@ -1913,8 +1929,13 @@ bool save_project_file(const std::string& path, const VideoPlayer& player) {
 bool load_project_file(const std::string& path, VideoPlayer& player) {
     std::ifstream in(path);
     if (!in) return false;
+    if (in.peek() == std::ifstream::traits_type::eof()) return false;
     json j;
-    in >> j;
+    try {
+        in >> j;
+    } catch (...) {
+        return false;
+    }
     if (!j.is_object()) return false;
     player.close();
     if (!j.contains("sources") || !j["sources"].is_array()) return false;

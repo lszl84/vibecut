@@ -53,15 +53,15 @@ git submodule update --init
 * Time Tracking
 
 #+BEGIN: clocktable :maxlevel nil :scope file :block nil
-#+CAPTION: Clock summary at [2026-01-16 Fri 10:32]
-| Headline          | Time |      |
-|-------------------+------+------|
-| *Total time*        | *9:56* |      |
-|-------------------+------+------|
-| Tasks             | 9:56 |      |
-| \_  Initial Setup |      | 0:13 |
-| \_  Vibe coding   |      | 8:50 |
-| \_  Manual coding |      | 0:53 |
+#+CAPTION: Clock summary at [2026-01-17 Sat 15:47]
+| Headline          | Time  |       |
+|-------------------+-------+-------|
+| *Total time*        | *11:51* |       |
+|-------------------+-------+-------|
+| Tasks             | 11:51 |       |
+| \_  Initial Setup |       |  0:13 |
+| \_  Vibe coding   |       | 10:45 |
+| \_  Manual coding |       |  0:53 |
 #+END:
 
 * Tasks
@@ -74,6 +74,7 @@ CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
 :END:
 ** Vibe coding
 :LOGBOOK:
+CLOCK: [2026-01-17 Sat 13:52]--[2026-01-17 Sat 15:47] =>  1:55
 CLOCK: [2026-01-16 Fri 09:21]--[2026-01-16 Fri 10:27] =>  1:06
 CLOCK: [2026-01-16 Fri 09:21]--[2026-01-16 Fri 09:21] =>  0:00
 CLOCK: [2026-01-15 Thu 12:00]--[2026-01-15 Thu 12:23] =>  0:23
@@ -98,6 +99,14 @@ Adding/changing code by hand, debugging, etc.
 * Devlog
 
 Live Streams: https://www.youtube.com/@lukeatdevmindscape/streams
+
+** Day 11
+Good progress, added audio, fixed clips reordering with improved UI,
+and started building the infrastructure for project management and
+inserting external clips to the timeline.
+
+I need to think about the UX of that feature, probably take a closer
+look at what Final Cut does.
 
 ** Day 10
 So I set out to fix the export issue, started a new ffmpeg project
