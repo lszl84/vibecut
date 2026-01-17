@@ -9,5 +9,5 @@
 
 - Test export for missing/incorrect last frame (manual verification)
 - Improve drag-to-end reordering UX (hard to place at end)
-- Add visual indicator while dragging a clip
+- Add visual indicator while dragging a clip (done)
 - Manual test pass for clip reordering + play/seek/resize

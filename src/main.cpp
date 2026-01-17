@@ -1629,6 +1629,28 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int64_t* cu
             frame_pos += clips[i].frame_count();
         }
     }
+
+    // Drag ghost: show semi-transparent clip at the dragged position
+    if (state.dragging == 5 && state.dragging_clip >= 0 && state.dragging_clip < (int)clips.size()) {
+        const Clip& dragged = clips[state.dragging_clip];
+        float drag_dur = frame_to_time(dragged.frame_count());
+        float cursor_time = x_to_time(mouse.x);
+        float drag_start_time = cursor_time - state.drag_grab_offset_time;
+        float max_start = std::max(0.0f, total_duration - drag_dur);
+        drag_start_time = std::clamp(drag_start_time, 0.0f, max_start);
+        float drag_end_time = drag_start_time + drag_dur;
+        float ghost_start_x = time_to_x(drag_start_time);
+        float ghost_end_x = time_to_x(drag_end_time);
+        ImVec2 ghost_min(ghost_start_x + clip_margin, bb_min.y + clip_margin);
+        ImVec2 ghost_max(ghost_end_x - clip_margin, clip_area_bottom - clip_margin);
+        if (ghost_max.x > ghost_min.x) {
+            ImVec4 col = ImGui::ColorConvertU32ToFloat4(clip_color_for(dragged.color_id));
+            col.w = 0.35f;
+            ImU32 ghost_col = ImGui::ColorConvertFloat4ToU32(col);
+            draw_list->AddRectFilled(ghost_min, ghost_max, ghost_col, rounding);
+            draw_list->AddRect(ghost_min, ghost_max, IM_COL32(255, 255, 255, 80), rounding);
+        }
+    }
     
     // Detect if clips are in source order (needed for safe trim constraints)
     bool clips_in_source_order = true;
