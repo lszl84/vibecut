@@ -709,6 +709,28 @@ bool export_clips(const std::string& input, const std::string& output, const std
     }
     
     AVStream* in_video = in_ctx->streams[video_idx];
+    AVRational stream_time_base = in_video->time_base;
+    int64_t stream_start_pts = (in_video->start_time != AV_NOPTS_VALUE) ? in_video->start_time : 0;
+    AVRational fps_q{0, 1};
+    if (in_video->avg_frame_rate.num && in_video->avg_frame_rate.den) {
+        fps_q = in_video->avg_frame_rate;
+    } else if (in_video->r_frame_rate.num && in_video->r_frame_rate.den) {
+        fps_q = in_video->r_frame_rate;
+    } else {
+        fps_q = av_d2q(fps > 0.0 ? fps : 30.0, 100000);
+    }
+    if (fps_q.num == 0 || fps_q.den == 0) {
+        fps_q = {30, 1};
+    }
+    const AVRational frame_tb{fps_q.den, fps_q.num};
+    const auto ts_rounding = static_cast<AVRounding>(AV_ROUND_DOWN | AV_ROUND_PASS_MINMAX);
+    auto ts_to_frame = [&](int64_t ts) -> int64_t {
+        if (ts == AV_NOPTS_VALUE) return 0;
+        return av_rescale_q_rnd(ts, stream_time_base, frame_tb, ts_rounding);
+    };
+    auto frame_to_ts = [&](int64_t frame) -> int64_t {
+        return av_rescale_q_rnd(frame, frame_tb, stream_time_base, ts_rounding);
+    };
     
     // Set up decoder (single-threaded)
     const AVCodec* decoder = avcodec_find_decoder(in_video->codecpar->codec_id);
@@ -730,8 +752,8 @@ bool export_clips(const std::string& input, const std::string& output, const std
     enc_ctx->width = dec_ctx->width;
     enc_ctx->height = dec_ctx->height;
     enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-    enc_ctx->time_base = AVRational{1, (int)fps};
-    enc_ctx->framerate = AVRational{(int)fps, 1};
+    enc_ctx->time_base = frame_tb;
+    enc_ctx->framerate = fps_q;
     enc_ctx->gop_size = 1;      // All I-frames
     enc_ctx->max_b_frames = 0;  // No B-frames
     enc_ctx->thread_count = 1;  // Single-threaded encoding
@@ -851,9 +873,9 @@ bool export_clips(const std::string& input, const std::string& output, const std
         std::printf("EXPORT: Processing clip [%lld, %lld)\n", (long long)clip.start_frame, (long long)clip.end_frame);
         
         // Seek to clip start
-        double start_time = clip.start_frame / fps;
+        int64_t target_ts = stream_start_pts + frame_to_ts(clip.start_frame);
         avcodec_flush_buffers(dec_ctx);
-        avformat_seek_file(in_ctx, -1, INT64_MIN, (int64_t)(start_time * AV_TIME_BASE), (int64_t)(start_time * AV_TIME_BASE), 0);
+        avformat_seek_file(in_ctx, video_idx, 0, target_ts, target_ts, AVSEEK_FLAG_BACKWARD);
         avcodec_flush_buffers(dec_ctx);
         
         int64_t frames_needed = clip.frame_count();
@@ -871,10 +893,12 @@ bool export_clips(const std::string& input, const std::string& output, const std
             
             while (avcodec_receive_frame(dec_ctx, dec_frame) >= 0 && frames_got < frames_needed) {
                 // Calculate source frame index
-                int64_t pts = dec_frame->best_effort_timestamp != AV_NOPTS_VALUE 
-                              ? dec_frame->best_effort_timestamp : dec_frame->pts;
-                double frame_time = pts * av_q2d(in_video->time_base);
-                int64_t src_frame = (int64_t)(frame_time * fps + 0.5);
+                int64_t pts = dec_frame->best_effort_timestamp != AV_NOPTS_VALUE
+                    ? dec_frame->best_effort_timestamp
+                    : dec_frame->pts;
+                if (pts == AV_NOPTS_VALUE) pts = stream_start_pts;
+                pts -= stream_start_pts;
+                int64_t src_frame = ts_to_frame(pts);
                 
                 // Skip frames before clip start
                 if (src_frame < clip.start_frame) {
@@ -882,10 +906,14 @@ bool export_clips(const std::string& input, const std::string& output, const std
                     continue;
                 }
                 
-                // Stop if past clip end
+                // Stop if past clip end. Allow one overflow frame to satisfy exact count.
                 if (src_frame >= clip.end_frame) {
-                    std::printf("EXPORT: Frame %lld past clip end, done with clip\n", (long long)src_frame);
-                    break;
+                    if (frames_got + 1 == frames_needed) {
+                        std::printf("EXPORT: Frame %lld past clip end, using as last frame\n", (long long)src_frame);
+                    } else {
+                        std::printf("EXPORT: Frame %lld past clip end, done with clip\n", (long long)src_frame);
+                        break;
+                    }
                 }
                 
                 std::printf("EXPORT: Decode src=%lld -> encode out=%lld\n", (long long)src_frame, (long long)output_frame);
@@ -899,18 +927,25 @@ bool export_clips(const std::string& input, const std::string& output, const std
                 output_frame++;
                 frames_got++;
                 progress = (float)output_frame / total_frames;
+
+                if (frames_got >= frames_needed) {
+                    break;
+                }
             }
         }
         
         // Flush decoder for this clip
         avcodec_send_packet(dec_ctx, nullptr);
         while (avcodec_receive_frame(dec_ctx, dec_frame) >= 0 && frames_got < frames_needed) {
-            int64_t pts = dec_frame->best_effort_timestamp != AV_NOPTS_VALUE 
-                          ? dec_frame->best_effort_timestamp : dec_frame->pts;
-            double frame_time = pts * av_q2d(in_video->time_base);
-            int64_t src_frame = (int64_t)(frame_time * fps + 0.5);
+            int64_t pts = dec_frame->best_effort_timestamp != AV_NOPTS_VALUE
+                ? dec_frame->best_effort_timestamp
+                : dec_frame->pts;
+            if (pts == AV_NOPTS_VALUE) pts = stream_start_pts;
+            pts -= stream_start_pts;
+            int64_t src_frame = ts_to_frame(pts);
             
-            if (src_frame < clip.start_frame || src_frame >= clip.end_frame) continue;
+            if (src_frame < clip.start_frame) continue;
+            if (src_frame >= clip.end_frame && frames_got + 1 != frames_needed) continue;
             
             std::printf("EXPORT: (flush) Decode src=%lld -> encode out=%lld\n", (long long)src_frame, (long long)output_frame);
             AVFrame* rgb = convert_and_save_ppm(dec_frame, "frame_" + std::to_string(output_frame) + "_src" + std::to_string(src_frame));
@@ -918,6 +953,7 @@ bool export_clips(const std::string& input, const std::string& output, const std
             
             output_frame++;
             frames_got++;
+            if (frames_got >= frames_needed) break;
         }
         
         std::printf("EXPORT: Clip done, got %lld/%lld frames\n", (long long)frames_got, (long long)frames_needed);
