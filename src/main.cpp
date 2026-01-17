@@ -339,7 +339,7 @@ struct VideoPlayer {
     
     // Seek to a specific frame number
     // Allows seeking to end_frame (one past last valid frame) - will display last frame
-    void seek_to_frame(int64_t target_frame, bool reset_play_clock = true, bool update_timeline_frame = true) {
+    void seek_to_frame(int64_t target_frame, bool reset_play_clock = true, bool update_timeline_frame = true, int64_t display_frame_override = -1) {
         if (!loaded) return;
         
         // Allow target_frame to be at the end position (for "at end" state)
@@ -347,7 +347,10 @@ struct VideoPlayer {
         target_frame = std::clamp(target_frame, (int64_t)0, max_frame);
         
         // For display, seek to the actual displayable frame
-        int64_t display_frame = std::min(target_frame, max_frame - 1);
+        int64_t max_display_frame = std::max<int64_t>(0, max_frame - 1);
+        int64_t display_frame = display_frame_override >= 0
+            ? std::clamp(display_frame_override, (int64_t)0, max_display_frame)
+            : std::min(target_frame, max_display_frame);
         double target_time = frame_to_time(display_frame);
         target_time = std::clamp(target_time, 0.0, duration);
         int64_t target_ts = stream_start_pts + frame_to_ts(display_frame);
@@ -394,7 +397,14 @@ struct VideoPlayer {
         int64_t max_timeline = total_timeline_frames();
         timeline_frame = std::clamp(timeline_frame, (int64_t)0, max_timeline);
         current_timeline_frame = timeline_frame;
-        seek_to_frame(timeline_to_source_frame(timeline_frame), reset_play_clock, false);
+        int64_t display_override = -1;
+        if (timeline_frame == max_timeline) {
+            int64_t last_clip_frame = clips.back().end_frame - 1;
+            if (last_clip_frame >= 0) {
+                display_override = last_clip_frame;
+            }
+        }
+        seek_to_frame(timeline_to_source_frame(timeline_frame), reset_play_clock, false, display_override);
     }
     
     // Find which clip index contains a given source frame, returns -1 if not in any clip
@@ -2129,11 +2139,15 @@ int main() {
                 }
                 
                 ImGui::SameLine();
+                int64_t total_timeline_frames = player.total_timeline_frames();
+                int64_t display_timeline_frame = std::clamp<int64_t>(
+                    player.current_timeline_frame, 0, std::max<int64_t>(0, total_timeline_frames - 1));
+                int64_t display_source_frame = player.timeline_to_source_frame(display_timeline_frame);
                 ImGui::Text("Frame %lld / %lld (clips: %zu, total: %lld fr)", 
-                    (long long)player.current_frame,
+                    (long long)display_source_frame,
                     (long long)player.total_frames,
                     player.clips.size(),
-                    (long long)player.total_timeline_frames());
+                    (long long)total_timeline_frames);
                 
                 // Spacebar to play/pause
                 if (ImGui::IsKeyPressed(ImGuiKey_Space)) {
