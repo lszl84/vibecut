@@ -13,6 +13,7 @@
 #include <atomic>
 #include <map>
 #include <cstring>
+#include <optional>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -23,6 +24,7 @@ extern "C" {
 }
 
 #include "embedded_font.h"
+#include "json.hpp"
 
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
@@ -32,11 +34,25 @@ namespace fs = std::filesystem;
 // Represents a segment of video on the timeline (frame-based)
 // Uses half-open intervals: [start_frame, end_frame)
 struct Clip {
+    int source_id = 0;
     int64_t start_frame;  // First frame included (0-indexed)
     int64_t end_frame;    // First frame NOT included
     int color_id = 0;
     
     int64_t frame_count() const { return end_frame - start_frame; }
+};
+
+struct SourceInfo {
+    std::string path;
+    int64_t total_frames = 0;
+    double fps = 30.0;
+    AVRational fps_q{30, 1};
+    double duration = 0.0;
+    int width = 0;
+    int height = 0;
+    int audio_rate = 48000;
+    int audio_channels = 2;
+    std::vector<float> audio_pcm;
 };
 
 struct VideoPlayer {
@@ -80,6 +96,9 @@ struct VideoPlayer {
     int active_clip = 0;      // Currently selected/playing clip
     
     std::string source_path;
+    std::vector<SourceInfo> sources;
+    int active_source = -1;
+    bool previewing_library = false;
 
     struct AudioEngine {
         ma_context ctx{};
@@ -96,6 +115,24 @@ struct VideoPlayer {
     // Convert between frames and time
     double frame_to_time(int64_t frame) const { return frame / fps; }
     int64_t time_to_frame(double time) const { return (int64_t)(time * fps + 0.5); }
+
+    double timeline_frame_to_time(int64_t timeline_frame) const {
+        double t = 0.0;
+        int64_t remaining = timeline_frame;
+        for (const auto& clip : clips) {
+            int64_t count = clip.frame_count();
+            int64_t take = std::min<int64_t>(remaining, count);
+            if (clip.source_id >= 0 && clip.source_id < (int)sources.size()) {
+                double clip_fps = sources[clip.source_id].fps;
+                if (clip_fps > 0.0) {
+                    t += take / clip_fps;
+                }
+            }
+            remaining -= take;
+            if (remaining <= 0) break;
+        }
+        return t;
+    }
     
     int64_t ts_to_frame(int64_t ts) const {
         if (ts == AV_NOPTS_VALUE || fps_q.num == 0 || fps_q.den == 0) {
@@ -122,32 +159,35 @@ struct VideoPlayer {
         return total;
     }
     
-    int64_t timeline_to_source_frame(int64_t timeline_frame) const {
+    int64_t timeline_to_source_frame(int64_t timeline_frame, int* out_source_id = nullptr) const {
         if (clips.empty()) return 0;
         int64_t total = total_timeline_frames();
         if (timeline_frame < 0) timeline_frame = 0;
         if (timeline_frame >= total) {
+            if (out_source_id) *out_source_id = clips.back().source_id;
             return clips.back().end_frame;  // end position
         }
         for (const auto& c : clips) {
             int64_t count = c.frame_count();
             if (timeline_frame < count) {
+                if (out_source_id) *out_source_id = c.source_id;
                 return c.start_frame + timeline_frame;
             }
             timeline_frame -= count;
         }
+        if (out_source_id) *out_source_id = clips.back().source_id;
         return clips.back().end_frame;
     }
     
-    int64_t source_to_timeline_frame(int64_t source_frame) const {
+    int64_t source_to_timeline_frame(int source_id, int64_t source_frame) const {
         int64_t tframe = 0;
         for (const auto& c : clips) {
-            if (source_frame >= c.start_frame && source_frame < c.end_frame) {
+            if (c.source_id == source_id && source_frame >= c.start_frame && source_frame < c.end_frame) {
                 return tframe + (source_frame - c.start_frame);
             }
             tframe += c.frame_count();
         }
-        if (!clips.empty() && source_frame == clips.back().end_frame) {
+        if (!clips.empty() && clips.back().source_id == source_id && source_frame == clips.back().end_frame) {
             return tframe;  // end position
         }
         return 0;
@@ -218,16 +258,17 @@ struct VideoPlayer {
 
     void set_audio_playhead_from_timeline(int64_t timeline_frame) {
         if (!audio_loaded || audio.timeline_pcm.empty()) return;
-        double timeline_time = frame_to_time(timeline_frame);
+        double timeline_time = timeline_frame_to_time(timeline_frame);
         int64_t sample_frame = static_cast<int64_t>(timeline_time * audio.sample_rate);
         int64_t max_frame = static_cast<int64_t>(audio.timeline_pcm.size() / audio.channels);
         sample_frame = std::clamp(sample_frame, (int64_t)0, max_frame);
         audio.playhead_frames.store(sample_frame);
     }
 
-    bool decode_audio_source(const std::string& path) {
+    bool decode_audio_for_source(SourceInfo& source) {
+        if (!source.audio_pcm.empty()) return true;
         AVFormatContext* a_fmt = nullptr;
-        if (avformat_open_input(&a_fmt, path.c_str(), nullptr, nullptr) < 0) {
+        if (avformat_open_input(&a_fmt, source.path.c_str(), nullptr, nullptr) < 0) {
             return false;
         }
         if (avformat_find_stream_info(a_fmt, nullptr) < 0) {
@@ -258,7 +299,7 @@ struct VideoPlayer {
             avformat_close_input(&a_fmt);
             return false;
         }
-        int out_rate = dec_ctx->sample_rate > 0 ? dec_ctx->sample_rate : 48000;
+        int out_rate = 48000;
         AVChannelLayout in_layout = dec_ctx->ch_layout;
         if (in_layout.nb_channels == 0) {
             int fallback_channels = stream->codecpar->ch_layout.nb_channels;
@@ -316,40 +357,137 @@ struct VideoPlayer {
         avcodec_free_context(&dec_ctx);
         avformat_close_input(&a_fmt);
 
-        audio.source_pcm = std::move(decoded);
-        audio.sample_rate = out_rate;
-        audio.channels = out_layout.nb_channels;
-        audio_loaded = !audio.source_pcm.empty();
-        return audio_loaded;
+        source.audio_pcm = std::move(decoded);
+        source.audio_rate = out_rate;
+        source.audio_channels = out_layout.nb_channels;
+        return !source.audio_pcm.empty();
     }
 
     void rebuild_timeline_audio() {
-        if (!audio_loaded) return;
         audio.playing.store(false);
         audio.timeline_pcm.clear();
-        if (clips.empty() || audio.source_pcm.empty()) return;
-        const int channels = audio.channels;
-        const int64_t source_frames = static_cast<int64_t>(audio.source_pcm.size() / channels);
+        if (clips.empty()) {
+            audio_loaded = false;
+            return;
+        }
+        audio.sample_rate = 48000;
+        audio.channels = 2;
         for (const auto& clip : clips) {
-            double start_time = frame_to_time(clip.start_frame);
-            double end_time = frame_to_time(clip.end_frame);
+            if (clip.source_id < 0 || clip.source_id >= (int)sources.size()) continue;
+            SourceInfo& src = sources[clip.source_id];
+            if (src.audio_pcm.empty()) {
+                decode_audio_for_source(src);
+            }
+            if (src.audio_pcm.empty()) continue;
+            const int64_t source_frames = static_cast<int64_t>(src.audio_pcm.size() / src.audio_channels);
+            double start_time = clip.start_frame / src.fps;
+            double end_time = clip.end_frame / src.fps;
             int64_t start_sample = static_cast<int64_t>(start_time * audio.sample_rate);
             int64_t end_sample = static_cast<int64_t>(end_time * audio.sample_rate);
             start_sample = std::clamp<int64_t>(start_sample, 0, source_frames);
             end_sample = std::clamp<int64_t>(end_sample, 0, source_frames);
             if (end_sample <= start_sample) continue;
-            size_t begin = static_cast<size_t>(start_sample) * channels;
-            size_t end = static_cast<size_t>(end_sample) * channels;
+            size_t begin = static_cast<size_t>(start_sample) * audio.channels;
+            size_t end = static_cast<size_t>(end_sample) * audio.channels;
             audio.timeline_pcm.insert(audio.timeline_pcm.end(),
-                                      audio.source_pcm.begin() + begin,
-                                      audio.source_pcm.begin() + end);
+                                      src.audio_pcm.begin() + begin,
+                                      src.audio_pcm.begin() + end);
         }
+        audio_loaded = !audio.timeline_pcm.empty();
         set_audio_playhead_from_timeline(current_timeline_frame);
     }
     
-    bool open(const std::string& path) {
-        close();
+    std::optional<SourceInfo> probe_source(const std::string& path) {
+        AVFormatContext* ctx = nullptr;
+        AVDictionary* opts = nullptr;
+        av_dict_set(&opts, "ignore_editlist", "1", 0);
+        if (avformat_open_input(&ctx, path.c_str(), nullptr, &opts) < 0) {
+            av_dict_free(&opts);
+            return std::nullopt;
+        }
+        av_dict_free(&opts);
+        if (avformat_find_stream_info(ctx, nullptr) < 0) {
+            avformat_close_input(&ctx);
+            return std::nullopt;
+        }
+        int video_idx = -1;
+        for (unsigned i = 0; i < ctx->nb_streams; i++) {
+            if (ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                video_idx = i;
+                break;
+            }
+        }
+        if (video_idx < 0) {
+            avformat_close_input(&ctx);
+            return std::nullopt;
+        }
+        AVStream* stream = ctx->streams[video_idx];
+        AVCodecParameters* codecpar = stream->codecpar;
+        SourceInfo info;
+        info.path = path;
+        info.width = codecpar->width;
+        info.height = codecpar->height;
+        if (stream->avg_frame_rate.num && stream->avg_frame_rate.den) {
+            info.fps_q = stream->avg_frame_rate;
+        } else if (stream->r_frame_rate.num && stream->r_frame_rate.den) {
+            info.fps_q = stream->r_frame_rate;
+        } else {
+            info.fps_q = {30, 1};
+        }
+        info.fps = av_q2d(info.fps_q);
+        double time_base_local = av_q2d(stream->time_base);
+        info.duration = (stream->duration != AV_NOPTS_VALUE)
+            ? (stream->duration * time_base_local)
+            : (ctx->duration / (double)AV_TIME_BASE);
+        if (stream->nb_frames > 0) {
+            info.total_frames = stream->nb_frames;
+        } else if (stream->duration != AV_NOPTS_VALUE) {
+            info.total_frames = (int64_t)(info.duration * info.fps + 0.5);
+        }
+        avformat_close_input(&ctx);
+        return info;
+    }
+
+    int add_source(const std::string& path) {
+        for (int i = 0; i < (int)sources.size(); i++) {
+            if (sources[i].path == path) return i;
+        }
+        auto info = probe_source(path);
+        if (!info.has_value()) return -1;
+        sources.push_back(*info);
+        return static_cast<int>(sources.size() - 1);
+    }
+
+    void close_decoder() {
+        playing = false;
+        loaded = false;
+        
+        if (buffer) { av_free(buffer); buffer = nullptr; }
+        if (sws_ctx) { sws_freeContext(sws_ctx); sws_ctx = nullptr; }
+        if (packet) { av_packet_free(&packet); packet = nullptr; }
+        if (frame_rgb) { av_frame_free(&frame_rgb); frame_rgb = nullptr; }
+        if (frame) { av_frame_free(&frame); frame = nullptr; }
+        if (codec_ctx) { avcodec_free_context(&codec_ctx); codec_ctx = nullptr; }
+        if (format_ctx) { avformat_close_input(&format_ctx); format_ctx = nullptr; }
+        
+        video_stream = -1;
+        width = height = 0;
+        duration = 0.0;
+        current_time = 0.0;
+        current_frame = 0;
+        total_frames = 0;
+        stream_start_pts = 0;
+        first_keyframe_time = 0.0;
+        source_path.clear();
+    }
+
+    bool open_source(int source_id, bool reset_timeline, bool keep_playing = false) {
+        if (source_id < 0 || source_id >= (int)sources.size()) return false;
+        bool was_playing = playing;
+        close_decoder();
+        const std::string& path = sources[source_id].path;
         source_path = path;
+        active_source = source_id;
         
         // Ignore edit list to avoid seeking issues with videos that have non-keyframe start points
         AVDictionary* opts = nullptr;
@@ -372,7 +510,7 @@ struct VideoPlayer {
         
         if (avformat_find_stream_info(format_ctx, nullptr) < 0) {
             std::fprintf(stderr, "Could not find stream info\n");
-            close();
+            close_decoder();
             return false;
         }
         
@@ -385,7 +523,7 @@ struct VideoPlayer {
         
         if (video_stream < 0) {
             std::fprintf(stderr, "No video stream found\n");
-            close();
+            close_decoder();
             return false;
         }
         
@@ -394,7 +532,7 @@ struct VideoPlayer {
         const AVCodec* codec = avcodec_find_decoder(codecpar->codec_id);
         if (!codec) {
             std::fprintf(stderr, "Codec not found\n");
-            close();
+            close_decoder();
             return false;
         }
         
@@ -403,7 +541,7 @@ struct VideoPlayer {
         
         if (avcodec_open2(codec_ctx, codec, nullptr) < 0) {
             std::fprintf(stderr, "Could not open codec\n");
-            close();
+            close_decoder();
             return false;
         }
         
@@ -427,6 +565,7 @@ struct VideoPlayer {
             fps = av_q2d(fps_q);
         } else {
             fps_q = { (int)(fps * 1000.0 + 0.5), 1000 };
+            fps = av_q2d(fps_q);
         }
         
         frame = av_frame_alloc();
@@ -442,16 +581,22 @@ struct VideoPlayer {
             SWS_BILINEAR, nullptr, nullptr, nullptr
         );
         
-        glGenTextures(1, &texture_id);
+        if (!texture_id) {
+            glGenTextures(1, &texture_id);
+        }
         glBindTexture(GL_TEXTURE_2D, texture_id);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
         
         loaded = true;
-        current_time = 0.0;
-        current_frame = 0;
-        playing = false;
+        if (!keep_playing) {
+            current_time = 0.0;
+            current_frame = 0;
+            playing = false;
+        } else {
+            playing = was_playing;
+        }
         
         // Detect first keyframe position by doing an initial decode
         decode_frame();
@@ -467,53 +612,52 @@ struct VideoPlayer {
         }
         if (total_frames < 1) total_frames = 1;
         
+        sources[source_id].fps = fps;
+        sources[source_id].fps_q = fps_q;
+        sources[source_id].duration = duration;
+        sources[source_id].total_frames = total_frames;
+        sources[source_id].width = width;
+        sources[source_id].height = height;
+        
         std::printf("Video: %d x %d, %.5f fps, %lld frames, %.3f sec (tb=%d/%d, fps_q=%d/%d)\n",
                     width, height, fps, (long long)total_frames, duration,
                     stream_time_base.num, stream_time_base.den, fps_q.num, fps_q.den);
         
-        // Initialize with single clip covering entire video [0, total_frames)
-        clips.clear();
-        next_clip_color_id = 0;
-        clips.push_back({0, total_frames, next_clip_color_id++});
-        active_clip = 0;
-        current_frame = 0;
-        current_timeline_frame = 0;
-        audio_dirty = true;
-        if (decode_audio_source(path)) {
-            init_audio_device();
-            rebuild_timeline_audio();
+        if (reset_timeline) {
+            // Initialize with single clip covering entire video [0, total_frames)
+            clips.clear();
+            next_clip_color_id = 0;
+            clips.push_back({source_id, 0, total_frames, next_clip_color_id++});
+            active_clip = 0;
+            current_frame = 0;
+            current_timeline_frame = 0;
+            audio_dirty = true;
+            if (decode_audio_for_source(sources[source_id])) {
+                init_audio_device();
+                rebuild_timeline_audio();
+            }
+            audio_dirty = false;
         }
-        audio_dirty = false;
         
         return true;
     }
+
+    bool open(const std::string& path) {
+        close();
+        int source_id = add_source(path);
+        if (source_id < 0) return false;
+        return open_source(source_id, true);
+    }
     
     void close() {
-        playing = false;
-        loaded = false;
-        
+        close_decoder();
         if (texture_id) { glDeleteTextures(1, &texture_id); texture_id = 0; }
-        if (buffer) { av_free(buffer); buffer = nullptr; }
-        if (sws_ctx) { sws_freeContext(sws_ctx); sws_ctx = nullptr; }
-        if (packet) { av_packet_free(&packet); packet = nullptr; }
-        if (frame_rgb) { av_frame_free(&frame_rgb); frame_rgb = nullptr; }
-        if (frame) { av_frame_free(&frame); frame = nullptr; }
-        if (codec_ctx) { avcodec_free_context(&codec_ctx); codec_ctx = nullptr; }
-        if (format_ctx) { avformat_close_input(&format_ctx); format_ctx = nullptr; }
-        
-        video_stream = -1;
-        width = height = 0;
-        duration = 0.0;
-        current_time = 0.0;
-        current_frame = 0;
-        total_frames = 0;
-        stream_start_pts = 0;
-        first_keyframe_time = 0.0;
         clips.clear();
+        sources.clear();
+        active_source = -1;
         active_clip = 0;
         current_timeline_frame = 0;
         next_clip_color_id = 0;
-        source_path.clear();
         shutdown_audio();
         audio_dirty = false;
     }
@@ -554,8 +698,7 @@ struct VideoPlayer {
     // Check if current_frame is at the end of the timeline (past all clips)
     bool at_timeline_end() const {
         if (clips.empty()) return false;
-        if (clip_at_frame(current_frame) >= 0) return false;
-        return current_frame == clips.back().end_frame;
+        return current_timeline_frame >= total_timeline_frames();
     }
     
     // Seek to a specific frame number
@@ -597,7 +740,7 @@ struct VideoPlayer {
         current_frame = target_frame;
         current_time = frame_to_time(target_frame);
         if (update_timeline_frame) {
-            current_timeline_frame = source_to_timeline_frame(current_frame);
+            current_timeline_frame = source_to_timeline_frame(active_source, current_frame);
         }
         
         if (playing && reset_play_clock) {
@@ -628,13 +771,19 @@ struct VideoPlayer {
                 display_override = last_clip_frame;
             }
         }
-        seek_to_frame(timeline_to_source_frame(timeline_frame), reset_play_clock, false, display_override, update_audio_playhead);
+        int source_id = active_source;
+        int64_t source_frame = timeline_to_source_frame(timeline_frame, &source_id);
+        if (source_id != active_source && source_id >= 0) {
+            open_source(source_id, false, playing);
+            previewing_library = false;
+        }
+        seek_to_frame(source_frame, reset_play_clock, false, display_override, update_audio_playhead);
     }
     
     // Find which clip index contains a given source frame, returns -1 if not in any clip
-    int clip_at_frame(int64_t frame) const {
+    int clip_at_frame(int source_id, int64_t frame) const {
         for (int i = 0; i < (int)clips.size(); i++) {
-            if (frame >= clips[i].start_frame && frame < clips[i].end_frame) {
+            if (clips[i].source_id == source_id && frame >= clips[i].start_frame && frame < clips[i].end_frame) {
                 return i;
             }
         }
@@ -642,22 +791,70 @@ struct VideoPlayer {
     }
     
     // Split the clip at the given source frame
-    void split_at_frame(int64_t frame) {
-        int idx = clip_at_frame(frame);
+    void split_at_frame(int source_id, int64_t frame) {
+        int idx = clip_at_frame(source_id, frame);
         if (idx < 0) return;
         
         Clip& clip = clips[idx];
         // Don't split if too close to edges (need at least 1 frame per clip)
         if (frame - clip.start_frame < 1 || clip.end_frame - frame < 1) return;
         
-        Clip new_clip = {frame, clip.end_frame, next_clip_color_id++};
+        Clip new_clip = {clip.source_id, frame, clip.end_frame, next_clip_color_id++};
         clip.end_frame = frame;
         clips.insert(clips.begin() + idx + 1, new_clip);
     }
     
     // Legacy split by time (converts to frame)
     void split_at(double source_time) {
-        split_at_frame(time_to_frame(source_time));
+        split_at_frame(active_source, time_to_frame(source_time));
+    }
+
+    bool insert_clip_at_timeline(int source_id, int64_t timeline_frame) {
+        if (source_id < 0 || source_id >= (int)sources.size()) return false;
+        if (sources[source_id].total_frames <= 0) return false;
+        int64_t total = total_timeline_frames();
+        timeline_frame = std::clamp<int64_t>(timeline_frame, 0, total);
+        int insert_index = (int)clips.size();
+        int64_t offset = timeline_frame;
+        for (int i = 0; i < (int)clips.size(); i++) {
+            int64_t count = clips[i].frame_count();
+            if (offset <= count) {
+                insert_index = i;
+                break;
+            }
+            offset -= count;
+        }
+        Clip new_clip{source_id, 0, sources[source_id].total_frames, next_clip_color_id++};
+        if (clips.empty()) {
+            clips.push_back(new_clip);
+            return true;
+        }
+        if (insert_index >= (int)clips.size()) {
+            clips.push_back(new_clip);
+            return true;
+        }
+        Clip& target = clips[insert_index];
+        if (offset == 0) {
+            clips.insert(clips.begin() + insert_index, new_clip);
+            return true;
+        }
+        if (offset >= target.frame_count()) {
+            clips.insert(clips.begin() + insert_index + 1, new_clip);
+            return true;
+        }
+        int64_t split_frame = target.start_frame + offset;
+        Clip right_clip{target.source_id, split_frame, target.end_frame, target.color_id};
+        target.end_frame = split_frame;
+        clips.insert(clips.begin() + insert_index + 1, new_clip);
+        clips.insert(clips.begin() + insert_index + 2, right_clip);
+        return true;
+    }
+
+    void preview_source(int source_id) {
+        if (source_id < 0 || source_id >= (int)sources.size()) return;
+        previewing_library = true;
+        open_source(source_id, false, false);
+        seek_to_frame(0, true, false);
     }
     
     void play() {
@@ -1687,6 +1884,73 @@ struct FileBrowser {
     }
 };
 
+using json = nlohmann::json;
+
+bool save_project_file(const std::string& path, const VideoPlayer& player) {
+    json j;
+    j["version"] = 1;
+    j["current_timeline_frame"] = player.current_timeline_frame;
+    j["active_source"] = player.active_source;
+    j["sources"] = json::array();
+    for (const auto& src : player.sources) {
+        j["sources"].push_back({{"path", src.path}});
+    }
+    j["clips"] = json::array();
+    for (const auto& clip : player.clips) {
+        j["clips"].push_back({
+            {"source", clip.source_id},
+            {"start", clip.start_frame},
+            {"end", clip.end_frame},
+            {"color", clip.color_id}
+        });
+    }
+    std::ofstream out(path);
+    if (!out) return false;
+    out << j.dump(2);
+    return true;
+}
+
+bool load_project_file(const std::string& path, VideoPlayer& player) {
+    std::ifstream in(path);
+    if (!in) return false;
+    json j;
+    in >> j;
+    if (!j.is_object()) return false;
+    player.close();
+    if (!j.contains("sources") || !j["sources"].is_array()) return false;
+    for (const auto& src : j["sources"]) {
+        if (!src.contains("path")) continue;
+        player.add_source(src["path"].get<std::string>());
+    }
+    if (player.sources.empty()) return false;
+    int active = j.value("active_source", 0);
+    active = std::clamp(active, 0, (int)player.sources.size() - 1);
+    player.open_source(active, false);
+    player.clips.clear();
+    int max_color = 0;
+    if (j.contains("clips") && j["clips"].is_array()) {
+        for (const auto& c : j["clips"]) {
+            int source_id = c.value("source", 0);
+            int64_t start = c.value("start", 0);
+            int64_t end = c.value("end", 0);
+            int color = c.value("color", 0);
+            if (source_id < 0 || source_id >= (int)player.sources.size()) continue;
+            if (end <= start) continue;
+            player.clips.push_back({source_id, start, end, color});
+            max_color = std::max(max_color, color);
+        }
+    }
+    player.next_clip_color_id = max_color + 1;
+    player.current_timeline_frame = j.value("current_timeline_frame", 0);
+    player.current_timeline_frame = std::clamp<int64_t>(
+        player.current_timeline_frame, 0, player.total_timeline_frames());
+    player.audio_dirty = true;
+    player.rebuild_timeline_audio();
+    player.audio_dirty = false;
+    player.seek_to_timeline_frame(player.current_timeline_frame);
+    return true;
+}
+
 WindowData create_window(const char* title, int width, int height, GLFWwindow* share_context = nullptr) {
     WindowData data;
     
@@ -1812,6 +2076,8 @@ struct ClipsTimelineState {
     float drag_grab_offset_time = 0.0f;    // Active drag offset (timeline time)
     float drag_start_mouse_time = 0.0f;    // Timeline time when drag started
     bool clips_modified = false;
+    int pending_library_source = -1;
+    int64_t pending_library_timeline = -1;
     float zoom = 1.0f;      // Zoom level (1.0 = fit all, higher = zoom in)
     float scroll = 0.0f;    // Scroll position (0.0 to 1.0, normalized)
     float pan_start_x = 0.0f; // For panning
@@ -1821,7 +2087,7 @@ struct ClipsTimelineState {
 // Modern Final Cut-style magnetic timeline widget with zoom/scroll
 // Clips are frame-based for precision
 // Returns true if anything changed
-bool ClipsTimeline(const char* label, int64_t* current_source_frame, int64_t* current_timeline_frame, std::vector<Clip>& clips, int64_t total_source_frames, double fps, const ImVec2& size, ClipsTimelineState& state) {
+bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* current_source_id, int64_t* current_timeline_frame, std::vector<Clip>& clips, int64_t total_source_frames, double fps, const ImVec2& size, ClipsTimelineState& state) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     
@@ -2020,6 +2286,21 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int64_t* cu
     bool is_active = ImGui::IsItemActive();
     
     bool changed = false;
+
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("LIB_CLIP")) {
+            if (payload->DataSize == sizeof(int)) {
+                int source_id = *static_cast<const int*>(payload->Data);
+                float drop_time = x_to_time(mouse.x);
+                drop_time = std::clamp(drop_time, 0.0f, total_duration);
+                int64_t drop_frame = time_to_frame_local(drop_time);
+                drop_frame = std::clamp<int64_t>(drop_frame, 0, total_timeline_frames);
+                state.pending_library_source = source_id;
+                state.pending_library_timeline = drop_frame;
+            }
+        }
+        ImGui::EndDragDropTarget();
+    }
     
     // Mouse wheel: Shift+wheel for scroll, plain wheel for zoom
     // Also support horizontal scroll (touchpad, horizontal mouse wheel)
@@ -2126,20 +2407,23 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int64_t* cu
         }
     }
     
-    // Helper: map timeline frame to source frame
-    auto timeline_frame_to_source_frame = [&](int64_t timeline_frame) -> int64_t {
+    // Helper: map timeline frame to source frame + source id
+    auto timeline_frame_to_source_frame = [&](int64_t timeline_frame, int* out_source_id) -> int64_t {
         if (clips.empty()) return 0;
         if (timeline_frame < 0) timeline_frame = 0;
         if (timeline_frame >= total_timeline_frames) {
+            if (out_source_id) *out_source_id = clips.back().source_id;
             return clips.back().end_frame;  // end position
         }
         for (const auto& c : clips) {
             int64_t count = c.frame_count();
             if (timeline_frame < count) {
+                if (out_source_id) *out_source_id = c.source_id;
                 return c.start_frame + timeline_frame;
             }
             timeline_frame -= count;
         }
+        if (out_source_id) *out_source_id = clips.back().source_id;
         return clips.back().end_frame;
     };
     
@@ -2216,7 +2500,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int64_t* cu
                 int64_t timeline_frame = time_to_frame_local(timeline_time);
                 timeline_frame = std::clamp<int64_t>(timeline_frame, 0, total_timeline_frames);
                 *current_timeline_frame = timeline_frame;
-                *current_source_frame = timeline_frame_to_source_frame(timeline_frame);
+                *current_source_frame = timeline_frame_to_source_frame(timeline_frame, current_source_id);
                 changed = true;
                 break;
             }
@@ -2229,7 +2513,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int64_t* cu
             int64_t timeline_frame = time_to_frame_local(timeline_time);
             timeline_frame = std::clamp<int64_t>(timeline_frame, 0, total_timeline_frames);
             *current_timeline_frame = timeline_frame;
-            *current_source_frame = timeline_frame_to_source_frame(timeline_frame);
+            *current_source_frame = timeline_frame_to_source_frame(timeline_frame, current_source_id);
             changed = true;
         }
     }
@@ -2318,7 +2602,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int64_t* cu
                 int64_t max_timeline = 0;
                 for (const auto& c : clips) max_timeline += c.frame_count();
                 *current_timeline_frame = std::clamp(*current_timeline_frame, (int64_t)0, max_timeline);
-                *current_source_frame = timeline_frame_to_source_frame(*current_timeline_frame);
+                *current_source_frame = timeline_frame_to_source_frame(*current_timeline_frame, current_source_id);
                 changed = true;
                 state.clips_modified = true;
             } else if (state.dragging == 2) {
@@ -2346,7 +2630,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int64_t* cu
                 int64_t max_timeline = 0;
                 for (const auto& c : clips) max_timeline += c.frame_count();
                 *current_timeline_frame = std::clamp(*current_timeline_frame, (int64_t)0, max_timeline);
-                *current_source_frame = timeline_frame_to_source_frame(*current_timeline_frame);
+                *current_source_frame = timeline_frame_to_source_frame(*current_timeline_frame, current_source_id);
                 changed = true;
                 state.clips_modified = true;
             }
@@ -2357,7 +2641,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int64_t* cu
                 int64_t max_timeline = 0;
                 for (const auto& c : clips) max_timeline += c.frame_count();
                 *current_timeline_frame = std::clamp(*current_timeline_frame, (int64_t)0, max_timeline);
-                *current_source_frame = timeline_frame_to_source_frame(*current_timeline_frame);
+                *current_source_frame = timeline_frame_to_source_frame(*current_timeline_frame, current_source_id);
             }
         }
     }
@@ -2559,8 +2843,14 @@ int main() {
     WindowData browser_window{};
     FileBrowser browser;
     std::string selected_file;
+    std::string project_path;
     VideoPlayer player;
     std::string pending_load;
+    std::string pending_project_load;
+    std::string pending_project_save;
+    int library_selected = -1;
+    enum class BrowserMode { None, OpenMedia, AddLibrary, OpenProject, SaveProject };
+    BrowserMode browser_mode = BrowserMode::None;
     ClipsTimelineState timeline_state;
     
     std::atomic<bool> exporting{false};
@@ -2581,6 +2871,23 @@ int main() {
                     player.width, player.height, player.fps, (long long)player.total_frames, player.duration);
             }
             pending_load.clear();
+        }
+        if (!pending_project_load.empty()) {
+            glfwMakeContextCurrent(main_window.window);
+            if (load_project_file(pending_project_load, player)) {
+                project_path = pending_project_load;
+                if (!player.sources.empty()) {
+                    selected_file = player.sources.front().path;
+                }
+            }
+            pending_project_load.clear();
+        }
+        if (!pending_project_save.empty()) {
+            glfwMakeContextCurrent(main_window.window);
+            if (save_project_file(pending_project_save, player)) {
+                project_path = pending_project_save;
+            }
+            pending_project_save.clear();
         }
 
         glfwMakeContextCurrent(main_window.window);
@@ -2603,14 +2910,43 @@ int main() {
                 
                 float ui_scale = main_window.scale;
                 float controls_height = 130 * ui_scale;
+                float library_w = 240 * ui_scale;
                 float scale_x = viewport->Size.x / player.width;
                 float scale_y = (viewport->Size.y - controls_height) / player.height;
                 float img_scale = std::min(scale_x, scale_y);
                 
                 float img_w = player.width * img_scale;
                 float img_h = player.height * img_scale;
-                float img_x = (viewport->Size.x - img_w) / 2;
+                float img_x = (viewport->Size.x - library_w - img_w) / 2 + library_w;
                 float img_y = (viewport->Size.y - controls_height - img_h) / 2;
+
+                ImGui::SetCursorPos(ImVec2(10, 10));
+                ImGui::BeginChild("##Library", ImVec2(library_w - 20, viewport->Size.y - controls_height - 20), true);
+                ImGui::Text("Library");
+                if (ImGui::Button("Add...", ImVec2(0, 0))) {
+                    browser_mode = BrowserMode::AddLibrary;
+                    open_browser = true;
+                }
+                ImGui::Separator();
+                for (int i = 0; i < (int)player.sources.size(); i++) {
+                    const auto& src = player.sources[i];
+                    bool selected = (library_selected == i);
+                    if (ImGui::Selectable(path_display_name(fs::path(src.path)).c_str(), selected)) {
+                        library_selected = i;
+                    }
+                    if (ImGui::BeginDragDropSource()) {
+                        ImGui::SetDragDropPayload("LIB_CLIP", &i, sizeof(int));
+                        ImGui::Text("%s", path_display_name(fs::path(src.path)).c_str());
+                        ImGui::EndDragDropSource();
+                    }
+                }
+                if (library_selected >= 0 && library_selected < (int)player.sources.size()) {
+                    ImGui::Separator();
+                    if (ImGui::Button("Preview", ImVec2(0, 0))) {
+                        player.preview_source(library_selected);
+                    }
+                }
+                ImGui::EndChild();
                 
                 ImGui::SetCursorPos(ImVec2(img_x, img_y));
                 ImGui::Image((ImTextureID)(intptr_t)player.texture_id, ImVec2(img_w, img_h));
@@ -2645,10 +2981,12 @@ int main() {
                 int64_t total_timeline_frames = player.total_timeline_frames();
                 int64_t display_timeline_frame = std::clamp<int64_t>(
                     player.current_timeline_frame, 0, std::max<int64_t>(0, total_timeline_frames - 1));
-                int64_t display_source_frame = player.timeline_to_source_frame(display_timeline_frame);
-                ImGui::Text("Frame %lld / %lld (clips: %zu, total: %lld fr)", 
+                int display_source_id = player.active_source;
+                int64_t display_source_frame = player.timeline_to_source_frame(display_timeline_frame, &display_source_id);
+                ImGui::Text("Frame %lld / %lld (src: %d, clips: %zu, total: %lld fr)", 
                     (long long)display_source_frame,
                     (long long)player.total_frames,
+                    display_source_id,
                     player.clips.size(),
                     (long long)total_timeline_frames);
                 
@@ -2665,6 +3003,13 @@ int main() {
                 if (ImGui::IsKeyPressed(ImGuiKey_B) && !player.clips.empty()) {
                     player.split_at(player.current_time);
                     player.audio_dirty = true;
+                }
+                
+                // 'W' key to insert selected library clip at playhead
+                if (ImGui::IsKeyPressed(ImGuiKey_W) && library_selected >= 0) {
+                    if (player.insert_clip_at_timeline(library_selected, player.current_timeline_frame)) {
+                        player.audio_dirty = true;
+                    }
                 }
                 
                 // Frame-based arrow key navigation (simple and precise)
@@ -2729,11 +3074,16 @@ int main() {
                 // Timeline with clips
                 ImGui::SetCursorPos(ImVec2(10, viewport->Size.y - controls_height + 35 * ui_scale));
                 int64_t curr_frame = player.current_frame;
+                int curr_source_id = player.active_source;
                 int64_t curr_timeline_frame = player.current_timeline_frame;
+                int64_t max_source_frames = 0;
+                for (const auto& src : player.sources) {
+                    max_source_frames = std::max(max_source_frames, src.total_frames);
+                }
                 
                 static int64_t last_seek_frame = -1;
                 
-                if (ClipsTimeline("##clips_timeline", &curr_frame, &curr_timeline_frame, player.clips, player.total_frames, player.fps,
+                if (ClipsTimeline("##clips_timeline", &curr_frame, &curr_source_id, &curr_timeline_frame, player.clips, max_source_frames, player.fps,
                                  ImVec2(viewport->Size.x - 20, 50 * ui_scale), timeline_state)) {
                     if (curr_timeline_frame != last_seek_frame) {
                         last_seek_frame = curr_timeline_frame;
@@ -2741,6 +3091,14 @@ int main() {
                         player.pause();
                         player.seek_to_timeline_frame(curr_timeline_frame);
                     }
+                }
+                if (timeline_state.pending_library_source >= 0) {
+                    if (player.insert_clip_at_timeline(timeline_state.pending_library_source,
+                                                      timeline_state.pending_library_timeline)) {
+                        player.audio_dirty = true;
+                    }
+                    timeline_state.pending_library_source = -1;
+                    timeline_state.pending_library_timeline = -1;
                 }
                 if (timeline_state.clips_modified) {
                     player.audio_dirty = true;
@@ -2802,7 +3160,24 @@ int main() {
                 
                 ImGui::SameLine();
                 if (ImGui::Button("Open File...", ImVec2(0, 0))) {
-                    if (!browser_window.window) open_browser = true;
+                    if (!browser_window.window) {
+                        browser_mode = BrowserMode::OpenMedia;
+                        open_browser = true;
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Open Project", ImVec2(0, 0))) {
+                    if (!browser_window.window) {
+                        browser_mode = BrowserMode::OpenProject;
+                        open_browser = true;
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Save Project", ImVec2(0, 0))) {
+                    if (!browser_window.window) {
+                        browser_mode = BrowserMode::SaveProject;
+                        open_browser = true;
+                    }
                 }
                 
                 ImGui::End();
@@ -2820,7 +3195,17 @@ int main() {
 
                 float scale = main_window.scale;
                 if (ImGui::Button("Open File...", ImVec2(160 * scale, 40 * scale))) {
-                    if (!browser_window.window) open_browser = true;
+                    if (!browser_window.window) {
+                        browser_mode = BrowserMode::OpenMedia;
+                        open_browser = true;
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Open Project", ImVec2(160 * scale, 40 * scale))) {
+                    if (!browser_window.window) {
+                        browser_mode = BrowserMode::OpenProject;
+                        open_browser = true;
+                    }
                 }
 
                 ImGui::End();
@@ -2830,7 +3215,11 @@ int main() {
         if (open_browser) {
             int bw = (int)(450 * main_window.scale);
             int bh = (int)(550 * main_window.scale);
-            browser_window = create_window("Open File", bw, bh, main_window.window);
+            const char* title = "Open File";
+            if (browser_mode == BrowserMode::OpenProject) title = "Open Project";
+            if (browser_mode == BrowserMode::SaveProject) title = "Save Project";
+            if (browser_mode == BrowserMode::AddLibrary) title = "Add To Library";
+            browser_window = create_window(title, bw, bh, main_window.window);
             browser.refresh();
         }
 
@@ -2886,8 +3275,16 @@ int main() {
                                     if (entry.is_directory()) {
                                         browser.navigate_to(entry.path());
                                     } else {
-                                        selected_file = entry.path().string();
-                                        pending_load = selected_file;
+                                        if (browser_mode == BrowserMode::OpenMedia) {
+                                            selected_file = entry.path().string();
+                                            pending_load = selected_file;
+                                        } else if (browser_mode == BrowserMode::AddLibrary) {
+                                            player.add_source(entry.path().string());
+                                        } else if (browser_mode == BrowserMode::OpenProject) {
+                                            pending_project_load = entry.path().string();
+                                        } else if (browser_mode == BrowserMode::SaveProject) {
+                                            pending_project_save = entry.path().string();
+                                        }
                                         should_close = true;
                                     }
                                 } catch (...) {}
@@ -2899,19 +3296,35 @@ int main() {
 
                 ImGui::Spacing();
                 
-                bool can_open = browser.selected_index >= 0 && 
+                bool can_open = browser.selected_index >= 0 &&
                                browser.selected_index < (int)browser.entries.size();
-                try {
-                    can_open = can_open && !browser.entries[browser.selected_index].is_directory();
-                } catch (...) { can_open = false; }
                 
                 if (!can_open) ImGui::BeginDisabled();
-                if (ImGui::Button("Open", ImVec2(80 * browser_window.scale, 0))) {
+                if (ImGui::Button(browser_mode == BrowserMode::SaveProject ? "Save" : "Open",
+                                  ImVec2(80 * browser_window.scale, 0))) {
                     try {
-                        selected_file = browser.entries[browser.selected_index].path().string();
-                        pending_load = selected_file;
+                        auto& entry = browser.entries[browser.selected_index];
+                        if (entry.is_directory()) {
+                            if (browser_mode == BrowserMode::SaveProject) {
+                                pending_project_save = (entry.path() / "project.vibecut").string();
+                                should_close = true;
+                            } else {
+                                browser.navigate_to(entry.path());
+                            }
+                        } else {
+                            if (browser_mode == BrowserMode::OpenMedia) {
+                                selected_file = entry.path().string();
+                                pending_load = selected_file;
+                            } else if (browser_mode == BrowserMode::AddLibrary) {
+                                player.add_source(entry.path().string());
+                            } else if (browser_mode == BrowserMode::OpenProject) {
+                                pending_project_load = entry.path().string();
+                            } else if (browser_mode == BrowserMode::SaveProject) {
+                                pending_project_save = entry.path().string();
+                            }
+                            should_close = true;
+                        }
                     } catch (...) {}
-                    should_close = true;
                 }
                 if (!can_open) ImGui::EndDisabled();
                 

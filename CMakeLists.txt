@@ -8,7 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Dependencies
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GLFW REQUIRED glfw3)
-pkg_check_modules(LIBAV REQUIRED libavformat libavcodec libswscale libavutil)
+pkg_check_modules(LIBAV REQUIRED libavformat libavcodec libswscale libswresample libavutil)
 find_package(OpenGL REQUIRED)
 
 # ImGui
@@ -46,8 +46,30 @@ add_custom_command(
 )
 add_custom_target(embedded_font DEPENDS ${FONT_OUTPUT})
 
+# miniaudio (single header)
+include(FetchContent)
+FetchContent_Declare(
+    miniaudio
+    URL https://raw.githubusercontent.com/mackron/miniaudio/master/miniaudio.h
+    DOWNLOAD_NO_EXTRACT TRUE
+)
+FetchContent_MakeAvailable(miniaudio)
+
+FetchContent_Declare(
+    nlohmann_json
+    URL https://raw.githubusercontent.com/nlohmann/json/develop/single_include/nlohmann/json.hpp
+    DOWNLOAD_NO_EXTRACT TRUE
+)
+FetchContent_MakeAvailable(nlohmann_json)
+
 # Main executable
 add_executable(vibecut src/main.cpp ${FONT_OUTPUT})
 add_dependencies(vibecut embedded_font)
-target_include_directories(vibecut PRIVATE ${GLFW_INCLUDE_DIRS} ${LIBAV_INCLUDE_DIRS} ${CMAKE_BINARY_DIR}/generated)
+target_include_directories(vibecut PRIVATE
+    ${GLFW_INCLUDE_DIRS}
+    ${LIBAV_INCLUDE_DIRS}
+    ${miniaudio_SOURCE_DIR}
+    ${nlohmann_json_SOURCE_DIR}
+    ${CMAKE_BINARY_DIR}/generated
+)
 target_link_libraries(vibecut PRIVATE imgui ${GLFW_LIBRARIES} ${LIBAV_LIBRARIES} OpenGL::GL)

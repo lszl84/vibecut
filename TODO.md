@@ -11,3 +11,4 @@
 - Improve drag-to-end reordering UX (hard to place at end)
 - Add visual indicator while dragging a clip (done)
 - Manual test pass for clip reordering + play/seek/resize
+- Add audio decode + playback (miniaudio or alternative) (done)
