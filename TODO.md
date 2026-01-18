@@ -1,16 +1,14 @@
 # VibeCut TODO
 
-## Notes
-
-- Export issues were traced to preview/loading; export pipeline is correct.
-- Non-integer FPS (e.g. 24.2) required timestamp→frame mapping to use floor rounding.
-
-## TODO
-
-- Test export for missing/incorrect last frame (manual verification)
-- Verify export output path/location (currently unclear)
-- Improve drag-to-end reordering UX (hard to place at end)
-- Add visual indicator while dragging a clip (done)
-- Manual test pass for clip reordering + play/seek/resize
-- Add audio decode + playback (miniaudio or alternative) (done)
-- Define desired UX for library layout, project open/save, insert, preview
+## The Project Feature
+- When opening the program, we should have three buttons: New Empty Project, Open Project, New Project From Video. The first two are obvious, the third lets the user select a video and creates a new project with that video in the timeline
+- The window title bar should show the path of the current project file
+- The "Library" text on the left should be replaced with "Project"
+- "Add..." should say "Add a Clip..."
+- There should be buttons to save the current project and load a different project (alongside the add button)
+- The Preview button should start playing the selected clip from the library. If the user hits space, OR starts interacting with the timeline, the preview play should stop
+- There should be an ability to remove a clip from the library
+- There should be a confirmation dialog when the user tries to exit the program with unsaved changes to the project
+- The buttons to Export/PNG/open File from the bottom should be removed
+- The Export button should be in the Project panel
+- The Project Panel currently overlays on top of the preview UI. Instead, these two views should be just next to each other
