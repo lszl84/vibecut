@@ -53,15 +53,15 @@ git submodule update --init
 * Time Tracking
 
 #+BEGIN: clocktable :maxlevel nil :scope file :block nil
-#+CAPTION: Clock summary at [2026-01-17 Sat 15:47]
-| Headline          | Time  |       |
-|-------------------+-------+-------|
-| *Total time*        | *11:51* |       |
-|-------------------+-------+-------|
-| Tasks             | 11:51 |       |
-| \_  Initial Setup |       |  0:13 |
-| \_  Vibe coding   |       | 10:45 |
-| \_  Manual coding |       |  0:53 |
+#+CAPTION: Clock summary at [2026-01-18 Sun 13:45]
+| Headline                     | Time  |       |
+|------------------------------+-------+-------|
+| *Total time*                   | *13:17* |       |
+|------------------------------+-------+-------|
+| Tasks                        | 13:17 |       |
+| \_  Initial Setup / Planning |       |  0:27 |
+| \_  Vibe coding              |       | 11:57 |
+| \_  Manual coding            |       |  0:53 |
 #+END:
 
 * Tasks
@@ -75,7 +75,7 @@ CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
 :END:
 ** Vibe coding
 :LOGBOOK:
-CLOCK: [2026-01-18 Sun 12:33]
+CLOCK: [2026-01-18 Sun 12:33]--[2026-01-18 Sun 13:45] =>  1:12
 CLOCK: [2026-01-17 Sat 13:52]--[2026-01-17 Sat 15:47] =>  1:55
 CLOCK: [2026-01-16 Fri 09:21]--[2026-01-16 Fri 10:27] =>  1:06
 CLOCK: [2026-01-16 Fri 09:21]--[2026-01-16 Fri 09:21] =>  0:00
@@ -101,6 +101,15 @@ Adding/changing code by hand, debugging, etc.
 * Devlog
 
 Live Streams: https://www.youtube.com/@lukeatdevmindscape/streams
+
+** Day 12
+Finished the UX of the Project Manager. We now have a pretty capable
+Video Editor, where we can insert clips from external files, change
+the clip length and order in the timeline, save our changes to a
+custom project file and export the final video!
+
+There are still some minor bugs (and the missing frame bug resurfaced
+again...) but that's something to be fixed soon.
 
 ** Day 11
 Good progress, added audio, fixed clips reordering with improved UI,
