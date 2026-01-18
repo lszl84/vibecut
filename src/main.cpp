@@ -31,6 +31,26 @@ extern "C" {
 
 namespace fs = std::filesystem;
 
+static int input_text_resize_callback(ImGuiInputTextCallbackData* data) {
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackResize) {
+        auto* str = static_cast<std::string*>(data->UserData);
+        str->resize(static_cast<size_t>(data->BufTextLen));
+        data->Buf = str->data();
+    }
+    return 0;
+}
+
+static bool input_text_string(const char* label, std::string& value, ImGuiInputTextFlags flags = 0) {
+    if (!(flags & ImGuiInputTextFlags_CallbackResize)) {
+        flags |= ImGuiInputTextFlags_CallbackResize;
+    }
+    if (value.capacity() < 256) {
+        value.reserve(256);
+    }
+    return ImGui::InputText(label, value.data(), value.capacity() + 1, flags,
+                            input_text_resize_callback, &value);
+}
+
 // Represents a segment of video on the timeline (frame-based)
 // Uses half-open intervals: [start_frame, end_frame)
 struct Clip {
@@ -99,6 +119,8 @@ struct VideoPlayer {
     std::vector<SourceInfo> sources;
     int active_source = -1;
     bool previewing_library = false;
+    int preview_restore_source = -1;
+    int64_t preview_restore_timeline_frame = 0;
 
     struct AudioEngine {
         ma_context ctx{};
@@ -106,10 +128,12 @@ struct VideoPlayer {
         bool device_initialized = false;
         std::vector<float> source_pcm;
         std::vector<float> timeline_pcm;
+        std::vector<float> preview_pcm;
         int sample_rate = 48000;
         int channels = 2;
         std::atomic<int64_t> playhead_frames{0};
         std::atomic<bool> playing{false};
+        std::atomic<bool> use_preview{false};
     } audio;
     
     // Convert between frames and time
@@ -196,12 +220,18 @@ struct VideoPlayer {
     static void audio_data_callback(ma_device* device, void* output, const void*, ma_uint32 frameCount) {
         auto* audio = reinterpret_cast<AudioEngine*>(device->pUserData);
         float* out = static_cast<float*>(output);
-        if (!audio || !audio->playing.load() || audio->timeline_pcm.empty()) {
+        if (!audio || !audio->playing.load()) {
+            std::fill(out, out + frameCount * audio->channels, 0.0f);
+            return;
+        }
+        const bool use_preview = audio->use_preview.load();
+        const std::vector<float>& pcm = use_preview ? audio->preview_pcm : audio->timeline_pcm;
+        if (pcm.empty()) {
             std::fill(out, out + frameCount * audio->channels, 0.0f);
             return;
         }
         const int channels = audio->channels;
-        const int64_t total_frames = static_cast<int64_t>(audio->timeline_pcm.size() / channels);
+        const int64_t total_frames = static_cast<int64_t>(pcm.size() / channels);
         int64_t playhead = audio->playhead_frames.load();
         if (playhead >= total_frames) {
             audio->playing.store(false);
@@ -209,7 +239,7 @@ struct VideoPlayer {
             return;
         }
         int64_t frames_to_copy = std::min<int64_t>(frameCount, total_frames - playhead);
-        const float* src = audio->timeline_pcm.data() + playhead * channels;
+        const float* src = pcm.data() + playhead * channels;
         std::memcpy(out, src, static_cast<size_t>(frames_to_copy) * channels * sizeof(float));
         if (frames_to_copy < static_cast<int64_t>(frameCount)) {
             std::fill(out + frames_to_copy * channels, out + frameCount * channels, 0.0f);
@@ -227,6 +257,8 @@ struct VideoPlayer {
         }
         audio.source_pcm.clear();
         audio.timeline_pcm.clear();
+        audio.preview_pcm.clear();
+        audio.use_preview.store(false);
         audio_loaded = false;
     }
 
@@ -474,6 +506,37 @@ struct VideoPlayer {
         return static_cast<int>(sources.size() - 1);
     }
 
+    bool remove_source(int source_id) {
+        if (source_id < 0 || source_id >= (int)sources.size()) return false;
+        const bool removing_active = (source_id == active_source);
+        sources.erase(sources.begin() + source_id);
+        for (auto it = clips.begin(); it != clips.end(); ) {
+            if (it->source_id == source_id) {
+                it = clips.erase(it);
+                continue;
+            }
+            if (it->source_id > source_id) {
+                it->source_id--;
+            }
+            ++it;
+        }
+        if (sources.empty()) {
+            close_decoder();
+            active_source = -1;
+            clips.clear();
+            current_timeline_frame = 0;
+            shutdown_audio();
+            return true;
+        }
+        if (removing_active) {
+            active_source = std::clamp(active_source, 0, (int)sources.size() - 1);
+            open_source(active_source, false, false);
+        }
+        current_timeline_frame = std::clamp<int64_t>(current_timeline_frame, 0, total_timeline_frames());
+        audio_dirty = true;
+        return true;
+    }
+
     void close_decoder() {
         playing = false;
         loaded = false;
@@ -674,6 +737,9 @@ struct VideoPlayer {
         active_clip = 0;
         current_timeline_frame = 0;
         next_clip_color_id = 0;
+        previewing_library = false;
+        preview_restore_source = -1;
+        preview_restore_timeline_frame = 0;
         shutdown_audio();
         audio_dirty = false;
     }
@@ -866,15 +932,63 @@ struct VideoPlayer {
         return true;
     }
 
-    void preview_source(int source_id) {
+    void stop_library_preview() {
+        if (!previewing_library) return;
+        pause();
+        audio.use_preview.store(false);
+        audio.preview_pcm.clear();
+        previewing_library = false;
+        if (!clips.empty()) {
+            current_timeline_frame = std::clamp<int64_t>(
+                preview_restore_timeline_frame, 0, total_timeline_frames());
+            seek_to_timeline_frame(current_timeline_frame);
+        } else if (preview_restore_source >= 0 && preview_restore_source < (int)sources.size()) {
+            open_source(preview_restore_source, false, false);
+        }
+    }
+
+    void start_library_preview(int source_id) {
         if (source_id < 0 || source_id >= (int)sources.size()) return;
+        if (previewing_library) {
+            stop_library_preview();
+        }
+        preview_restore_source = active_source;
+        preview_restore_timeline_frame = current_timeline_frame;
+        pause();
         previewing_library = true;
         open_source(source_id, false, false);
-        seek_to_frame(0, true, false);
+        seek_to_frame(0, true, false, -1, false);
+        if (sources[source_id].audio_pcm.empty()) {
+            decode_audio_for_source(sources[source_id]);
+        }
+        audio.playing.store(false);
+        audio.use_preview.store(false);
+        audio.preview_pcm = sources[source_id].audio_pcm;
+        audio.playhead_frames.store(0);
+        audio.use_preview.store(true);
+        if (!audio.device_initialized) {
+            init_audio_device();
+        }
+        playing = true;
+        play_start_time = glfwGetTime();
+        play_start_frame = 0;
+        if (!audio.preview_pcm.empty()) {
+            audio.playing.store(true);
+        }
     }
     
     void play() {
-        if (!loaded || clips.empty()) return;
+        if (!loaded) return;
+        if (previewing_library) {
+            playing = true;
+            play_start_time = glfwGetTime();
+            play_start_frame = current_frame;
+            if (audio.use_preview.load()) {
+                audio.playing.store(true);
+            }
+            return;
+        }
+        if (clips.empty()) return;
         int64_t max_timeline = total_timeline_frames();
         current_timeline_frame = std::clamp(current_timeline_frame, (int64_t)0, max_timeline);
         playing = true;
@@ -897,7 +1011,20 @@ struct VideoPlayer {
     }
     
     void update() {
-        if (!loaded || !playing || clips.empty()) return;
+        if (!loaded || !playing) return;
+        if (previewing_library) {
+            double elapsed = glfwGetTime() - play_start_time;
+            int64_t target_frame = play_start_frame + (int64_t)(elapsed * fps);
+            if (target_frame >= total_frames) {
+                seek_to_frame(total_frames > 0 ? total_frames - 1 : 0, true, false, -1, false);
+                pause();
+                return;
+            }
+            if (target_frame == current_frame) return;
+            seek_to_frame(target_frame, false, false, -1, false);
+            return;
+        }
+        if (clips.empty()) return;
         double elapsed = glfwGetTime() - play_start_time;
         int64_t target_timeline = play_start_timeline_frame + (int64_t)(elapsed * fps);
         int64_t max_timeline = total_timeline_frames();
@@ -1118,8 +1245,16 @@ bool export_frames_as_png(const std::string& input, const std::string& output_fo
     return true;
 }
 
+struct ExportAudio {
+    std::vector<float> timeline_pcm;
+    int sample_rate = 48000;
+    int channels = 2;
+    bool has_audio = false;
+};
+
 // SIMPLIFIED LINEAR EXPORT: decode → encode → write immediately, no buffering
-bool export_clips(const std::string& input, const std::string& output, const std::vector<Clip>& clips, double fps, std::atomic<bool>& exporting, std::atomic<float>& progress) {
+bool export_clips(const std::vector<std::string>& source_paths, const std::string& output, const std::vector<Clip>& clips,
+                  double fps, const ExportAudio& audio_export, std::atomic<bool>& exporting, std::atomic<float>& progress) {
     if (clips.empty()) {
         exporting = false;
         return false;
@@ -1134,173 +1269,87 @@ bool export_clips(const std::string& input, const std::string& output, const std
     }
     std::printf("EXPORT: Total frames to export: %lld\n", (long long)total_frames);
     
-    // Open input
-    AVFormatContext* in_ctx = nullptr;
-    AVDictionary* opts = nullptr;
-    av_dict_set(&opts, "ignore_editlist", "1", 0);
-    if (avformat_open_input(&in_ctx, input.c_str(), nullptr, &opts) < 0) {
-        av_dict_free(&opts);
-        exporting = false;
-        return false;
-    }
-    av_dict_free(&opts);
-    avformat_find_stream_info(in_ctx, nullptr);
-    
-    // Find video + audio streams
-    int video_idx = -1;
-    int audio_idx = -1;
-    for (unsigned i = 0; i < in_ctx->nb_streams; i++) {
-        if (in_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            video_idx = i;
-        } else if (in_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-            audio_idx = i;
+    struct SourceDecodeState {
+        AVFormatContext* in_ctx = nullptr;
+        AVCodecContext* dec_ctx = nullptr;
+        AVStream* in_video = nullptr;
+        int video_idx = -1;
+        AVRational stream_time_base{0, 1};
+        int64_t stream_start_pts = 0;
+        AVRational fps_q{0, 1};
+        AVRational frame_tb{0, 1};
+        SwsContext* debug_sws = nullptr;
+        AVFrame* debug_rgb = nullptr;
+    };
+
+    auto close_source = [&](SourceDecodeState& s) {
+        if (s.debug_rgb) av_frame_free(&s.debug_rgb);
+        if (s.debug_sws) sws_freeContext(s.debug_sws);
+        if (s.dec_ctx) avcodec_free_context(&s.dec_ctx);
+        if (s.in_ctx) avformat_close_input(&s.in_ctx);
+        s = {};
+    };
+
+    auto open_source = [&](const std::string& path, SourceDecodeState& s) -> bool {
+        close_source(s);
+        AVDictionary* opts = nullptr;
+        av_dict_set(&opts, "ignore_editlist", "1", 0);
+        if (avformat_open_input(&s.in_ctx, path.c_str(), nullptr, &opts) < 0) {
+            av_dict_free(&opts);
+            return false;
         }
-    }
-    if (video_idx < 0) {
-        avformat_close_input(&in_ctx);
+        av_dict_free(&opts);
+        avformat_find_stream_info(s.in_ctx, nullptr);
+        for (unsigned i = 0; i < s.in_ctx->nb_streams; i++) {
+            if (s.in_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                s.video_idx = static_cast<int>(i);
+                break;
+            }
+        }
+        if (s.video_idx < 0) {
+            close_source(s);
+            return false;
+        }
+        s.in_video = s.in_ctx->streams[s.video_idx];
+        s.stream_time_base = s.in_video->time_base;
+        s.stream_start_pts = (s.in_video->start_time != AV_NOPTS_VALUE) ? s.in_video->start_time : 0;
+        if (s.in_video->avg_frame_rate.num && s.in_video->avg_frame_rate.den) {
+            s.fps_q = s.in_video->avg_frame_rate;
+        } else if (s.in_video->r_frame_rate.num && s.in_video->r_frame_rate.den) {
+            s.fps_q = s.in_video->r_frame_rate;
+        } else {
+            s.fps_q = av_d2q(fps > 0.0 ? fps : 30.0, 100000);
+        }
+        if (s.fps_q.num == 0 || s.fps_q.den == 0) {
+            s.fps_q = {30, 1};
+        }
+        s.frame_tb = {s.fps_q.den, s.fps_q.num};
+
+        const AVCodec* decoder = avcodec_find_decoder(s.in_video->codecpar->codec_id);
+        s.dec_ctx = avcodec_alloc_context3(decoder);
+        avcodec_parameters_to_context(s.dec_ctx, s.in_video->codecpar);
+        s.dec_ctx->thread_count = 1;
+        if (avcodec_open2(s.dec_ctx, decoder, nullptr) < 0) {
+            close_source(s);
+            return false;
+        }
+        return true;
+    };
+
+    if (clips.front().source_id < 0 || clips.front().source_id >= (int)source_paths.size()) {
         exporting = false;
         return false;
     }
-    
-    AVStream* in_video = in_ctx->streams[video_idx];
-    AVStream* in_audio = (audio_idx >= 0) ? in_ctx->streams[audio_idx] : nullptr;
-    AVRational stream_time_base = in_video->time_base;
-    int64_t stream_start_pts = (in_video->start_time != AV_NOPTS_VALUE) ? in_video->start_time : 0;
-    AVRational fps_q{0, 1};
-    if (in_video->avg_frame_rate.num && in_video->avg_frame_rate.den) {
-        fps_q = in_video->avg_frame_rate;
-    } else if (in_video->r_frame_rate.num && in_video->r_frame_rate.den) {
-        fps_q = in_video->r_frame_rate;
-    } else {
-        fps_q = av_d2q(fps > 0.0 ? fps : 30.0, 100000);
+    SourceDecodeState source_state;
+    if (!open_source(source_paths[clips.front().source_id], source_state)) {
+        exporting = false;
+        return false;
     }
+    AVRational fps_q = av_d2q(fps > 0.0 ? fps : av_q2d(source_state.fps_q), 100000);
     if (fps_q.num == 0 || fps_q.den == 0) {
         fps_q = {30, 1};
     }
     const AVRational frame_tb{fps_q.den, fps_q.num};
-    const auto ts_rounding = static_cast<AVRounding>(AV_ROUND_DOWN | AV_ROUND_PASS_MINMAX);
-    auto ts_to_frame = [&](int64_t ts) -> int64_t {
-        if (ts == AV_NOPTS_VALUE) return 0;
-        return av_rescale_q_rnd(ts, stream_time_base, frame_tb, ts_rounding);
-    };
-    auto frame_to_ts = [&](int64_t frame) -> int64_t {
-        return av_rescale_q_rnd(frame, frame_tb, stream_time_base, ts_rounding);
-    };
-    
-    // Set up decoder (single-threaded)
-    const AVCodec* decoder = avcodec_find_decoder(in_video->codecpar->codec_id);
-    AVCodecContext* dec_ctx = avcodec_alloc_context3(decoder);
-    avcodec_parameters_to_context(dec_ctx, in_video->codecpar);
-    dec_ctx->thread_count = 1;  // Single-threaded decoding
-    avcodec_open2(dec_ctx, decoder, nullptr);
-    
-    // Decode audio to timeline PCM (float stereo)
-    struct AudioExport {
-        std::vector<float> timeline_pcm;
-        int sample_rate = 48000;
-        int channels = 2;
-        bool has_audio = false;
-    } audio_export;
-    if (in_audio) {
-        AVFormatContext* audio_ctx = nullptr;
-        if (avformat_open_input(&audio_ctx, input.c_str(), nullptr, nullptr) >= 0 &&
-            avformat_find_stream_info(audio_ctx, nullptr) >= 0) {
-            int audio_stream = -1;
-            for (unsigned i = 0; i < audio_ctx->nb_streams; i++) {
-                if (audio_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-                    audio_stream = static_cast<int>(i);
-                    break;
-                }
-            }
-            if (audio_stream >= 0) {
-                AVStream* audio_stream_info = audio_ctx->streams[audio_stream];
-                const AVCodec* audio_decoder = avcodec_find_decoder(audio_stream_info->codecpar->codec_id);
-                if (audio_decoder) {
-                    AVCodecContext* audio_dec = avcodec_alloc_context3(audio_decoder);
-                    avcodec_parameters_to_context(audio_dec, audio_stream_info->codecpar);
-                    if (avcodec_open2(audio_dec, audio_decoder, nullptr) >= 0) {
-                        int out_rate = audio_dec->sample_rate > 0 ? audio_dec->sample_rate : 48000;
-                        AVChannelLayout in_layout = audio_dec->ch_layout;
-                        if (in_layout.nb_channels == 0) {
-                            int fallback_channels = audio_stream_info->codecpar->ch_layout.nb_channels;
-                            if (fallback_channels <= 0) fallback_channels = 2;
-                            av_channel_layout_default(&in_layout, fallback_channels);
-                        }
-                        AVChannelLayout out_layout;
-                        av_channel_layout_default(&out_layout, 2);
-                        SwrContext* swr = nullptr;
-                        if (swr_alloc_set_opts2(&swr, &out_layout, AV_SAMPLE_FMT_FLT, out_rate,
-                                                &in_layout, audio_dec->sample_fmt, audio_dec->sample_rate,
-                                                0, nullptr) >= 0 &&
-                            swr_init(swr) >= 0) {
-                            std::vector<float> decoded_pcm;
-                            AVPacket* a_pkt = av_packet_alloc();
-                            AVFrame* a_frame = av_frame_alloc();
-                            while (av_read_frame(audio_ctx, a_pkt) >= 0) {
-                                if (a_pkt->stream_index != audio_stream) {
-                                    av_packet_unref(a_pkt);
-                                    continue;
-                                }
-                                avcodec_send_packet(audio_dec, a_pkt);
-                                av_packet_unref(a_pkt);
-                                while (avcodec_receive_frame(audio_dec, a_frame) >= 0) {
-                                    int out_samples = swr_get_out_samples(swr, a_frame->nb_samples);
-                                    std::vector<float> temp(static_cast<size_t>(out_samples) * out_layout.nb_channels);
-                                    uint8_t* out_data[] = { reinterpret_cast<uint8_t*>(temp.data()) };
-                                    int converted = swr_convert(swr, out_data, out_samples,
-                                                                const_cast<const uint8_t**>(a_frame->data), a_frame->nb_samples);
-                                    if (converted > 0) {
-                                        size_t count = static_cast<size_t>(converted) * out_layout.nb_channels;
-                                        decoded_pcm.insert(decoded_pcm.end(), temp.begin(), temp.begin() + count);
-                                    }
-                                }
-                            }
-                            avcodec_send_packet(audio_dec, nullptr);
-                            while (avcodec_receive_frame(audio_dec, a_frame) >= 0) {
-                                int out_samples = swr_get_out_samples(swr, a_frame->nb_samples);
-                                std::vector<float> temp(static_cast<size_t>(out_samples) * out_layout.nb_channels);
-                                uint8_t* out_data[] = { reinterpret_cast<uint8_t*>(temp.data()) };
-                                int converted = swr_convert(swr, out_data, out_samples,
-                                                            const_cast<const uint8_t**>(a_frame->data), a_frame->nb_samples);
-                                if (converted > 0) {
-                                    size_t count = static_cast<size_t>(converted) * out_layout.nb_channels;
-                                    decoded_pcm.insert(decoded_pcm.end(), temp.begin(), temp.begin() + count);
-                                }
-                            }
-                            av_frame_free(&a_frame);
-                            av_packet_free(&a_pkt);
-                            swr_free(&swr);
-
-                            if (!decoded_pcm.empty()) {
-                                audio_export.sample_rate = out_rate;
-                                audio_export.channels = out_layout.nb_channels;
-                                const int64_t source_frames = static_cast<int64_t>(decoded_pcm.size() / audio_export.channels);
-                                for (const auto& clip : clips) {
-                                    double start_time = clip.start_frame / fps;
-                                    double end_time = clip.end_frame / fps;
-                                    int64_t start_sample = static_cast<int64_t>(start_time * out_rate);
-                                    int64_t end_sample = static_cast<int64_t>(end_time * out_rate);
-                                    start_sample = std::clamp<int64_t>(start_sample, 0, source_frames);
-                                    end_sample = std::clamp<int64_t>(end_sample, 0, source_frames);
-                                    if (end_sample <= start_sample) continue;
-                                    size_t begin = static_cast<size_t>(start_sample) * audio_export.channels;
-                                    size_t end = static_cast<size_t>(end_sample) * audio_export.channels;
-                                    audio_export.timeline_pcm.insert(audio_export.timeline_pcm.end(),
-                                                                     decoded_pcm.begin() + begin,
-                                                                     decoded_pcm.begin() + end);
-                                }
-                                audio_export.has_audio = !audio_export.timeline_pcm.empty();
-                            }
-                        }
-                    }
-                    avcodec_free_context(&audio_dec);
-                }
-            }
-        }
-        if (audio_ctx) {
-            avformat_close_input(&audio_ctx);
-        }
-    }
 
     // Create output
     AVFormatContext* out_ctx = nullptr;
@@ -1312,8 +1361,8 @@ bool export_clips(const std::string& input, const std::string& output, const std
     
     AVStream* out_video = avformat_new_stream(out_ctx, nullptr);
     AVCodecContext* enc_ctx = avcodec_alloc_context3(encoder);
-    enc_ctx->width = dec_ctx->width;
-    enc_ctx->height = dec_ctx->height;
+    enc_ctx->width = source_state.dec_ctx->width;
+    enc_ctx->height = source_state.dec_ctx->height;
     enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
     enc_ctx->time_base = frame_tb;
     enc_ctx->framerate = fps_q;
@@ -1348,16 +1397,20 @@ bool export_clips(const std::string& input, const std::string& output, const std
             audio_enc->time_base = AVRational{1, audio_export.sample_rate};
             audio_enc->bit_rate = 128000;
             audio_enc->sample_fmt = AV_SAMPLE_FMT_FLTP;
-            if (aac->sample_fmts) {
+            const void* configs = nullptr;
+            int num_configs = 0;
+            if (avcodec_get_supported_config(audio_enc, aac, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0,
+                                            &configs, &num_configs) >= 0 && configs && num_configs > 0) {
+                auto fmts = static_cast<const AVSampleFormat*>(configs);
                 bool supported = false;
-                for (const AVSampleFormat* fmt = aac->sample_fmts; *fmt != AV_SAMPLE_FMT_NONE; ++fmt) {
-                    if (*fmt == audio_enc->sample_fmt) {
+                for (int i = 0; i < num_configs; ++i) {
+                    if (fmts[i] == audio_enc->sample_fmt) {
                         supported = true;
                         break;
                     }
                 }
                 if (!supported) {
-                    audio_enc->sample_fmt = aac->sample_fmts[0];
+                    audio_enc->sample_fmt = fmts[0];
                 }
             }
             if (out_ctx->oformat->flags & AVFMT_GLOBALHEADER) {
@@ -1385,40 +1438,43 @@ bool export_clips(const std::string& input, const std::string& output, const std
     
     std::printf("EXPORT: Encoder: %s, single-threaded, gop=1, no B-frames, zerolatency\n", encoder->name);
     
-    // Pixel format converter
-    SwsContext* sws_ctx = sws_getContext(
-        dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
-        enc_ctx->width, enc_ctx->height, AV_PIX_FMT_YUV420P,
-        SWS_BILINEAR, nullptr, nullptr, nullptr
-    );
-    
     // Debug output setup
     fs::path debug_dir = fs::path(output).parent_path() / "export_debug";
     fs::create_directories(debug_dir);
-    SwsContext* debug_sws = sws_getContext(
-        dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
-        dec_ctx->width, dec_ctx->height, AV_PIX_FMT_RGB24,
-        SWS_BILINEAR, nullptr, nullptr, nullptr
-    );
-    AVFrame* debug_rgb = av_frame_alloc();
-    debug_rgb->format = AV_PIX_FMT_RGB24;
-    debug_rgb->width = dec_ctx->width;
-    debug_rgb->height = dec_ctx->height;
-    av_frame_get_buffer(debug_rgb, 0);
+    auto ensure_source_converters = [&]() {
+        if (!source_state.debug_sws) {
+            source_state.debug_sws = sws_getContext(
+                source_state.dec_ctx->width, source_state.dec_ctx->height, source_state.dec_ctx->pix_fmt,
+                enc_ctx->width, enc_ctx->height, AV_PIX_FMT_RGB24,
+                SWS_BILINEAR, nullptr, nullptr, nullptr
+            );
+        }
+        if (!source_state.debug_rgb) {
+            source_state.debug_rgb = av_frame_alloc();
+            source_state.debug_rgb->format = AV_PIX_FMT_RGB24;
+            source_state.debug_rgb->width = enc_ctx->width;
+            source_state.debug_rgb->height = enc_ctx->height;
+            av_frame_get_buffer(source_state.debug_rgb, 0);
+        }
+    };
+    ensure_source_converters();
     
     // Convert to RGB and save PPM - returns the RGB frame for encoding
     auto convert_and_save_ppm = [&](AVFrame* src, const std::string& name) -> AVFrame* {
-        av_frame_make_writable(debug_rgb);
-        sws_scale(debug_sws, src->data, src->linesize, 0, src->height, debug_rgb->data, debug_rgb->linesize);
+        ensure_source_converters();
+        av_frame_make_writable(source_state.debug_rgb);
+        sws_scale(source_state.debug_sws, src->data, src->linesize, 0, src->height,
+                  source_state.debug_rgb->data, source_state.debug_rgb->linesize);
         std::string path = (debug_dir / (name + ".ppm")).string();
         FILE* f = fopen(path.c_str(), "wb");
         if (f) {
-            fprintf(f, "P6\n%d %d\n255\n", debug_rgb->width, debug_rgb->height);
-            for (int y = 0; y < debug_rgb->height; y++)
-                fwrite(debug_rgb->data[0] + y * debug_rgb->linesize[0], 1, debug_rgb->width * 3, f);
+            fprintf(f, "P6\n%d %d\n255\n", source_state.debug_rgb->width, source_state.debug_rgb->height);
+            for (int y = 0; y < source_state.debug_rgb->height; y++)
+                fwrite(source_state.debug_rgb->data[0] + y * source_state.debug_rgb->linesize[0], 1,
+                       source_state.debug_rgb->width * 3, f);
             fclose(f);
         }
-        return debug_rgb;  // Return the RGB frame we just created
+        return source_state.debug_rgb;  // Return the RGB frame we just created
     };
     
     // Open output file
@@ -1488,36 +1544,57 @@ bool export_clips(const std::string& input, const std::string& output, const std
         }
     };
     
+    int current_source_id = clips.front().source_id;
+
     // Process each clip
     for (const auto& clip : clips) {
-        std::printf("EXPORT: Processing clip [%lld, %lld)\n", (long long)clip.start_frame, (long long)clip.end_frame);
+        if (clip.source_id < 0 || clip.source_id >= (int)source_paths.size()) continue;
+        if (clip.source_id != current_source_id) {
+            current_source_id = clip.source_id;
+            if (!open_source(source_paths[current_source_id], source_state)) {
+                continue;
+            }
+            ensure_source_converters();
+        }
+        std::printf("EXPORT: Processing clip [%lld, %lld) src=%d\n",
+                    (long long)clip.start_frame, (long long)clip.end_frame, clip.source_id);
+        
+        const auto ts_rounding = static_cast<AVRounding>(AV_ROUND_DOWN | AV_ROUND_PASS_MINMAX);
+        auto ts_to_frame = [&](int64_t ts) -> int64_t {
+            if (ts == AV_NOPTS_VALUE) return 0;
+            return av_rescale_q_rnd(ts, source_state.stream_time_base, source_state.frame_tb, ts_rounding);
+        };
+        auto frame_to_ts = [&](int64_t frame) -> int64_t {
+            return av_rescale_q_rnd(frame, source_state.frame_tb, source_state.stream_time_base, ts_rounding);
+        };
         
         // Seek to clip start
-        int64_t target_ts = stream_start_pts + frame_to_ts(clip.start_frame);
-        avcodec_flush_buffers(dec_ctx);
-        avformat_seek_file(in_ctx, video_idx, 0, target_ts, target_ts, AVSEEK_FLAG_BACKWARD);
-        avcodec_flush_buffers(dec_ctx);
+        int64_t target_ts = source_state.stream_start_pts + frame_to_ts(clip.start_frame);
+        avcodec_flush_buffers(source_state.dec_ctx);
+        avformat_seek_file(source_state.in_ctx, source_state.video_idx, 0, target_ts, target_ts, AVSEEK_FLAG_BACKWARD);
+        avcodec_flush_buffers(source_state.dec_ctx);
         
         int64_t frames_needed = clip.frame_count();
         int64_t frames_got = 0;
+        bool have_last_rgb = false;
         
         // Decode frames one by one
-        while (av_read_frame(in_ctx, pkt) >= 0 && frames_got < frames_needed) {
-            if (pkt->stream_index != video_idx) {
+        while (av_read_frame(source_state.in_ctx, pkt) >= 0 && frames_got < frames_needed) {
+            if (pkt->stream_index != source_state.video_idx) {
                 av_packet_unref(pkt);
                 continue;
             }
             
-            avcodec_send_packet(dec_ctx, pkt);
+            avcodec_send_packet(source_state.dec_ctx, pkt);
             av_packet_unref(pkt);
             
-            while (avcodec_receive_frame(dec_ctx, dec_frame) >= 0 && frames_got < frames_needed) {
+            while (avcodec_receive_frame(source_state.dec_ctx, dec_frame) >= 0 && frames_got < frames_needed) {
                 // Calculate source frame index
                 int64_t pts = dec_frame->best_effort_timestamp != AV_NOPTS_VALUE
                     ? dec_frame->best_effort_timestamp
                     : dec_frame->pts;
-                if (pts == AV_NOPTS_VALUE) pts = stream_start_pts;
-                pts -= stream_start_pts;
+                if (pts == AV_NOPTS_VALUE) pts = source_state.stream_start_pts;
+                pts -= source_state.stream_start_pts;
                 int64_t src_frame = ts_to_frame(pts);
                 
                 // Skip frames before clip start
@@ -1543,6 +1620,7 @@ bool export_clips(const std::string& input, const std::string& output, const std
                 
                 // Encode from the EXACT SAME RGB data we just saved to PPM
                 encode_from_rgb(rgb, output_frame);
+                have_last_rgb = true;
                 
                 output_frame++;
                 frames_got++;
@@ -1555,13 +1633,13 @@ bool export_clips(const std::string& input, const std::string& output, const std
         }
         
         // Flush decoder for this clip
-        avcodec_send_packet(dec_ctx, nullptr);
-        while (avcodec_receive_frame(dec_ctx, dec_frame) >= 0 && frames_got < frames_needed) {
+        avcodec_send_packet(source_state.dec_ctx, nullptr);
+        while (avcodec_receive_frame(source_state.dec_ctx, dec_frame) >= 0 && frames_got < frames_needed) {
             int64_t pts = dec_frame->best_effort_timestamp != AV_NOPTS_VALUE
                 ? dec_frame->best_effort_timestamp
                 : dec_frame->pts;
-            if (pts == AV_NOPTS_VALUE) pts = stream_start_pts;
-            pts -= stream_start_pts;
+            if (pts == AV_NOPTS_VALUE) pts = source_state.stream_start_pts;
+            pts -= source_state.stream_start_pts;
             int64_t src_frame = ts_to_frame(pts);
             
             if (src_frame < clip.start_frame) continue;
@@ -1570,12 +1648,23 @@ bool export_clips(const std::string& input, const std::string& output, const std
             std::printf("EXPORT: (flush) Decode src=%lld -> encode out=%lld\n", (long long)src_frame, (long long)output_frame);
             AVFrame* rgb = convert_and_save_ppm(dec_frame, "frame_" + std::to_string(output_frame) + "_src" + std::to_string(src_frame));
             encode_from_rgb(rgb, output_frame);
+            have_last_rgb = true;
             
             output_frame++;
             frames_got++;
             if (frames_got >= frames_needed) break;
         }
         
+        if (frames_got < frames_needed && have_last_rgb) {
+            std::printf("EXPORT: Padding %lld frames using last decoded frame\n",
+                        (long long)(frames_needed - frames_got));
+            while (frames_got < frames_needed) {
+                encode_from_rgb(source_state.debug_rgb, output_frame);
+                output_frame++;
+                frames_got++;
+                progress = (float)output_frame / total_frames;
+            }
+        }
         std::printf("EXPORT: Clip done, got %lld/%lld frames\n", (long long)frames_got, (long long)frames_needed);
     }
     
@@ -1660,20 +1749,16 @@ bool export_clips(const std::string& input, const std::string& output, const std
     av_write_trailer(out_ctx);
     
     // Cleanup
-    av_frame_free(&debug_rgb);
-    sws_freeContext(debug_sws);
     sws_freeContext(rgb_to_yuv);
     av_frame_free(&dec_frame);
     av_packet_free(&enc_pkt);
     av_packet_free(&pkt);
-    sws_freeContext(sws_ctx);
     avcodec_free_context(&enc_ctx);
     if (audio_swr) swr_free(&audio_swr);
     if (audio_enc) avcodec_free_context(&audio_enc);
-    avcodec_free_context(&dec_ctx);
     avio_closep(&out_ctx->pb);
     avformat_free_context(out_ctx);
-    avformat_close_input(&in_ctx);
+    close_source(source_state);
     
     progress = 1.0f;
     exporting = false;
@@ -1902,11 +1987,12 @@ struct FileBrowser {
 
 using json = nlohmann::json;
 
-bool save_project_file(const std::string& path, const VideoPlayer& player) {
+bool save_project_file(const std::string& path, const VideoPlayer& player, float timeline_zoom) {
     json j;
     j["version"] = 1;
     j["current_timeline_frame"] = player.current_timeline_frame;
     j["active_source"] = player.active_source;
+    j["timeline_zoom"] = timeline_zoom;
     j["sources"] = json::array();
     for (const auto& src : player.sources) {
         j["sources"].push_back({{"path", src.path}});
@@ -1926,7 +2012,7 @@ bool save_project_file(const std::string& path, const VideoPlayer& player) {
     return true;
 }
 
-bool load_project_file(const std::string& path, VideoPlayer& player) {
+bool load_project_file(const std::string& path, VideoPlayer& player, float& out_zoom) {
     std::ifstream in(path);
     if (!in) return false;
     if (in.peek() == std::ifstream::traits_type::eof()) return false;
@@ -1965,6 +2051,8 @@ bool load_project_file(const std::string& path, VideoPlayer& player) {
     player.current_timeline_frame = j.value("current_timeline_frame", 0);
     player.current_timeline_frame = std::clamp<int64_t>(
         player.current_timeline_frame, 0, player.total_timeline_frames());
+    out_zoom = j.value("timeline_zoom", 1.0f);
+    out_zoom = std::clamp(out_zoom, 0.25f, 50.0f);
     player.audio_dirty = true;
     player.rebuild_timeline_audio();
     player.audio_dirty = false;
@@ -2854,7 +2942,7 @@ int main() {
         return 1;
     }
 
-    WindowData main_window = create_window("VibeCut", 1400, 1000);
+    WindowData main_window = create_window("VibeCut", 1600, 1000);
     if (!main_window.window) {
         std::fprintf(stderr, "Failed to create main window\n");
         glfwTerminate();
@@ -2862,63 +2950,113 @@ int main() {
     }
 
     WindowData browser_window{};
+    WindowData confirm_window{};
     FileBrowser browser;
-    std::string selected_file;
     std::string project_path;
+    bool project_open = false;
+    bool project_dirty = false;
+    bool show_exit_confirm = false;
+    bool exit_after_save = false;
+    std::string save_filename = "project.vibecut";
     VideoPlayer player;
-    std::string pending_load;
+    std::string pending_new_project_media;
     std::string pending_project_load;
     std::string pending_project_save;
     int library_selected = -1;
-    enum class BrowserMode { None, OpenMedia, AddLibrary, OpenProject, SaveProject };
+    enum class BrowserMode { None, AddLibrary, OpenProject, SaveProject, NewProjectFromVideo };
     BrowserMode browser_mode = BrowserMode::None;
     ClipsTimelineState timeline_state;
+    std::string window_title_cache;
     
     std::atomic<bool> exporting{false};
     std::atomic<float> export_progress{0.0f};
     std::thread export_thread;
 
-    while (!glfwWindowShouldClose(main_window.window)) {
+    bool should_exit = false;
+    while (!should_exit) {
         glfwPollEvents();
 
-        if (browser_window.window && glfwWindowShouldClose(browser_window.window)) {
-            destroy_window(browser_window);
+        if (glfwWindowShouldClose(main_window.window)) {
+            if (project_dirty) {
+                show_exit_confirm = true;
+                glfwSetWindowShouldClose(main_window.window, GLFW_FALSE);
+            } else {
+                should_exit = true;
+            }
         }
 
-        if (!pending_load.empty()) {
+        if (browser_window.window && glfwWindowShouldClose(browser_window.window)) {
+            if (browser_mode == BrowserMode::SaveProject) {
+                exit_after_save = false;
+            }
+            destroy_window(browser_window);
+        }
+        if (confirm_window.window && glfwWindowShouldClose(confirm_window.window)) {
+            destroy_window(confirm_window);
+            show_exit_confirm = false;
+        }
+
+        if (!pending_new_project_media.empty()) {
             glfwMakeContextCurrent(main_window.window);
-            if (player.open(pending_load)) {
+            player.close();
+            if (player.open(pending_new_project_media)) {
                 std::printf("Loaded video: %dx%d, %.1f fps, %lld frames, %.1f sec\n", 
                     player.width, player.height, player.fps, (long long)player.total_frames, player.duration);
+                project_open = true;
+                project_dirty = true;
+                project_path.clear();
             }
-            pending_load.clear();
+            pending_new_project_media.clear();
         }
         if (!pending_project_load.empty()) {
             glfwMakeContextCurrent(main_window.window);
-            if (load_project_file(pending_project_load, player)) {
+            if (load_project_file(pending_project_load, player, timeline_state.zoom)) {
                 project_path = pending_project_load;
+                project_open = true;
+                project_dirty = false;
                 if (!player.sources.empty()) {
-                    selected_file = player.sources.front().path;
+                    library_selected = 0;
                 }
             }
             pending_project_load.clear();
         }
         if (!pending_project_save.empty()) {
             glfwMakeContextCurrent(main_window.window);
-            if (save_project_file(pending_project_save, player)) {
+            if (save_project_file(pending_project_save, player, timeline_state.zoom)) {
                 project_path = pending_project_save;
+                project_dirty = false;
+                if (exit_after_save) {
+                    should_exit = true;
+                }
             }
+            exit_after_save = false;
             pending_project_save.clear();
         }
 
         glfwMakeContextCurrent(main_window.window);
         player.update();
 
+        std::string desired_title = "VibeCut";
+        if (project_open) {
+            if (!project_path.empty()) {
+                desired_title = "VibeCut - " + project_path;
+            } else {
+                desired_title = "VibeCut - (unsaved)";
+            }
+        }
+        if (desired_title != window_title_cache) {
+            glfwSetWindowTitle(main_window.window, desired_title.c_str());
+            window_title_cache = desired_title;
+        }
+
         bool open_browser = false;
         render_window(main_window, [&]() {
             ImGuiViewport* viewport = ImGui::GetMainViewport();
+            if (show_exit_confirm) {
+                ImGui::BeginDisabled();
+            }
             
-            if (player.loaded) {
+            if (project_open) {
                 ImGui::SetNextWindowPos(ImVec2(0, 0));
                 ImGui::SetNextWindowSize(viewport->Size);
                 ImGui::Begin("##VideoView", nullptr,
@@ -2930,23 +3068,78 @@ int main() {
                     ImGuiWindowFlags_NoScrollWithMouse);
                 
                 float ui_scale = main_window.scale;
-                float controls_height = 130 * ui_scale;
-                float library_w = 240 * ui_scale;
-                float scale_x = viewport->Size.x / player.width;
-                float scale_y = (viewport->Size.y - controls_height) / player.height;
-                float img_scale = std::min(scale_x, scale_y);
+                float controls_height = 95 * ui_scale;
+                float panel_w = 280 * ui_scale;
+                float pad = 10 * ui_scale;
+                float panel_h = viewport->Size.y - controls_height - 2 * pad;
                 
-                float img_w = player.width * img_scale;
-                float img_h = player.height * img_scale;
-                float img_x = (viewport->Size.x - library_w - img_w) / 2 + library_w;
-                float img_y = (viewport->Size.y - controls_height - img_h) / 2;
-
-                ImGui::SetCursorPos(ImVec2(10, 10));
-                ImGui::BeginChild("##Library", ImVec2(library_w - 20, viewport->Size.y - controls_height - 20), true);
-                ImGui::Text("Library");
-                if (ImGui::Button("Add...", ImVec2(0, 0))) {
-                    browser_mode = BrowserMode::AddLibrary;
-                    open_browser = true;
+                ImGui::SetCursorPos(ImVec2(pad, pad));
+                ImGui::BeginChild("##ProjectPanel", ImVec2(panel_w, panel_h), true);
+                ImGui::Text("Project");
+                float full_w = ImGui::GetContentRegionAvail().x;
+                if (ImGui::Button("Add a Clip...", ImVec2(full_w, 0))) {
+                    if (!browser_window.window) {
+                        browser_mode = BrowserMode::AddLibrary;
+                        open_browser = true;
+                    }
+                }
+                if (ImGui::Button("Save Project", ImVec2(full_w, 0))) {
+                    if (!project_path.empty()) {
+                        pending_project_save = project_path;
+                    } else {
+                        if (!browser_window.window) {
+                            save_filename = "project.vibecut";
+                            browser_mode = BrowserMode::SaveProject;
+                            open_browser = true;
+                        }
+                    }
+                }
+                if (ImGui::Button("Open Project", ImVec2(full_w, 0))) {
+                    if (!browser_window.window) {
+                        browser_mode = BrowserMode::OpenProject;
+                        open_browser = true;
+                    }
+                }
+                if (ImGui::Button("New Project", ImVec2(full_w, 0))) {
+                    player.close();
+                    project_open = true;
+                    project_dirty = true;
+                    project_path.clear();
+                    library_selected = -1;
+                }
+                if (exporting) {
+                    ImGui::ProgressBar(export_progress, ImVec2(full_w, 0), "Exporting...");
+                } else {
+                    bool can_export = player.loaded && !player.clips.empty() && !player.source_path.empty();
+                    if (!can_export) ImGui::BeginDisabled();
+                    if (ImGui::Button("Export", ImVec2(full_w, 0))) {
+                        fs::path base = project_path.empty() ? fs::path(player.source_path) : fs::path(project_path);
+                        std::string stem = base.stem().string();
+                        if (stem.empty()) stem = "vibecut_project";
+                        std::string out_path = (base.parent_path() / (stem + "_export.mp4")).string();
+                        
+                        exporting = true;
+                        export_progress = 0.0f;
+                        
+                        std::vector<Clip> clips_copy = player.clips;
+                        double fps_copy = player.fps;
+                        std::vector<std::string> source_paths;
+                        source_paths.reserve(player.sources.size());
+                        for (const auto& src : player.sources) {
+                            source_paths.push_back(src.path);
+                        }
+                        ExportAudio audio_copy;
+                        audio_copy.timeline_pcm = player.audio.timeline_pcm;
+                        audio_copy.sample_rate = player.audio.sample_rate;
+                        audio_copy.channels = player.audio.channels;
+                        audio_copy.has_audio = !audio_copy.timeline_pcm.empty();
+                        
+                        if (export_thread.joinable()) export_thread.join();
+                        export_thread = std::thread([&, out_path, clips_copy, fps_copy, source_paths, audio_copy]() {
+                            export_clips(source_paths, out_path, clips_copy, fps_copy, audio_copy, exporting, export_progress);
+                        });
+                    }
+                    if (!can_export) ImGui::EndDisabled();
                 }
                 ImGui::Separator();
                 for (int i = 0; i < (int)player.sources.size(); i++) {
@@ -2963,38 +3156,76 @@ int main() {
                 }
                 if (library_selected >= 0 && library_selected < (int)player.sources.size()) {
                     ImGui::Separator();
-                    if (ImGui::Button("Preview", ImVec2(0, 0))) {
-                        player.preview_source(library_selected);
+                    float clip_btn_w = ImGui::GetContentRegionAvail().x;
+                    if (ImGui::Button("Preview", ImVec2(clip_btn_w, 0))) {
+                        player.start_library_preview(library_selected);
+                    }
+                    if (ImGui::Button("Insert to Timeline", ImVec2(clip_btn_w, 0))) {
+                        if (player.insert_clip_at_timeline(library_selected, player.current_timeline_frame)) {
+                            player.audio_dirty = true;
+                            project_dirty = true;
+                        }
+                    }
+                    if (ImGui::Button("Remove Clip", ImVec2(clip_btn_w, 0))) {
+                        if (player.previewing_library) {
+                            player.stop_library_preview();
+                        }
+                        if (player.remove_source(library_selected)) {
+                            project_dirty = true;
+                            if (player.sources.empty()) {
+                                library_selected = -1;
+                            } else {
+                                library_selected = std::clamp(library_selected, 0, (int)player.sources.size() - 1);
+                            }
+                        }
                     }
                 }
                 ImGui::EndChild();
                 
-                ImGui::SetCursorPos(ImVec2(img_x, img_y));
-                ImGui::Image((ImTextureID)(intptr_t)player.texture_id, ImVec2(img_w, img_h));
-                
-                // "END" overlay when at the end of the timeline
-                if (player.at_timeline_end()) {
-                    ImDrawList* draw_list = ImGui::GetWindowDrawList();
-                    ImVec2 window_pos = ImGui::GetWindowPos();
+                ImGui::SameLine();
+                ImGui::SetCursorPos(ImVec2(pad + panel_w + pad, pad));
+                ImGui::BeginChild("##PreviewPanel",
+                                  ImVec2(viewport->Size.x - panel_w - 3 * pad, panel_h), false);
+                ImVec2 preview_size = ImGui::GetContentRegionAvail();
+                if (player.loaded) {
+                    float scale_x = preview_size.x / player.width;
+                    float scale_y = preview_size.y / player.height;
+                    float img_scale = std::min(scale_x, scale_y);
+                    float img_w = player.width * img_scale;
+                    float img_h = player.height * img_scale;
+                    ImVec2 img_pos((preview_size.x - img_w) * 0.5f, (preview_size.y - img_h) * 0.5f);
+                    ImGui::SetCursorPos(img_pos);
+                    ImGui::Image((ImTextureID)(intptr_t)player.texture_id, ImVec2(img_w, img_h));
                     
-                    // Semi-transparent gray overlay on the right side
-                    float overlay_width = img_w * 0.12f;
-                    ImVec2 overlay_min(window_pos.x + img_x + img_w - overlay_width, window_pos.y + img_y);
-                    ImVec2 overlay_max(window_pos.x + img_x + img_w, window_pos.y + img_y + img_h);
-                    draw_list->AddRectFilled(overlay_min, overlay_max, IM_COL32(50, 50, 55, 180));
-                    
-                    // "END" text centered in the overlay
-                    const char* end_text = "END";
-                    ImVec2 text_size = ImGui::CalcTextSize(end_text);
-                    float text_x = window_pos.x + img_x + img_w - overlay_width/2 - text_size.x/2;
-                    float text_y = window_pos.y + img_y + img_h/2 - text_size.y/2;
-                    draw_list->AddText(ImVec2(text_x, text_y), IM_COL32(255, 255, 255, 220), end_text);
+                    if (player.at_timeline_end()) {
+                        ImDrawList* draw_list = ImGui::GetWindowDrawList();
+                        ImVec2 window_pos = ImGui::GetWindowPos();
+                        
+                        float overlay_width = img_w * 0.12f;
+                        ImVec2 overlay_min(window_pos.x + img_pos.x + img_w - overlay_width,
+                                           window_pos.y + img_pos.y);
+                        ImVec2 overlay_max(window_pos.x + img_pos.x + img_w,
+                                           window_pos.y + img_pos.y + img_h);
+                        draw_list->AddRectFilled(overlay_min, overlay_max, IM_COL32(50, 50, 55, 180));
+                        
+                        const char* end_text = "END";
+                        ImVec2 text_size = ImGui::CalcTextSize(end_text);
+                        float text_x = window_pos.x + img_pos.x + img_w - overlay_width / 2 - text_size.x / 2;
+                        float text_y = window_pos.y + img_pos.y + img_h / 2 - text_size.y / 2;
+                        draw_list->AddText(ImVec2(text_x, text_y), IM_COL32(255, 255, 255, 220), end_text);
+                    }
+                } else {
+                    ImGui::Text("No media loaded. Add a clip to get started.");
                 }
+                ImGui::EndChild();
                 
                 // Controls
                 ImGui::SetCursorPos(ImVec2(10, viewport->Size.y - controls_height + 5));
                 
                 if (ImGui::Button(player.playing ? "Pause" : "Play", ImVec2(60 * ui_scale, 0))) {
+                    if (player.previewing_library) {
+                        player.stop_library_preview();
+                    }
                     player.toggle_play();
                 }
                 
@@ -3013,7 +3244,9 @@ int main() {
                 
                 // Spacebar to play/pause
                 if (ImGui::IsKeyPressed(ImGuiKey_Space)) {
-                    if (player.playing) {
+                    if (player.previewing_library) {
+                        player.stop_library_preview();
+                    } else if (player.playing) {
                         player.pause();
                     } else {
                         player.play();
@@ -3024,12 +3257,14 @@ int main() {
                 if (ImGui::IsKeyPressed(ImGuiKey_B) && !player.clips.empty()) {
                     player.split_at(player.current_time);
                     player.audio_dirty = true;
+                    project_dirty = true;
                 }
                 
                 // 'W' key to insert selected library clip at playhead
                 if (ImGui::IsKeyPressed(ImGuiKey_W) && library_selected >= 0) {
                     if (player.insert_clip_at_timeline(library_selected, player.current_timeline_frame)) {
                         player.audio_dirty = true;
+                        project_dirty = true;
                     }
                 }
                 
@@ -3092,8 +3327,10 @@ int main() {
                     }
                 }
                 
+                ImGui::Dummy(ImVec2(0, 2 * ui_scale));
+                
                 // Timeline with clips
-                ImGui::SetCursorPos(ImVec2(10, viewport->Size.y - controls_height + 35 * ui_scale));
+                ImGui::SetCursorPos(ImVec2(10, viewport->Size.y - controls_height + 45 * ui_scale));
                 int64_t curr_frame = player.current_frame;
                 int curr_source_id = player.active_source;
                 int64_t curr_timeline_frame = player.current_timeline_frame;
@@ -3113,16 +3350,21 @@ int main() {
                         player.seek_to_timeline_frame(curr_timeline_frame);
                     }
                 }
+                if (player.previewing_library && (timeline_state.dragging != 0 || timeline_state.pending_click)) {
+                    player.stop_library_preview();
+                }
                 if (timeline_state.pending_library_source >= 0) {
                     if (player.insert_clip_at_timeline(timeline_state.pending_library_source,
                                                       timeline_state.pending_library_timeline)) {
                         player.audio_dirty = true;
+                        project_dirty = true;
                     }
                     timeline_state.pending_library_source = -1;
                     timeline_state.pending_library_timeline = -1;
                 }
                 if (timeline_state.clips_modified) {
                     player.audio_dirty = true;
+                    project_dirty = true;
                     timeline_state.clips_modified = false;
                 }
                 if (player.audio_dirty) {
@@ -3133,72 +3375,6 @@ int main() {
                 // Reset seek target tracking when drag ends
                 if (timeline_state.dragging == 0) {
                     last_seek_frame = -1;
-                }
-                
-                // Bottom row
-                ImGui::SetCursorPos(ImVec2(10, viewport->Size.y - 30 * ui_scale));
-                ImGui::Text("File: %s", path_display_name(fs::path(selected_file)).c_str());
-                
-                ImGui::SameLine(viewport->Size.x - 180 * ui_scale);
-                
-                if (exporting) {
-                    ImGui::ProgressBar(export_progress, ImVec2(80 * ui_scale, 0), "Exporting...");
-                } else {
-                    if (ImGui::Button("Export", ImVec2(0, 0))) {
-                        fs::path src(selected_file);
-                        std::string out_name = src.stem().string() + "_edited.mp4";
-                        std::string out_path = (src.parent_path() / out_name).string();
-                        
-                        exporting = true;
-                        export_progress = 0.0f;
-                        
-                        // Copy clips and fps for thread safety
-                        std::vector<Clip> clips_copy = player.clips;
-                        double fps_copy = player.fps;
-                        
-                        if (export_thread.joinable()) export_thread.join();
-                        export_thread = std::thread([&, out_path, clips_copy, fps_copy]() {
-                            export_clips(player.source_path, out_path, clips_copy, fps_copy, exporting, export_progress);
-                        });
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button("PNG", ImVec2(0, 0))) {
-                        fs::path src(selected_file);
-                        std::string out_folder = (src.parent_path() / (src.stem().string() + "_frames")).string();
-                        
-                        exporting = true;
-                        export_progress = 0.0f;
-                        
-                        std::vector<Clip> clips_copy = player.clips;
-                        double fps_copy = player.fps;
-                        
-                        if (export_thread.joinable()) export_thread.join();
-                        export_thread = std::thread([&, out_folder, clips_copy, fps_copy]() {
-                            export_frames_as_png(player.source_path, out_folder, clips_copy, fps_copy, exporting, export_progress);
-                        });
-                    }
-                }
-                
-                ImGui::SameLine();
-                if (ImGui::Button("Open File...", ImVec2(0, 0))) {
-                    if (!browser_window.window) {
-                        browser_mode = BrowserMode::OpenMedia;
-                        open_browser = true;
-                    }
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Open Project", ImVec2(0, 0))) {
-                    if (!browser_window.window) {
-                        browser_mode = BrowserMode::OpenProject;
-                        open_browser = true;
-                    }
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Save Project", ImVec2(0, 0))) {
-                    if (!browser_window.window) {
-                        browser_mode = BrowserMode::SaveProject;
-                        open_browser = true;
-                    }
                 }
                 
                 ImGui::End();
@@ -3215,33 +3391,58 @@ int main() {
                     ImGuiWindowFlags_AlwaysAutoResize);
 
                 float scale = main_window.scale;
-                if (ImGui::Button("Open File...", ImVec2(160 * scale, 40 * scale))) {
+                if (ImGui::Button("New Empty Project", ImVec2(200 * scale, 40 * scale))) {
+                    player.close();
+                    project_open = true;
+                    project_dirty = true;
+                    project_path.clear();
+                    library_selected = -1;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Open Project", ImVec2(200 * scale, 40 * scale))) {
                     if (!browser_window.window) {
-                        browser_mode = BrowserMode::OpenMedia;
+                        browser_mode = BrowserMode::OpenProject;
                         open_browser = true;
                     }
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("Open Project", ImVec2(160 * scale, 40 * scale))) {
+                if (ImGui::Button("New Project From Video", ImVec2(240 * scale, 40 * scale))) {
                     if (!browser_window.window) {
-                        browser_mode = BrowserMode::OpenProject;
+                        browser_mode = BrowserMode::NewProjectFromVideo;
                         open_browser = true;
                     }
                 }
 
                 ImGui::End();
             }
+            if (show_exit_confirm) {
+                ImGui::EndDisabled();
+                ImDrawList* fg = ImGui::GetForegroundDrawList();
+                ImVec2 p = viewport->Pos;
+                ImVec2 s = viewport->Size;
+                fg->AddRectFilled(p, ImVec2(p.x + s.x, p.y + s.y), IM_COL32(0, 0, 0, 120));
+            }
+
         });
 
         if (open_browser) {
             int bw = (int)(450 * main_window.scale);
             int bh = (int)(550 * main_window.scale);
-            const char* title = "Open File";
+            const char* title = "Select File";
             if (browser_mode == BrowserMode::OpenProject) title = "Open Project";
             if (browser_mode == BrowserMode::SaveProject) title = "Save Project";
             if (browser_mode == BrowserMode::AddLibrary) title = "Add To Library";
+            if (browser_mode == BrowserMode::NewProjectFromVideo) title = "New Project From Video";
+            if (browser_mode == BrowserMode::SaveProject) {
+                bh = (int)(620 * main_window.scale);
+            }
             browser_window = create_window(title, bw, bh, main_window.window);
             browser.refresh();
+        }
+        if (show_exit_confirm && !confirm_window.window) {
+            int cw = (int)(360 * main_window.scale);
+            int ch = (int)(160 * main_window.scale);
+            confirm_window = create_window("Unsaved Changes", cw, ch, main_window.window);
         }
 
         if (browser_window.window) {
@@ -3262,11 +3463,16 @@ int main() {
                 ImGui::Text("Path: %s", browser.current_path.string().c_str());
                 ImGui::Separator();
 
-                float button_area_height = 35 * browser_window.scale;
-                ImVec2 list_size(ImGui::GetContentRegionAvail().x, 
-                                 ImGui::GetContentRegionAvail().y - button_area_height);
+                float button_area_height = 40 * browser_window.scale;
+                float input_height = (browser_mode == BrowserMode::SaveProject) ? (36 * browser_window.scale) : 0.0f;
+                float pad_y = ImGui::GetStyle().ItemSpacing.y * 2.0f;
+                float list_height = ImGui::GetContentRegionAvail().y - button_area_height - input_height - pad_y;
+                if (list_height < 100.0f * browser_window.scale) {
+                    list_height = 100.0f * browser_window.scale;
+                }
                 
-                if (ImGui::BeginListBox("##files", list_size)) {
+                ImGui::BeginChild("##file_list", ImVec2(0, list_height), true);
+                if (ImGui::BeginListBox("##files", ImVec2(-1, -1))) {
                     bool first_is_parent = !browser.entries.empty() && 
                         browser.entries[0].path() != browser.current_path &&
                         browser.current_path.string().starts_with(browser.entries[0].path().string());
@@ -3296,14 +3502,16 @@ int main() {
                                     if (entry.is_directory()) {
                                         browser.navigate_to(entry.path());
                                     } else {
-                                        if (browser_mode == BrowserMode::OpenMedia) {
-                                            selected_file = entry.path().string();
-                                            pending_load = selected_file;
-                                        } else if (browser_mode == BrowserMode::AddLibrary) {
-                                            player.add_source(entry.path().string());
+                                        if (browser_mode == BrowserMode::AddLibrary) {
+                                            if (player.add_source(entry.path().string()) >= 0) {
+                                                project_dirty = true;
+                                            }
+                                        } else if (browser_mode == BrowserMode::NewProjectFromVideo) {
+                                            pending_new_project_media = entry.path().string();
                                         } else if (browser_mode == BrowserMode::OpenProject) {
                                             pending_project_load = entry.path().string();
                                         } else if (browser_mode == BrowserMode::SaveProject) {
+                                            save_filename = entry.path().filename().string();
                                             pending_project_save = entry.path().string();
                                         }
                                         should_close = true;
@@ -3314,36 +3522,56 @@ int main() {
                     }
                     ImGui::EndListBox();
                 }
+                ImGui::EndChild();
+
+                if (browser_mode == BrowserMode::SaveProject) {
+                    ImGui::Text("File name:");
+                    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+                    input_text_string("##save_name", save_filename);
+                }
 
                 ImGui::Spacing();
                 
-                bool can_open = browser.selected_index >= 0 &&
-                               browser.selected_index < (int)browser.entries.size();
+                bool has_selection = browser.selected_index >= 0 &&
+                                    browser.selected_index < (int)browser.entries.size();
+                bool can_open = (browser_mode == BrowserMode::SaveProject) ? true : has_selection;
                 
                 if (!can_open) ImGui::BeginDisabled();
                 if (ImGui::Button(browser_mode == BrowserMode::SaveProject ? "Save" : "Open",
                                   ImVec2(80 * browser_window.scale, 0))) {
                     try {
-                        auto& entry = browser.entries[browser.selected_index];
-                        if (entry.is_directory()) {
-                            if (browser_mode == BrowserMode::SaveProject) {
-                                pending_project_save = (entry.path() / "project.vibecut").string();
-                                should_close = true;
-                            } else {
-                                browser.navigate_to(entry.path());
+                        if (browser_mode == BrowserMode::SaveProject) {
+                            fs::path target_dir = browser.current_path;
+                            if (has_selection) {
+                                auto& entry = browser.entries[browser.selected_index];
+                                if (entry.is_directory()) {
+                                    target_dir = entry.path();
+                                } else {
+                                    target_dir = entry.path().parent_path();
+                                    if (save_filename.empty()) {
+                                        save_filename = entry.path().filename().string();
+                                    }
+                                }
                             }
-                        } else {
-                            if (browser_mode == BrowserMode::OpenMedia) {
-                                selected_file = entry.path().string();
-                                pending_load = selected_file;
-                            } else if (browser_mode == BrowserMode::AddLibrary) {
-                                player.add_source(entry.path().string());
-                            } else if (browser_mode == BrowserMode::OpenProject) {
-                                pending_project_load = entry.path().string();
-                            } else if (browser_mode == BrowserMode::SaveProject) {
-                                pending_project_save = entry.path().string();
-                            }
+                            std::string filename = save_filename.empty() ? "project.vibecut" : save_filename;
+                            pending_project_save = (target_dir / filename).string();
                             should_close = true;
+                        } else if (has_selection) {
+                            auto& entry = browser.entries[browser.selected_index];
+                            if (entry.is_directory()) {
+                                browser.navigate_to(entry.path());
+                            } else {
+                                if (browser_mode == BrowserMode::AddLibrary) {
+                                    if (player.add_source(entry.path().string()) >= 0) {
+                                        project_dirty = true;
+                                    }
+                                } else if (browser_mode == BrowserMode::NewProjectFromVideo) {
+                                    pending_new_project_media = entry.path().string();
+                                } else if (browser_mode == BrowserMode::OpenProject) {
+                                    pending_project_load = entry.path().string();
+                                }
+                                should_close = true;
+                            }
                         }
                     } catch (...) {}
                 }
@@ -3352,6 +3580,9 @@ int main() {
                 ImGui::SameLine();
                 if (ImGui::Button("Cancel", ImVec2(80 * browser_window.scale, 0))) {
                     should_close = true;
+                    if (browser_mode == BrowserMode::SaveProject) {
+                        exit_after_save = false;
+                    }
                 }
 
                 ImGui::End();
@@ -3359,6 +3590,48 @@ int main() {
             
             if (should_close) {
                 destroy_window(browser_window);
+            }
+        }
+        if (confirm_window.window) {
+            bool close_confirm = false;
+            render_window(confirm_window, [&]() {
+                ImGui::SetNextWindowPos(ImVec2(0, 0));
+                ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
+                ImGui::Begin("##ConfirmExit", nullptr,
+                    ImGuiWindowFlags_NoTitleBar |
+                    ImGuiWindowFlags_NoResize |
+                    ImGuiWindowFlags_NoMove |
+                    ImGuiWindowFlags_NoCollapse);
+                
+                ImGui::Text("You have unsaved changes.");
+                ImGui::Separator();
+                float w = ImGui::GetContentRegionAvail().x;
+                if (ImGui::Button("Save and Exit", ImVec2(w, 0))) {
+                    if (!project_path.empty()) {
+                        pending_project_save = project_path;
+                        exit_after_save = true;
+                    } else if (!browser_window.window) {
+                        save_filename = "project.vibecut";
+                        browser_mode = BrowserMode::SaveProject;
+                        open_browser = true;
+                        exit_after_save = true;
+                    }
+                    show_exit_confirm = false;
+                    close_confirm = true;
+                }
+                if (ImGui::Button("Exit Without Saving", ImVec2(w, 0))) {
+                    should_exit = true;
+                    show_exit_confirm = false;
+                    close_confirm = true;
+                }
+                if (ImGui::Button("Cancel", ImVec2(w, 0))) {
+                    show_exit_confirm = false;
+                    close_confirm = true;
+                }
+                ImGui::End();
+            });
+            if (close_confirm) {
+                destroy_window(confirm_window);
             }
         }
     }
