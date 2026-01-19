@@ -685,7 +685,9 @@ struct VideoPlayer {
         if (stream->nb_frames > 0) {
             total_frames = stream->nb_frames;
         } else if (stream->duration != AV_NOPTS_VALUE && fps_q.num && fps_q.den) {
-            total_frames = ts_to_frame(stream->duration);
+            const AVRational frame_tb{fps_q.den, fps_q.num};
+            const auto rounding = static_cast<AVRounding>(AV_ROUND_UP | AV_ROUND_PASS_MINMAX);
+            total_frames = av_rescale_q_rnd(stream->duration, stream_time_base, frame_tb, rounding);
         } else {
             total_frames = (int64_t)(duration * fps + 0.5);
         }
@@ -1496,6 +1498,20 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
     AVFrame* dec_frame = av_frame_alloc();
     
     int64_t output_frame = 0;
+    float last_progress_log = -1.0f;
+    auto update_export_progress = [&]() {
+        if (total_frames <= 0) {
+            progress = 1.0f;
+            return;
+        }
+        float pct = static_cast<float>(output_frame) / static_cast<float>(total_frames);
+        progress = std::min(1.0f, std::max(0.0f, pct));
+        if (progress - last_progress_log >= 0.02f || output_frame % 30 == 0) {
+            std::printf("EXPORT: Progress %.1f%% (%lld/%lld)\n",
+                        progress * 100.0f, (long long)output_frame, (long long)total_frames);
+            last_progress_log = progress;
+        }
+    };
     int packet_num = 0;
     
     // Create RGB→YUV converter (we'll encode from the same RGB data used for PPM)
@@ -1577,9 +1593,46 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
         int64_t frames_needed = clip.frame_count();
         int64_t frames_got = 0;
         bool have_last_rgb = false;
+        auto try_force_last_frame = [&]() -> bool {
+            if (frames_needed <= 0) return false;
+            int64_t target_frame = std::max<int64_t>(clip.start_frame, clip.end_frame - 1);
+            int64_t target_ts = source_state.stream_start_pts + frame_to_ts(target_frame);
+            avcodec_flush_buffers(source_state.dec_ctx);
+            avformat_seek_file(source_state.in_ctx, source_state.video_idx, 0, target_ts, target_ts, AVSEEK_FLAG_BACKWARD);
+            avcodec_flush_buffers(source_state.dec_ctx);
+            while (av_read_frame(source_state.in_ctx, pkt) >= 0) {
+                if (pkt->stream_index != source_state.video_idx) {
+                    av_packet_unref(pkt);
+                    continue;
+                }
+                avcodec_send_packet(source_state.dec_ctx, pkt);
+                av_packet_unref(pkt);
+                while (avcodec_receive_frame(source_state.dec_ctx, dec_frame) >= 0) {
+                    int64_t pts = dec_frame->best_effort_timestamp != AV_NOPTS_VALUE
+                        ? dec_frame->best_effort_timestamp
+                        : dec_frame->pts;
+                    if (pts == AV_NOPTS_VALUE) pts = source_state.stream_start_pts;
+                    pts -= source_state.stream_start_pts;
+                    int64_t src_frame = ts_to_frame(pts);
+                    if (src_frame < clip.start_frame) continue;
+                    if (src_frame > clip.end_frame) break;
+                    std::printf("EXPORT: Fallback decode src=%lld -> encode out=%lld\n",
+                                (long long)src_frame, (long long)output_frame);
+                    AVFrame* rgb = convert_and_save_ppm(dec_frame, "frame_" + std::to_string(output_frame) + "_src" + std::to_string(src_frame));
+                    encode_from_rgb(rgb, output_frame);
+                    have_last_rgb = true;
+                    output_frame++;
+                    frames_got++;
+                    update_export_progress();
+                    return true;
+                }
+            }
+            return false;
+        };
         
+        bool clip_done = false;
         // Decode frames one by one
-        while (av_read_frame(source_state.in_ctx, pkt) >= 0 && frames_got < frames_needed) {
+        while (av_read_frame(source_state.in_ctx, pkt) >= 0 && frames_got < frames_needed && !clip_done) {
             if (pkt->stream_index != source_state.video_idx) {
                 av_packet_unref(pkt);
                 continue;
@@ -1609,6 +1662,7 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
                         std::printf("EXPORT: Frame %lld past clip end, using as last frame\n", (long long)src_frame);
                     } else {
                         std::printf("EXPORT: Frame %lld past clip end, done with clip\n", (long long)src_frame);
+                        clip_done = true;
                         break;
                     }
                 }
@@ -1624,11 +1678,14 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
                 
                 output_frame++;
                 frames_got++;
-                progress = (float)output_frame / total_frames;
+                update_export_progress();
 
                 if (frames_got >= frames_needed) {
                     break;
                 }
+            }
+            if (clip_done) {
+                break;
             }
         }
         
@@ -1652,9 +1709,13 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
             
             output_frame++;
             frames_got++;
+            update_export_progress();
             if (frames_got >= frames_needed) break;
         }
         
+        if (frames_got < frames_needed && !have_last_rgb) {
+            try_force_last_frame();
+        }
         if (frames_got < frames_needed && have_last_rgb) {
             std::printf("EXPORT: Padding %lld frames using last decoded frame\n",
                         (long long)(frames_needed - frames_got));
@@ -1662,7 +1723,7 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
                 encode_from_rgb(source_state.debug_rgb, output_frame);
                 output_frame++;
                 frames_got++;
-                progress = (float)output_frame / total_frames;
+                update_export_progress();
             }
         }
         std::printf("EXPORT: Clip done, got %lld/%lld frames\n", (long long)frames_got, (long long)frames_needed);
@@ -1680,9 +1741,17 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
     }
     
     std::printf("EXPORT: Total: %lld frames encoded, %d packets written\n", (long long)output_frame, packet_num);
+    if (output_frame >= total_frames) {
+        progress = 1.0f;
+    }
+    // UX: ensure the bar reaches the end while finalizing audio/muxing.
+    progress = 1.0f;
+    std::printf("EXPORT: Progress forced to 100%% before audio/mux finalize\n");
 
     // Encode audio after video (timeline PCM -> AAC)
     if (out_audio && audio_enc && audio_swr && !audio_export.timeline_pcm.empty()) {
+        std::printf("EXPORT: Audio encode start (pcm_frames=%lld)\n",
+                    (long long)(audio_export.timeline_pcm.size() / std::max(1, audio_export.channels)));
         AVPacket* audio_pkt = av_packet_alloc();
         AVFrame* audio_frame = av_frame_alloc();
         audio_frame->format = audio_enc->sample_fmt;
@@ -1744,6 +1813,8 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
         }
         av_frame_free(&audio_frame);
         av_packet_free(&audio_pkt);
+        std::printf("EXPORT: Audio encode done (packets=%d, sends=%d, converts=%d)\n",
+                    audio_packet_count, audio_send_count, audio_convert_count);
     }
     
     av_write_trailer(out_ctx);
