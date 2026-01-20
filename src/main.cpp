@@ -2246,7 +2246,7 @@ struct TrimTimelineState {
 };
 
 struct ClipsTimelineState {
-    int dragging = 0;       // 0=none, 1=left handle, 2=right handle, 3=playhead, 4=panning, 5=clip drag
+    int dragging = 0;       // 0=none, 1=left handle, 2=right handle, 3=playhead, 4=panning, 5=clip drag, 6=scrollbar drag
     int dragging_clip = -1; // Which clip's handle we're dragging
     int pending_clip = -1;  // Clip clicked (waiting to see if it becomes a drag)
     int selected_clip = -1;
@@ -2906,7 +2906,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
             
             // Thumb color
             ImU32 thumb_color = IM_COL32(70, 70, 80, 255);
-            if (state.dragging == 5) {
+            if (state.dragging == 6) {
                 thumb_color = IM_COL32(110, 110, 130, 255);
             } else if (thumb_hovered) {
                 thumb_color = IM_COL32(90, 90, 105, 255);
@@ -2917,7 +2917,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
             // Handle scrollbar click/drag
             if (mouse_over_scrollbar && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && state.dragging == 0) {
                 if (thumb_hovered) {
-                    state.dragging = 5;
+                    state.dragging = 6;
                     state.pan_start_x = mouse.x;
                     state.pan_start_scroll = state.scroll;
                 } else {
@@ -2941,7 +2941,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
     }
     
     // Handle scrollbar dragging (continue even when mouse leaves scrollbar area)
-    if (state.dragging == 5) {
+    if (state.dragging == 6) {
         if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
             float delta_x = mouse.x - state.pan_start_x;
             float delta_scroll = (delta_x / size.x) * base_duration;
