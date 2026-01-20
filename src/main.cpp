@@ -2249,6 +2249,7 @@ struct ClipsTimelineState {
     int dragging = 0;       // 0=none, 1=left handle, 2=right handle, 3=playhead, 4=panning, 5=clip drag
     int dragging_clip = -1; // Which clip's handle we're dragging
     int pending_clip = -1;  // Clip clicked (waiting to see if it becomes a drag)
+    int selected_clip = -1;
     bool pending_click = false;
     float pending_click_x = 0.0f;
     ImVec2 pending_mouse_start{0.0f, 0.0f};
@@ -2262,6 +2263,10 @@ struct ClipsTimelineState {
     float scroll = 0.0f;    // Scroll position (0.0 to 1.0, normalized)
     float pan_start_x = 0.0f; // For panning
     float pan_start_scroll = 0.0f;
+    float lead_in_time = 0.0f; // Timeline offset before first clip (seconds)
+    float lead_in_start = 0.0f;
+    float trim_mouse_start_x = 0.0f;
+    int64_t trim_start_frame = 0;
 };
 
 // Modern Final Cut-style magnetic timeline widget with zoom/scroll
@@ -2291,10 +2296,11 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
     for (const auto& c : clips) total_timeline_frames += c.frame_count();
     float total_duration = frame_to_time(total_timeline_frames);
     if (total_duration < 0.01f) total_duration = source_duration;
+    float display_duration = total_duration + state.lead_in_time;
     
     // Zoom and scroll calculations - based on SOURCE duration for consistent pixel scaling
     // This means 1 second of video = same pixel width regardless of trimming
-    float base_duration = source_duration;
+    float base_duration = std::max(source_duration, display_duration);
     
     // Dynamic max zoom: at max zoom, one frame should be ~50 pixels wide
     // visible_duration = base_duration / zoom, and we want visible_duration = frame_duration * (size.x / 50)
@@ -2307,15 +2313,19 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
     state.scroll = std::clamp(state.scroll, 0.0f, max_scroll);
     float view_start = state.scroll;
     float view_end = state.scroll + visible_duration;
+    float view_start_timeline = view_start - state.lead_in_time;
+    float view_end_timeline = view_end - state.lead_in_time;
     
     // Helper to convert timeline time to screen X
     auto time_to_x = [&](float t) -> float {
-        return bb_min.x + ((t - view_start) / visible_duration) * size.x;
+        float display_t = t + state.lead_in_time;
+        return bb_min.x + ((display_t - view_start) / visible_duration) * size.x;
     };
     
     // Helper to convert screen X to timeline time
     auto x_to_time = [&](float x) -> float {
-        return view_start + ((x - bb_min.x) / size.x) * visible_duration;
+        float display_t = view_start + ((x - bb_min.x) / size.x) * visible_duration;
+        return display_t - state.lead_in_time;
     };
     
     // Background - dark with subtle inset look
@@ -2359,8 +2369,8 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         const Clip& clip = clips[i];
         float clip_dur_time = frame_to_time(clip.frame_count());
         
-        // Skip clips outside visible range
-        if (timeline_pos + clip_dur_time < view_start || timeline_pos > view_end) {
+        // Skip clips outside visible range (convert view to timeline space)
+        if (timeline_pos + clip_dur_time < view_start_timeline || timeline_pos > view_end_timeline) {
             timeline_pos += clip_dur_time;
             continue;
         }
@@ -2406,6 +2416,10 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                                      right_handle_col, rounding, ImDrawFlags_RoundCornersRight);
         }
         
+        if (state.selected_clip == i) {
+            draw_list->AddRect(clip_min, clip_max, IM_COL32(255, 215, 0, 255), rounding, 0, 2.0f);
+        }
+        
         // Clip duration text (if clip is wide enough)
         float clip_width = clip_max.x - clip_min.x;
         if (clip_width > 60) {
@@ -2433,7 +2447,8 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
     
     // Playhead - red line with triangular head (only if visible)
     float curr_x = time_to_x(playhead_timeline_pos);
-    bool playhead_visible = (playhead_timeline_pos >= view_start - 0.1f && playhead_timeline_pos <= view_end + 0.1f);
+    bool playhead_visible = (playhead_timeline_pos >= view_start_timeline - 0.1f &&
+                             playhead_timeline_pos <= view_end_timeline + 0.1f);
     
     if (playhead_visible) {
         curr_x = std::clamp(curr_x, bb_min.x, bb_max.x);
@@ -2639,6 +2654,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         state.pending_click = false;
         state.pending_grab_offset_time = 0.0f;
         state.drag_start_mouse_time = 0.0f;
+        bool clicked_clip = false;
         
         // Check each clip's handles or body
         for (int i = 0; i < (int)clips.size(); i++) {
@@ -2650,22 +2666,36 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
             bool on_body = (click_x > start_x + handle_w + 6 && click_x < end_x - handle_w - 6);
             
             if (on_left && on_right) {
+                clicked_clip = true;
+                state.selected_clip = i;
                 if (std::abs(click_x - start_x) < std::abs(click_x - end_x)) {
                     state.dragging = 1;
                 } else {
                     state.dragging = 2;
                 }
                 state.dragging_clip = i;
+                state.trim_mouse_start_x = mouse.x;
+                state.lead_in_start = state.lead_in_time;
+                state.trim_start_frame = clips[i].start_frame;
                 break;
             } else if (on_left) {
+                clicked_clip = true;
+                state.selected_clip = i;
                 state.dragging = 1;
                 state.dragging_clip = i;
+                state.trim_mouse_start_x = mouse.x;
+                state.lead_in_start = state.lead_in_time;
+                state.trim_start_frame = clips[i].start_frame;
                 break;
             } else if (on_right) {
+                clicked_clip = true;
+                state.selected_clip = i;
                 state.dragging = 2;
                 state.dragging_clip = i;
                 break;
             } else if (on_body && !ImGui::GetIO().KeyAlt) {
+                clicked_clip = true;
+                state.selected_clip = i;
                 state.pending_clip = i;
                 state.pending_click = true;
                 state.pending_click_x = click_x;
@@ -2695,6 +2725,9 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
             *current_timeline_frame = timeline_frame;
             *current_source_frame = timeline_frame_to_source_frame(timeline_frame, current_source_id);
             changed = true;
+            if (!clicked_clip) {
+                state.selected_clip = -1;
+            }
         }
     }
     
@@ -2747,6 +2780,17 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
             if (insert_index != old_index) {
                 clips.erase(clips.begin() + old_index);
                 clips.insert(clips.begin() + insert_index, dragged);
+                if (state.selected_clip == old_index) {
+                    state.selected_clip = insert_index;
+                } else if (old_index < insert_index) {
+                    if (state.selected_clip > old_index && state.selected_clip <= insert_index) {
+                        state.selected_clip--;
+                    }
+                } else {
+                    if (state.selected_clip >= insert_index && state.selected_clip < old_index) {
+                        state.selected_clip++;
+                    }
+                }
                 state.dragging_clip = insert_index;
                 changed = true;
                 state.clips_modified = true;
@@ -2759,24 +2803,21 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
             
             if (state.dragging == 1) {
                 // Left handle - adjust start_frame (trim beginning)
-                float delta_x = mouse.x - cp.start_x;
+                float delta_x = mouse.x - state.trim_mouse_start_x;
                 float delta_time = (delta_x / size.x) * visible_duration;
                 int64_t delta_frames = time_to_frame_local(std::abs(delta_time));
                 if (delta_time < 0) delta_frames = -delta_frames;
                 
-                int64_t old_start = clip.start_frame;
-                int64_t new_start = clip.start_frame + delta_frames;
-                
                 int64_t min_start = 0;
-                if (clips_in_source_order && state.dragging_clip > 0) {
-                    min_start = clips[state.dragging_clip - 1].end_frame;
-                }
                 int64_t max_start = clip.end_frame - 1;
                 if (min_start > max_start) {
                     min_start = max_start;
                 }
+                int64_t new_start = state.trim_start_frame + delta_frames;
                 new_start = std::clamp(new_start, min_start, max_start);
                 clip.start_frame = new_start;
+                
+                state.lead_in_time = std::max(0.0f, state.lead_in_start + delta_time);
                 
                 // If playhead was at the old start, follow the handle
                 int64_t max_timeline = 0;
@@ -3334,6 +3375,28 @@ int main() {
                 // 'W' key to insert selected library clip at playhead
                 if (ImGui::IsKeyPressed(ImGuiKey_W) && library_selected >= 0) {
                     if (player.insert_clip_at_timeline(library_selected, player.current_timeline_frame)) {
+                        player.audio_dirty = true;
+                        project_dirty = true;
+                    }
+                }
+                
+                // Backspace to delete selected timeline clip
+                if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Backspace)) {
+                    int remove_idx = timeline_state.selected_clip;
+                    if (remove_idx >= 0 && remove_idx < (int)player.clips.size()) {
+                        player.clips.erase(player.clips.begin() + remove_idx);
+                        if (player.clips.empty()) {
+                            timeline_state.selected_clip = -1;
+                            player.current_timeline_frame = 0;
+                            player.pause();
+                        } else {
+                            timeline_state.selected_clip = std::clamp(remove_idx, 0, (int)player.clips.size() - 1);
+                            int64_t max_timeline = player.total_timeline_frames();
+                            player.current_timeline_frame = std::clamp<int64_t>(player.current_timeline_frame, 0, max_timeline);
+                            player.pause();
+                            player.seek_to_timeline_frame(player.current_timeline_frame);
+                        }
+                        timeline_state.clips_modified = true;
                         player.audio_dirty = true;
                         project_dirty = true;
                     }
