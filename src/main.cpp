@@ -2267,6 +2267,7 @@ struct ClipsTimelineState {
     float lead_in_start = 0.0f;
     float trim_mouse_start_x = 0.0f;
     int64_t trim_start_frame = 0;
+    bool trim_playhead_in_clip = false;
 };
 
 // Modern Final Cut-style magnetic timeline widget with zoom/scroll
@@ -2677,6 +2678,14 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 state.trim_mouse_start_x = mouse.x;
                 state.lead_in_start = state.lead_in_time;
                 state.trim_start_frame = clips[i].start_frame;
+                {
+                    int64_t playhead = *current_timeline_frame;
+                    int64_t clip_timeline_start = clip_positions[i].start_frame;
+                    int64_t clip_timeline_end = clip_timeline_start + clips[i].frame_count();
+                    state.trim_playhead_in_clip =
+                        (playhead >= clip_timeline_start && playhead <= clip_timeline_end);
+                    
+                }
                 break;
             } else if (on_left) {
                 clicked_clip = true;
@@ -2686,6 +2695,14 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 state.trim_mouse_start_x = mouse.x;
                 state.lead_in_start = state.lead_in_time;
                 state.trim_start_frame = clips[i].start_frame;
+                {
+                    int64_t playhead = *current_timeline_frame;
+                    int64_t clip_timeline_start = clip_positions[i].start_frame;
+                    int64_t clip_timeline_end = clip_timeline_start + clips[i].frame_count();
+                    state.trim_playhead_in_clip =
+                        (playhead >= clip_timeline_start && playhead <= clip_timeline_end);
+                    
+                }
                 break;
             } else if (on_right) {
                 clicked_clip = true;
@@ -2808,6 +2825,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 int64_t delta_frames = time_to_frame_local(std::abs(delta_time));
                 if (delta_time < 0) delta_frames = -delta_frames;
                 
+                int64_t clip_timeline_start = cp.start_frame;
                 int64_t min_start = 0;
                 int64_t max_start = clip.end_frame - 1;
                 if (min_start > max_start) {
@@ -2818,6 +2836,16 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 clip.start_frame = new_start;
                 
                 state.lead_in_time = std::max(0.0f, state.lead_in_start + delta_time);
+                
+                if (state.trim_playhead_in_clip) {
+                    float playhead_time = frame_to_time(*current_timeline_frame);
+                    float clip_start_time = frame_to_time(clip_timeline_start);
+                    float clip_end_time = clip_start_time + frame_to_time(clip.frame_count());
+                    if (playhead_time > clip_end_time) {
+                        *current_timeline_frame = time_to_frame_local(clip_end_time);
+                        *current_source_frame = timeline_frame_to_source_frame(*current_timeline_frame, current_source_id);
+                    }
+                }
                 
                 // If playhead was at the old start, follow the handle
                 int64_t max_timeline = 0;
@@ -2856,8 +2884,9 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 state.clips_modified = true;
             }
             
-            // After resizing, check if current_frame is now outside all clips
-            // If so, snap it to the nearest valid position
+            // After resizing, ensure playhead stays within timeline bounds.
+            // When left-trimming with a preserved source frame, keep the
+            // source mapping we already set above.
             if (!clips.empty()) {
                 int64_t max_timeline = 0;
                 for (const auto& c : clips) max_timeline += c.frame_count();
