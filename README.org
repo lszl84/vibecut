@@ -53,14 +53,14 @@ git submodule update --init
 * Time Tracking
 
 #+BEGIN: clocktable :maxlevel nil :scope file :block nil
-#+CAPTION: Clock summary at [2026-01-20 Tue 20:34]
+#+CAPTION: Clock summary at [2026-01-22 Thu 11:11]
 | Headline                     | Time  |       |
 |------------------------------+-------+-------|
-| *Total time*                   | *15:10* |       |
+| *Total time*                   | *15:29* |       |
 |------------------------------+-------+-------|
-| Tasks                        | 15:10 |       |
+| Tasks                        | 15:29 |       |
 | \_  Initial Setup / Planning |       |  0:36 |
-| \_  Vibe coding              |       | 13:41 |
+| \_  Vibe coding              |       | 14:00 |
 | \_  Manual coding            |       |  0:53 |
 #+END:
 
@@ -76,6 +76,7 @@ CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
 :END:
 ** Vibe coding
 :LOGBOOK:
+CLOCK: [2026-01-22 Thu 10:52]--[2026-01-22 Thu 11:11] =>  0:19
 CLOCK: [2026-01-20 Tue 19:26]--[2026-01-20 Tue 20:34] =>  1:08
 CLOCK: [2026-01-19 Mon 15:43]--[2026-01-19 Mon 16:19] =>  0:36
 CLOCK: [2026-01-18 Sun 12:33]--[2026-01-18 Sun 13:45] =>  1:12
@@ -104,6 +105,11 @@ Adding/changing code by hand, debugging, etc.
 * Devlog
 
 Live Streams: https://www.youtube.com/@lukeatdevmindscape/streams
+
+** Day 15
+Codex is still struggling with basic stuff. Moreover, my X session
+restarted randomly during the vibe coding stream, so looks like just
+15 minutes of banging my head against the wall today :)
 
 ** Day 14
 I think that the idea of "jagged frontier" might be true. AI Agents

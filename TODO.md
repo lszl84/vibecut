@@ -4,7 +4,7 @@
 - when changing the clip size by drawing the left or right side, the side that is being moved should move with the mouse,
 - when user clicks on a clip in the timeline, this clip should be selected, indicated by the yellow border
 - user should be able to delete the selected clip with backspace
-- left-trim playhead should not move unless the clip end passes it (bug)
+- left-trim playhead should not move unless the clip start passes it (bug)
 
 # Connected Clips
 - the timeline's size should be much larger (vertically) to allow connecting clips to the main timeline
