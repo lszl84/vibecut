@@ -13,6 +13,7 @@
 - ~~the pixel height of connected clips should be the same as the clips in the main timeline~~
 - connected clips can be placed above or below the main timeline by the user (TODO: UI for changing lane)
 - ~~export with connected clips compositing~~
+- fix connected clip jumping behavior when trimming main clips
 
 # Undo Stack
 - implement infinite undo stack for all the operations that are saved in the project

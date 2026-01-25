@@ -3205,8 +3205,50 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
             
             int old_index = state.dragging_clip;
             if (insert_index != old_index) {
+                // Record old clip timeline starts for connected clip adjustment
+                std::vector<int64_t> old_starts(clips.size());
+                int64_t t = 0;
+                for (size_t i = 0; i < clips.size(); i++) {
+                    old_starts[i] = t;
+                    t += clips[i].frame_count();
+                }
+                int64_t dragged_old_start = old_starts[old_index];
+                int64_t dragged_frames = dragged.frame_count();
+                
                 clips.erase(clips.begin() + old_index);
                 clips.insert(clips.begin() + insert_index, dragged);
+                
+                // Calculate new clip timeline starts
+                std::vector<int64_t> new_starts(clips.size());
+                t = 0;
+                for (size_t i = 0; i < clips.size(); i++) {
+                    new_starts[i] = t;
+                    t += clips[i].frame_count();
+                }
+                int64_t dragged_new_start = new_starts[insert_index];
+                
+                // Update connected clips: adjust connection_frame based on timeline shift
+                for (auto& cc : connected_clips) {
+                    int64_t cf = cc.connection_frame;
+                    // If connected to the dragged clip, move with it
+                    if (cf >= dragged_old_start && cf < dragged_old_start + dragged_frames) {
+                        int64_t offset_in_clip = cf - dragged_old_start;
+                        cc.connection_frame = dragged_new_start + offset_in_clip;
+                    }
+                    // If connected to a clip that shifted due to the move
+                    else if (old_index < insert_index) {
+                        // Dragged clip moved right: clips between old and new shifted left
+                        if (cf >= dragged_old_start + dragged_frames && cf < new_starts[insert_index] + dragged_frames) {
+                            cc.connection_frame -= dragged_frames;
+                        }
+                    } else {
+                        // Dragged clip moved left: clips between new and old shifted right
+                        if (cf >= dragged_new_start + dragged_frames && cf < dragged_old_start + dragged_frames) {
+                            cc.connection_frame += dragged_frames;
+                        }
+                    }
+                }
+                
                 if (state.selected_clip == old_index) {
                     state.selected_clip = insert_index;
                 } else if (old_index < insert_index) {
@@ -3273,6 +3315,16 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                     }
                     // If playhead is BEFORE the clip, no adjustment needed (new_timeline = orig_timeline)
                     
+                    // Update connected clips: shift those after this clip by the trim delta
+                    // actual_delta is positive when clip grows, negative when shrinks
+                    // Connected clips AFTER this clip's end should shift by -actual_delta
+                    int64_t clip_end_timeline = clip_timeline_start + clip.frame_count();
+                    for (auto& cc : connected_clips) {
+                        if (cc.connection_frame >= clip_end_timeline) {
+                            cc.connection_frame -= actual_delta;
+                        }
+                    }
+                    
                     *current_timeline_frame = new_timeline;
                     changed = true;
                     state.clips_modified = true;
@@ -3296,7 +3348,21 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                     max_end = min_end;
                 }
                 new_end = std::clamp(new_end, min_end, max_end);
+                
+                // Calculate the actual frame change
+                int64_t right_trim_delta = new_end - clip.end_frame;
+                int64_t old_clip_end_timeline = cp.start_frame + clip.frame_count();
+                
                 clip.end_frame = new_end;
+                
+                // Update connected clips: shift those after this clip's end by the delta
+                if (right_trim_delta != 0) {
+                    for (auto& cc : connected_clips) {
+                        if (cc.connection_frame >= old_clip_end_timeline) {
+                            cc.connection_frame += right_trim_delta;
+                        }
+                    }
+                }
                 
                 // If playhead was at the old last frame, follow the handle
                 int64_t max_timeline = 0;
@@ -3922,7 +3988,22 @@ int main() {
                         timeline_state.clips_modified = true;
                         project_dirty = true;
                     } else if (remove_idx >= 0 && remove_idx < (int)player.clips.size()) {
+                        // Calculate deleted clip's timeline position before removal
+                        int64_t deleted_timeline_start = 0;
+                        for (int i = 0; i < remove_idx; i++) {
+                            deleted_timeline_start += player.clips[i].frame_count();
+                        }
+                        int64_t deleted_frames = player.clips[remove_idx].frame_count();
+                        
                         player.clips.erase(player.clips.begin() + remove_idx);
+                        
+                        // Shift connected clips that were after the deleted clip
+                        for (auto& cc : player.connected_clips) {
+                            if (cc.connection_frame >= deleted_timeline_start + deleted_frames) {
+                                cc.connection_frame -= deleted_frames;
+                            }
+                        }
+                        
                         if (player.clips.empty()) {
                             timeline_state.selected_clip = -1;
                             player.current_timeline_frame = 0;
