@@ -53,14 +53,14 @@ git submodule update --init
 * Time Tracking
 
 #+BEGIN: clocktable :maxlevel nil :scope file :block nil
-#+CAPTION: Clock summary at [2026-01-22 Thu 11:11]
+#+CAPTION: Clock summary at [2026-01-25 Sun 15:05]
 | Headline                     | Time  |       |
 |------------------------------+-------+-------|
-| *Total time*                   | *15:29* |       |
+| *Total time*                   | *17:10* |       |
 |------------------------------+-------+-------|
-| Tasks                        | 15:29 |       |
+| Tasks                        | 17:10 |       |
 | \_  Initial Setup / Planning |       |  0:36 |
-| \_  Vibe coding              |       | 14:00 |
+| \_  Vibe coding              |       | 15:41 |
 | \_  Manual coding            |       |  0:53 |
 #+END:
 
@@ -76,6 +76,7 @@ CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
 :END:
 ** Vibe coding
 :LOGBOOK:
+CLOCK: [2026-01-25 Sun 13:23]--[2026-01-25 Sun 15:04] =>  1:41
 CLOCK: [2026-01-22 Thu 10:52]--[2026-01-22 Thu 11:11] =>  0:19
 CLOCK: [2026-01-20 Tue 19:26]--[2026-01-20 Tue 20:34] =>  1:08
 CLOCK: [2026-01-19 Mon 15:43]--[2026-01-19 Mon 16:19] =>  0:36
@@ -105,6 +106,14 @@ Adding/changing code by hand, debugging, etc.
 * Devlog
 
 Live Streams: https://www.youtube.com/@lukeatdevmindscape/streams
+
+** Day 16
+Another classic AI Agent experience: one hour of frustrating back and
+forth with the agent to fix the simplest thing, then a random fix that
+magically worked.
+
+After that just 20 minutes or so to implement a huge feature with
+almost no bugs ¯\_(ツ)_/¯
 
 ** Day 15
 Codex is still struggling with basic stuff. Moreover, my X session
