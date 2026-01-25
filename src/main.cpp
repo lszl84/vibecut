@@ -2270,6 +2270,7 @@ struct ClipsTimelineState {
     bool trim_playhead_in_clip = false;
     int64_t trim_playhead_source_frame = -1;
     int trim_playhead_source_id = -1;
+    int64_t trim_playhead_timeline = -1;
 };
 
 // Modern Final Cut-style magnetic timeline widget with zoom/scroll
@@ -2721,6 +2722,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                         (playhead >= clip_timeline_start && playhead <= clip_timeline_end);
                     state.trim_playhead_source_frame = *current_source_frame;
                     state.trim_playhead_source_id = *current_source_id;
+                    state.trim_playhead_timeline = playhead;
                 }
                 break;
             } else if (on_right) {
@@ -2843,7 +2845,6 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 float delta_time = (delta_x / size.x) * visible_duration;
                 int64_t delta_frames = time_to_frame_local(std::abs(delta_time));
                 if (delta_time < 0) delta_frames = -delta_frames;
-                
                 int64_t clip_timeline_start = cp.start_frame;
                 int64_t min_start = 0;
                 int64_t max_start = clip.end_frame - 1;
@@ -2851,31 +2852,39 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 int64_t new_start = state.trim_start_frame + delta_frames;
                 new_start = std::clamp(new_start, min_start, max_start);
                 clip.start_frame = new_start;
-                
                 state.lead_in_time = std::max(0.0f, state.lead_in_start + delta_time);
                 
-                int64_t new_clip_end_timeline = clip_timeline_start + clip.frame_count();
-                bool clip_start_passed_playhead = state.trim_playhead_in_clip
-                    && state.trim_playhead_source_id == clip.source_id
-                    && new_start > state.trim_playhead_source_frame;
-                bool playhead_past_new_clip_end = state.trim_playhead_in_clip
-                    && *current_timeline_frame > new_clip_end_timeline;
-                
-                if (clip_start_passed_playhead) {
-                    *current_timeline_frame = clip_timeline_start;
-                    *current_source_frame = new_start;
-                    if (current_source_id) *current_source_id = clip.source_id;
-                } else if (playhead_past_new_clip_end) {
-                    int64_t last_frame = std::max<int64_t>(0, new_clip_end_timeline - 1);
-                    *current_timeline_frame = last_frame;
-                    *current_source_frame = timeline_frame_to_source_frame(*current_timeline_frame, current_source_id);
-                } else {
-                    *current_source_frame = state.trim_playhead_source_frame;
-                    if (current_source_id) *current_source_id = state.trim_playhead_source_id;
-                    *current_timeline_frame = source_frame_to_timeline_frame(state.trim_playhead_source_id, state.trim_playhead_source_frame);
+                if (delta_frames != 0) {
+                    int64_t orig_timeline = state.trim_playhead_timeline;
+                    int64_t new_timeline = orig_timeline;
+                    
+                    if (state.trim_playhead_in_clip) {
+                        int64_t orig_src = state.trim_playhead_source_frame;
+                        int orig_sid = state.trim_playhead_source_id;
+                        
+                        // Playhead is in the clip being trimmed
+                        bool clip_start_passed = orig_sid == clip.source_id
+                            && new_start > orig_src;
+                        
+                        if (clip_start_passed) {
+                            // Playhead got trimmed past - move to new clip start
+                            new_timeline = clip_timeline_start;
+                        } else {
+                            // Preserve source frame - recalculate timeline within this clip
+                            int64_t offset_in_clip = orig_src - new_start;
+                            new_timeline = clip_timeline_start + offset_in_clip;
+                        }
+                    } else if (orig_timeline > clip_timeline_start) {
+                        // Playhead is AFTER the clip being trimmed
+                        // Calculate from ORIGINAL timeline, subtracting total delta
+                        new_timeline = orig_timeline - delta_frames;
+                    }
+                    // If playhead is BEFORE the clip, no adjustment needed (new_timeline = orig_timeline)
+                    
+                    *current_timeline_frame = new_timeline;
+                    changed = true;
+                    state.clips_modified = true;
                 }
-                changed = true;
-                state.clips_modified = true;
             } else if (state.dragging == 2) {
                 // Right handle - adjust end_frame (trim end)
                 float delta_x = mouse.x - cp.end_x;
@@ -3176,6 +3185,8 @@ int main() {
                 project_path = pending_project_load;
                 project_open = true;
                 project_dirty = false;
+                timeline_state.trim_playhead_source_frame = -1;
+                timeline_state.trim_playhead_source_id = -1;
                 if (!player.sources.empty()) {
                     library_selected = 0;
                 }
