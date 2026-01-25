@@ -2852,7 +2852,10 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 int64_t new_start = state.trim_start_frame + delta_frames;
                 new_start = std::clamp(new_start, min_start, max_start);
                 clip.start_frame = new_start;
-                state.lead_in_time = std::max(0.0f, state.lead_in_start + delta_time);
+                // Adjust lead_in based on actual frame change (not floating point delta_time)
+                // to avoid jitter from float/int mismatch
+                int64_t actual_delta = new_start - state.trim_start_frame;
+                state.lead_in_time = std::max(0.0f, state.lead_in_start + frame_to_time(actual_delta));
                 
                 if (delta_frames != 0) {
                     int64_t orig_timeline = state.trim_playhead_timeline;
