@@ -2268,6 +2268,8 @@ struct ClipsTimelineState {
     float trim_mouse_start_x = 0.0f;
     int64_t trim_start_frame = 0;
     bool trim_playhead_in_clip = false;
+    int64_t trim_playhead_source_frame = -1;
+    int trim_playhead_source_id = -1;
 };
 
 // Modern Final Cut-style magnetic timeline widget with zoom/scroll
@@ -2623,6 +2625,21 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         return clips.back().end_frame;
     };
     
+    auto source_frame_to_timeline_frame = [&](int source_id, int64_t source_frame) -> int64_t {
+        if (clips.empty()) return 0;
+        int64_t t = 0;
+        for (size_t i = 0; i < clips.size(); i++) {
+            const auto& c = clips[i];
+            if (c.source_id != source_id) { t += c.frame_count(); continue; }
+            if (source_frame >= c.start_frame && source_frame < c.end_frame)
+                return t + (source_frame - c.start_frame);
+            if (i == clips.size() - 1 && source_frame == c.end_frame)
+                return t + c.frame_count();
+            t += c.frame_count();
+        }
+        return std::min(t, total_timeline_frames);
+    };
+    
     // Hover playhead (temporary) - follows mouse, does not move real playhead
     if (mouse_in_timeline && !mouse_over_scrollbar) {
         float hover_time = x_to_time(mouse.x);
@@ -2684,7 +2701,8 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                     int64_t clip_timeline_end = clip_timeline_start + clips[i].frame_count();
                     state.trim_playhead_in_clip =
                         (playhead >= clip_timeline_start && playhead <= clip_timeline_end);
-                    
+                    state.trim_playhead_source_frame = *current_source_frame;
+                    state.trim_playhead_source_id = *current_source_id;
                 }
                 break;
             } else if (on_left) {
@@ -2701,7 +2719,8 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                     int64_t clip_timeline_end = clip_timeline_start + clips[i].frame_count();
                     state.trim_playhead_in_clip =
                         (playhead >= clip_timeline_start && playhead <= clip_timeline_end);
-                    
+                    state.trim_playhead_source_frame = *current_source_frame;
+                    state.trim_playhead_source_id = *current_source_id;
                 }
                 break;
             } else if (on_right) {
@@ -2828,30 +2847,33 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 int64_t clip_timeline_start = cp.start_frame;
                 int64_t min_start = 0;
                 int64_t max_start = clip.end_frame - 1;
-                if (min_start > max_start) {
-                    min_start = max_start;
-                }
+                if (min_start > max_start) min_start = max_start;
                 int64_t new_start = state.trim_start_frame + delta_frames;
                 new_start = std::clamp(new_start, min_start, max_start);
                 clip.start_frame = new_start;
                 
                 state.lead_in_time = std::max(0.0f, state.lead_in_start + delta_time);
                 
-                if (state.trim_playhead_in_clip) {
-                    float playhead_time = frame_to_time(*current_timeline_frame);
-                    float clip_start_time = frame_to_time(clip_timeline_start);
-                    float clip_end_time = clip_start_time + frame_to_time(clip.frame_count());
-                    if (playhead_time > clip_end_time) {
-                        *current_timeline_frame = time_to_frame_local(clip_end_time);
-                        *current_source_frame = timeline_frame_to_source_frame(*current_timeline_frame, current_source_id);
-                    }
-                }
+                int64_t new_clip_end_timeline = clip_timeline_start + clip.frame_count();
+                bool clip_start_passed_playhead = state.trim_playhead_in_clip
+                    && state.trim_playhead_source_id == clip.source_id
+                    && new_start > state.trim_playhead_source_frame;
+                bool playhead_past_new_clip_end = state.trim_playhead_in_clip
+                    && *current_timeline_frame > new_clip_end_timeline;
                 
-                // If playhead was at the old start, follow the handle
-                int64_t max_timeline = 0;
-                for (const auto& c : clips) max_timeline += c.frame_count();
-                *current_timeline_frame = std::clamp(*current_timeline_frame, (int64_t)0, max_timeline);
-                *current_source_frame = timeline_frame_to_source_frame(*current_timeline_frame, current_source_id);
+                if (clip_start_passed_playhead) {
+                    *current_timeline_frame = clip_timeline_start;
+                    *current_source_frame = new_start;
+                    if (current_source_id) *current_source_id = clip.source_id;
+                } else if (playhead_past_new_clip_end) {
+                    int64_t last_frame = std::max<int64_t>(0, new_clip_end_timeline - 1);
+                    *current_timeline_frame = last_frame;
+                    *current_source_frame = timeline_frame_to_source_frame(*current_timeline_frame, current_source_id);
+                } else {
+                    *current_source_frame = state.trim_playhead_source_frame;
+                    if (current_source_id) *current_source_id = state.trim_playhead_source_id;
+                    *current_timeline_frame = source_frame_to_timeline_frame(state.trim_playhead_source_id, state.trim_playhead_source_frame);
+                }
                 changed = true;
                 state.clips_modified = true;
             } else if (state.dragging == 2) {
@@ -2885,9 +2907,8 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
             }
             
             // After resizing, ensure playhead stays within timeline bounds.
-            // When left-trimming with a preserved source frame, keep the
-            // source mapping we already set above.
-            if (!clips.empty()) {
+            // Skip for left-trim: playhead is managed there (move only when clip start passes it).
+            if (!clips.empty() && state.dragging != 1) {
                 int64_t max_timeline = 0;
                 for (const auto& c : clips) max_timeline += c.frame_count();
                 *current_timeline_frame = std::clamp(*current_timeline_frame, (int64_t)0, max_timeline);
