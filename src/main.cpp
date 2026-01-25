@@ -62,6 +62,19 @@ struct Clip {
     int64_t frame_count() const { return end_frame - start_frame; }
 };
 
+// Connected clip - overlays on top of (or below) the main timeline
+// Connects at a specific timeline frame, can be positioned in lanes above/below
+struct ConnectedClip {
+    int source_id = 0;
+    int64_t start_frame;      // First SOURCE frame included
+    int64_t end_frame;        // First SOURCE frame NOT included
+    int64_t connection_frame; // Timeline frame where this clip connects (its start)
+    int lane = 1;             // Positive = above main timeline, negative = below
+    int color_id = 0;
+    
+    int64_t frame_count() const { return end_frame - start_frame; }
+};
+
 struct SourceInfo {
     std::string path;
     int64_t total_frames = 0;
@@ -113,7 +126,9 @@ struct VideoPlayer {
     
     
     std::vector<Clip> clips;  // Timeline clips (frame-based)
+    std::vector<ConnectedClip> connected_clips;  // Overlay clips above/below timeline
     int active_clip = 0;      // Currently selected/playing clip
+    int next_connected_clip_color_id = 0;
     
     std::string source_path;
     std::vector<SourceInfo> sources;
@@ -842,12 +857,47 @@ struct VideoPlayer {
         seek_to_frame(time_to_frame(time));
     }
     
+    // Find topmost connected clip covering a timeline frame (highest lane takes priority)
+    // Returns index into connected_clips, or -1 if none
+    int connected_clip_at_timeline_frame(int64_t timeline_frame) const {
+        int best_idx = -1;
+        int best_lane = INT_MIN;
+        for (int i = 0; i < (int)connected_clips.size(); i++) {
+            const auto& cc = connected_clips[i];
+            int64_t cc_end = cc.connection_frame + cc.frame_count();
+            if (timeline_frame >= cc.connection_frame && timeline_frame < cc_end) {
+                // For clips above (positive lane), higher is better
+                // For clips below (negative lane), they don't normally play (future audio use)
+                if (cc.lane > 0 && cc.lane > best_lane) {
+                    best_lane = cc.lane;
+                    best_idx = i;
+                }
+            }
+        }
+        return best_idx;
+    }
+
     // Seek by timeline frame (clip order)
     void seek_to_timeline_frame(int64_t timeline_frame, bool reset_play_clock = true, bool update_audio_playhead = true) {
         if (clips.empty()) return;
         int64_t max_timeline = total_timeline_frames();
         timeline_frame = std::clamp(timeline_frame, (int64_t)0, max_timeline);
         current_timeline_frame = timeline_frame;
+        
+        // Check for connected clip at this timeline frame (topmost layer takes priority)
+        int cc_idx = connected_clip_at_timeline_frame(timeline_frame);
+        if (cc_idx >= 0) {
+            const auto& cc = connected_clips[cc_idx];
+            int64_t offset_in_clip = timeline_frame - cc.connection_frame;
+            int64_t source_frame = cc.start_frame + offset_in_clip;
+            if (cc.source_id != active_source && cc.source_id >= 0) {
+                open_source(cc.source_id, false, playing);
+                previewing_library = false;
+            }
+            seek_to_frame(source_frame, reset_play_clock, false, -1, update_audio_playhead);
+            return;
+        }
+        
         int64_t display_override = -1;
         if (timeline_frame == max_timeline) {
             int64_t last_clip_frame = clips.back().end_frame - 1;
@@ -931,6 +981,58 @@ struct VideoPlayer {
         target.end_frame = split_frame;
         clips.insert(clips.begin() + insert_index + 1, new_clip);
         clips.insert(clips.begin() + insert_index + 2, right_clip);
+        return true;
+    }
+
+    bool connect_clip_at_timeline(int source_id, int64_t timeline_frame, int preferred_lane = 1) {
+        if (source_id < 0 || source_id >= (int)sources.size()) return false;
+        if (sources[source_id].total_frames <= 0) return false;
+        
+        int64_t new_clip_frames = sources[source_id].total_frames;
+        int64_t new_start = timeline_frame;
+        int64_t new_end = timeline_frame + new_clip_frames;
+        
+        // Find available lane (check positive lanes 1, 2 first, then negative -1, -2)
+        auto lane_available = [&](int lane) {
+            for (const auto& cc : connected_clips) {
+                if (cc.lane != lane) continue;
+                int64_t cc_end = cc.connection_frame + cc.frame_count();
+                // Check for overlap
+                if (new_start < cc_end && new_end > cc.connection_frame) {
+                    return false;  // Overlap found
+                }
+            }
+            return true;
+        };
+        
+        int lane = preferred_lane;
+        if (!lane_available(lane)) {
+            // Try other positive lanes
+            for (int try_lane = 1; try_lane <= 2; try_lane++) {
+                if (lane_available(try_lane)) {
+                    lane = try_lane;
+                    break;
+                }
+            }
+            // If still not found, try negative lanes
+            if (!lane_available(lane)) {
+                for (int try_lane = -1; try_lane >= -2; try_lane--) {
+                    if (lane_available(try_lane)) {
+                        lane = try_lane;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        ConnectedClip cc;
+        cc.source_id = source_id;
+        cc.start_frame = 0;
+        cc.end_frame = sources[source_id].total_frames;
+        cc.connection_frame = timeline_frame;
+        cc.lane = lane;
+        cc.color_id = next_connected_clip_color_id++;
+        connected_clips.push_back(cc);
         return true;
     }
 
@@ -1254,8 +1356,26 @@ struct ExportAudio {
     bool has_audio = false;
 };
 
+// Helper to find topmost connected clip at a timeline frame
+int find_connected_clip_at_frame(const std::vector<ConnectedClip>& connected_clips, int64_t timeline_frame) {
+    int best_idx = -1;
+    int best_lane = INT_MIN;
+    for (int i = 0; i < (int)connected_clips.size(); i++) {
+        const auto& cc = connected_clips[i];
+        int64_t cc_end = cc.connection_frame + cc.frame_count();
+        if (timeline_frame >= cc.connection_frame && timeline_frame < cc_end) {
+            if (cc.lane > 0 && cc.lane > best_lane) {
+                best_lane = cc.lane;
+                best_idx = i;
+            }
+        }
+    }
+    return best_idx;
+}
+
 // SIMPLIFIED LINEAR EXPORT: decode → encode → write immediately, no buffering
 bool export_clips(const std::vector<std::string>& source_paths, const std::string& output, const std::vector<Clip>& clips,
+                  const std::vector<ConnectedClip>& connected_clips,
                   double fps, const ExportAudio& audio_export, std::atomic<bool>& exporting, std::atomic<float>& progress) {
     if (clips.empty()) {
         exporting = false;
@@ -1561,6 +1681,75 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
     };
     
     int current_source_id = clips.front().source_id;
+    
+    // Second decoder state for connected clips
+    SourceDecodeState connected_state;
+    int connected_source_id = -1;
+    
+    // Helper to decode a single frame from a source at a specific source frame
+    auto decode_frame_from_source = [&](SourceDecodeState& state, int source_id, int64_t target_source_frame, 
+                                         const std::string& debug_name) -> AVFrame* {
+        if (source_id != (state.in_ctx ? connected_source_id : current_source_id)) {
+            if (&state == &connected_state) {
+                connected_source_id = source_id;
+            }
+            if (!open_source(source_paths[source_id], state)) {
+                return nullptr;
+            }
+            // Setup converters for this state
+            if (!state.debug_sws) {
+                state.debug_sws = sws_getContext(
+                    state.dec_ctx->width, state.dec_ctx->height, state.dec_ctx->pix_fmt,
+                    enc_ctx->width, enc_ctx->height, AV_PIX_FMT_RGB24,
+                    SWS_BILINEAR, nullptr, nullptr, nullptr
+                );
+            }
+            if (!state.debug_rgb) {
+                state.debug_rgb = av_frame_alloc();
+                state.debug_rgb->format = AV_PIX_FMT_RGB24;
+                state.debug_rgb->width = enc_ctx->width;
+                state.debug_rgb->height = enc_ctx->height;
+                av_frame_get_buffer(state.debug_rgb, 0);
+            }
+        }
+        
+        const auto ts_rounding = static_cast<AVRounding>(AV_ROUND_DOWN | AV_ROUND_PASS_MINMAX);
+        auto ts_to_frame = [&](int64_t ts) -> int64_t {
+            if (ts == AV_NOPTS_VALUE) return 0;
+            return av_rescale_q_rnd(ts, state.stream_time_base, state.frame_tb, ts_rounding);
+        };
+        auto frame_to_ts = [&](int64_t frame) -> int64_t {
+            return av_rescale_q_rnd(frame, state.frame_tb, state.stream_time_base, ts_rounding);
+        };
+        
+        int64_t target_ts = state.stream_start_pts + frame_to_ts(target_source_frame);
+        avcodec_flush_buffers(state.dec_ctx);
+        avformat_seek_file(state.in_ctx, state.video_idx, 0, target_ts, target_ts, AVSEEK_FLAG_BACKWARD);
+        avcodec_flush_buffers(state.dec_ctx);
+        
+        while (av_read_frame(state.in_ctx, pkt) >= 0) {
+            if (pkt->stream_index != state.video_idx) {
+                av_packet_unref(pkt);
+                continue;
+            }
+            avcodec_send_packet(state.dec_ctx, pkt);
+            av_packet_unref(pkt);
+            while (avcodec_receive_frame(state.dec_ctx, dec_frame) >= 0) {
+                int64_t pts = dec_frame->best_effort_timestamp != AV_NOPTS_VALUE
+                    ? dec_frame->best_effort_timestamp : dec_frame->pts;
+                if (pts == AV_NOPTS_VALUE) pts = state.stream_start_pts;
+                pts -= state.stream_start_pts;
+                int64_t src_frame = ts_to_frame(pts);
+                if (src_frame < target_source_frame) continue;
+                // Got the frame - convert to RGB
+                av_frame_make_writable(state.debug_rgb);
+                sws_scale(state.debug_sws, dec_frame->data, dec_frame->linesize, 0, dec_frame->height,
+                          state.debug_rgb->data, state.debug_rgb->linesize);
+                return state.debug_rgb;
+            }
+        }
+        return nullptr;
+    };
 
     // Process each clip
     for (const auto& clip : clips) {
@@ -1667,13 +1856,29 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
                     }
                 }
                 
-                std::printf("EXPORT: Decode src=%lld -> encode out=%lld\n", (long long)src_frame, (long long)output_frame);
+                // Check for connected clip override at this timeline frame
+                int cc_idx = find_connected_clip_at_frame(connected_clips, output_frame);
+                AVFrame* rgb = nullptr;
+                if (cc_idx >= 0) {
+                    const auto& cc = connected_clips[cc_idx];
+                    int64_t offset_in_cc = output_frame - cc.connection_frame;
+                    int64_t cc_source_frame = cc.start_frame + offset_in_cc;
+                    std::printf("EXPORT: Connected clip override at timeline %lld -> src %d frame %lld\n",
+                                (long long)output_frame, cc.source_id, (long long)cc_source_frame);
+                    rgb = decode_frame_from_source(connected_state, cc.source_id, cc_source_frame, 
+                                                   "cc_" + std::to_string(output_frame));
+                    if (rgb) {
+                        encode_from_rgb(rgb, output_frame);
+                    }
+                }
                 
-                // Convert to RGB and save PPM - get the SAME RGB data for encoding
-                AVFrame* rgb = convert_and_save_ppm(dec_frame, "frame_" + std::to_string(output_frame) + "_src" + std::to_string(src_frame));
-                
-                // Encode from the EXACT SAME RGB data we just saved to PPM
-                encode_from_rgb(rgb, output_frame);
+                if (!rgb) {
+                    std::printf("EXPORT: Decode src=%lld -> encode out=%lld\n", (long long)src_frame, (long long)output_frame);
+                    // Convert to RGB and save PPM - get the SAME RGB data for encoding
+                    rgb = convert_and_save_ppm(dec_frame, "frame_" + std::to_string(output_frame) + "_src" + std::to_string(src_frame));
+                    // Encode from the EXACT SAME RGB data we just saved to PPM
+                    encode_from_rgb(rgb, output_frame);
+                }
                 have_last_rgb = true;
                 
                 output_frame++;
@@ -1830,6 +2035,7 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
     avio_closep(&out_ctx->pb);
     avformat_free_context(out_ctx);
     close_source(source_state);
+    close_source(connected_state);
     
     progress = 1.0f;
     exporting = false;
@@ -2077,6 +2283,17 @@ bool save_project_file(const std::string& path, const VideoPlayer& player, float
             {"color", clip.color_id}
         });
     }
+    j["connected_clips"] = json::array();
+    for (const auto& cc : player.connected_clips) {
+        j["connected_clips"].push_back({
+            {"source", cc.source_id},
+            {"start", cc.start_frame},
+            {"end", cc.end_frame},
+            {"connection", cc.connection_frame},
+            {"lane", cc.lane},
+            {"color", cc.color_id}
+        });
+    }
     std::ofstream out(path);
     if (!out) return false;
     out << j.dump(2);
@@ -2119,6 +2336,25 @@ bool load_project_file(const std::string& path, VideoPlayer& player, float& out_
         }
     }
     player.next_clip_color_id = max_color + 1;
+    
+    player.connected_clips.clear();
+    int max_connected_color = 0;
+    if (j.contains("connected_clips") && j["connected_clips"].is_array()) {
+        for (const auto& c : j["connected_clips"]) {
+            int source_id = c.value("source", 0);
+            int64_t start = c.value("start", 0);
+            int64_t end = c.value("end", 0);
+            int64_t connection = c.value("connection", 0);
+            int lane = c.value("lane", 1);
+            int color = c.value("color", 0);
+            if (source_id < 0 || source_id >= (int)player.sources.size()) continue;
+            if (end <= start) continue;
+            player.connected_clips.push_back({source_id, start, end, connection, lane, color});
+            max_connected_color = std::max(max_connected_color, color);
+        }
+    }
+    player.next_connected_clip_color_id = max_connected_color + 1;
+    
     player.current_timeline_frame = j.value("current_timeline_frame", 0);
     player.current_timeline_frame = std::clamp<int64_t>(
         player.current_timeline_frame, 0, player.total_timeline_frames());
@@ -2271,12 +2507,18 @@ struct ClipsTimelineState {
     int64_t trim_playhead_source_frame = -1;
     int trim_playhead_source_id = -1;
     int64_t trim_playhead_timeline = -1;
+    // Connected clip interaction
+    int selected_connected_clip = -1;
+    int dragging_connected_clip = -1;
+    int connected_clip_dragging = 0;  // 0=none, 1=left handle, 2=right handle, 3=move
+    int64_t connected_clip_drag_start_connection = 0;
+    int64_t connected_clip_trim_start_frame = 0;
 };
 
 // Modern Final Cut-style magnetic timeline widget with zoom/scroll
 // Clips are frame-based for precision
 // Returns true if anything changed
-bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* current_source_id, int64_t* current_timeline_frame, std::vector<Clip>& clips, int64_t total_source_frames, double fps, const ImVec2& size, ClipsTimelineState& state) {
+bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* current_source_id, int64_t* current_timeline_frame, std::vector<Clip>& clips, std::vector<ConnectedClip>& connected_clips, int64_t total_source_frames, double fps, const ImVec2& size, ClipsTimelineState& state) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     
@@ -2347,6 +2589,24 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
     // Always leave room for scrollbar
     float clip_area_bottom = scroll_bar_y - 4;
     
+    // Lane layout: main track in center, lanes above and below
+    float total_lane_area = clip_area_bottom - bb_min.y - playhead_head_size;
+    float lane_height = total_lane_area / 5.0f;  // 2 lanes above, 1 main, 2 lanes below
+    float main_track_top = bb_min.y + playhead_head_size + lane_height * 2;
+    float main_track_bottom = main_track_top + lane_height;
+    
+    // Helper to get Y bounds for a lane (lane 1, 2 = above; -1, -2 = below; 0 = main)
+    auto lane_y_bounds = [&](int lane) -> std::pair<float, float> {
+        if (lane == 0) return {main_track_top, main_track_bottom};
+        if (lane > 0) {
+            float top = main_track_top - lane * lane_height;
+            return {top, top + lane_height};
+        } else {
+            float top = main_track_bottom + (-lane - 1) * lane_height;
+            return {top, top + lane_height};
+        }
+    };
+    
     // Track if mouse is over scrollbar area (for click priority)
     bool mouse_over_scrollbar = (mouse.y >= scroll_bar_y - 2 && mouse.y <= bb_max.y &&
                                   mouse.x >= bb_min.x && mouse.x <= bb_max.x);
@@ -2383,9 +2643,9 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         float start_x = time_to_x(timeline_pos);
         float end_x = time_to_x(timeline_pos + clip_dur_time);
         
-        // Clip bounds with margin (leave room for scrollbar at bottom)
-        ImVec2 clip_min(start_x + clip_margin, bb_min.y + clip_margin);
-        ImVec2 clip_max(end_x - clip_margin, clip_area_bottom - clip_margin);
+        // Clip bounds with margin (in main track lane)
+        ImVec2 clip_min(start_x + clip_margin, main_track_top + clip_margin);
+        ImVec2 clip_max(end_x - clip_margin, main_track_bottom - clip_margin);
         
         if (clip_max.x <= clip_min.x) continue;  // Skip if too small
         
@@ -2439,6 +2699,89 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         
         timeline_pos += clip_dur_time;
     }
+    
+    // Draw connected clips in their lanes
+    for (int i = 0; i < (int)connected_clips.size(); i++) {
+        const ConnectedClip& cc = connected_clips[i];
+        float clip_start_time = frame_to_time(cc.connection_frame);
+        float clip_dur_time = frame_to_time(cc.frame_count());
+        
+        // Skip clips outside visible range
+        if (clip_start_time + clip_dur_time < view_start_timeline || clip_start_time > view_end_timeline) {
+            continue;
+        }
+        
+        // Calculate screen positions
+        float start_x = time_to_x(clip_start_time);
+        float end_x = time_to_x(clip_start_time + clip_dur_time);
+        
+        // Get lane Y bounds
+        auto [lane_top, lane_bottom] = lane_y_bounds(cc.lane);
+        
+        // Clip bounds with margin
+        ImVec2 clip_min(start_x + clip_margin, lane_top + clip_margin);
+        ImVec2 clip_max(end_x - clip_margin, lane_bottom - clip_margin);
+        
+        if (clip_max.x <= clip_min.x) continue;
+        
+        // Check mouse hover
+        bool hover_cc = mouse_in_timeline && mouse.x >= start_x && mouse.x <= end_x &&
+                        mouse.y >= lane_top && mouse.y <= lane_bottom;
+        bool hover_cc_left = hover_cc && mouse.x <= start_x + handle_w + 6;
+        bool hover_cc_right = hover_cc && mouse.x >= end_x - handle_w - 6;
+        
+        // Draw connected clip
+        ImU32 clip_color = clip_color_for(cc.color_id);
+        draw_list->AddRectFilled(clip_min, clip_max, clip_color, rounding);
+        
+        // Subtle highlight at top edge
+        draw_list->AddLine(ImVec2(clip_min.x + rounding, clip_min.y + 1), 
+                          ImVec2(clip_max.x - rounding, clip_min.y + 1), 
+                          IM_COL32(255, 255, 255, 40), 1.0f);
+        
+        // Handle zones
+        float handle_inner = handle_w;
+        float clip_width = clip_max.x - clip_min.x;
+        if (clip_width > handle_w * 3) {
+            ImU32 left_handle_col = hover_cc_left ? IM_COL32(255, 255, 255, 60) : IM_COL32(0, 0, 0, 30);
+            draw_list->AddRectFilled(clip_min, ImVec2(clip_min.x + handle_inner, clip_max.y), 
+                                     left_handle_col, rounding, ImDrawFlags_RoundCornersLeft);
+            
+            ImU32 right_handle_col = hover_cc_right ? IM_COL32(255, 255, 255, 60) : IM_COL32(0, 0, 0, 30);
+            draw_list->AddRectFilled(ImVec2(clip_max.x - handle_inner, clip_min.y), clip_max, 
+                                     right_handle_col, rounding, ImDrawFlags_RoundCornersRight);
+        }
+        
+        // Selection highlight
+        if (state.selected_connected_clip == i) {
+            draw_list->AddRect(clip_min, clip_max, IM_COL32(255, 215, 0, 255), rounding, 0, 2.0f);
+        }
+        
+        // Connection line from clip start to main timeline
+        float conn_x = start_x;
+        float main_y = (cc.lane > 0) ? main_track_top : main_track_bottom;
+        float clip_y = (cc.lane > 0) ? lane_bottom : lane_top;
+        draw_list->AddLine(ImVec2(conn_x, clip_y), ImVec2(conn_x, main_y), 
+                          IM_COL32(255, 255, 255, 120), 1.5f);
+        // Small circle at connection point
+        draw_list->AddCircleFilled(ImVec2(conn_x, main_y), 3.0f, IM_COL32(255, 255, 255, 180));
+        
+        // Frame count text if wide enough (clip_width already calculated above)
+        if (clip_width > 60) {
+            char time_str[32];
+            snprintf(time_str, sizeof(time_str), "%lld fr", (long long)cc.frame_count());
+            ImVec2 text_size = ImGui::CalcTextSize(time_str);
+            ImVec2 text_pos((clip_min.x + clip_max.x - text_size.x) / 2, 
+                           (clip_min.y + clip_max.y - text_size.y) / 2);
+            draw_list->AddText(text_pos, IM_COL32(255, 255, 255, 180), time_str);
+        }
+    }
+    
+    // Draw lane separator lines
+    draw_list->AddLine(ImVec2(bb_min.x, main_track_top), ImVec2(bb_max.x, main_track_top), 
+                      IM_COL32(60, 60, 65, 255), 1.0f);
+    draw_list->AddLine(ImVec2(bb_min.x, main_track_bottom), ImVec2(bb_max.x, main_track_bottom), 
+                      IM_COL32(60, 60, 65, 255), 1.0f);
     
     // Convert current timeline frame to timeline position
     float playhead_timeline_pos = 0.0f;
@@ -2675,8 +3018,10 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         state.drag_start_mouse_time = 0.0f;
         bool clicked_clip = false;
         
-        // Check each clip's handles or body
+        // Check each clip's handles or body (only if mouse Y is in main track)
+        bool mouse_in_main_track = (mouse.y >= main_track_top && mouse.y <= main_track_bottom);
         for (int i = 0; i < (int)clips.size(); i++) {
+            if (!mouse_in_main_track) break;  // Skip main clip check if not in main track
             float start_x = clip_positions[i].start_x;
             float end_x = clip_positions[i].end_x;
             
@@ -2754,8 +3099,51 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
             }
         }
         
+        // Check connected clips if we didn't hit a main clip
+        bool clicked_connected = false;
+        if (!clicked_clip) {
+            for (int i = 0; i < (int)connected_clips.size(); i++) {
+                const ConnectedClip& cc = connected_clips[i];
+                float clip_start_time = frame_to_time(cc.connection_frame);
+                float clip_dur_time = frame_to_time(cc.frame_count());
+                float start_x = time_to_x(clip_start_time);
+                float end_x = time_to_x(clip_start_time + clip_dur_time);
+                auto [lane_top, lane_bottom] = lane_y_bounds(cc.lane);
+                
+                // Check if click is in this clip's Y range
+                if (mouse.y < lane_top || mouse.y > lane_bottom) continue;
+                if (click_x < start_x || click_x > end_x) continue;
+                
+                bool on_left = (click_x >= start_x && click_x <= start_x + handle_w + 6);
+                bool on_right = (click_x >= end_x - handle_w - 6 && click_x <= end_x);
+                
+                clicked_connected = true;
+                state.selected_clip = -1;  // Deselect main clip
+                state.selected_connected_clip = i;
+                
+                if (on_left && on_right) {
+                    if (std::abs(click_x - start_x) < std::abs(click_x - end_x)) {
+                        state.connected_clip_dragging = 1;
+                    } else {
+                        state.connected_clip_dragging = 2;
+                    }
+                } else if (on_left) {
+                    state.connected_clip_dragging = 1;
+                } else if (on_right) {
+                    state.connected_clip_dragging = 2;
+                } else {
+                    state.connected_clip_dragging = 3;  // Move the clip
+                }
+                state.dragging_connected_clip = i;
+                state.connected_clip_drag_start_connection = cc.connection_frame;
+                state.connected_clip_trim_start_frame = cc.start_frame;
+                state.trim_mouse_start_x = mouse.x;
+                break;
+            }
+        }
+        
         // If didn't hit any handle or clip, move playhead to the clicked position
-        if (state.dragging == 0 && !ImGui::GetIO().KeyAlt) {
+        if (state.dragging == 0 && !clicked_connected && !ImGui::GetIO().KeyAlt) {
             float timeline_time = x_to_time(click_x);
             timeline_time = std::clamp(timeline_time, 0.0f, total_duration);
             int64_t timeline_frame = time_to_frame_local(timeline_time);
@@ -2763,8 +3151,9 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
             *current_timeline_frame = timeline_frame;
             *current_source_frame = timeline_frame_to_source_frame(timeline_frame, current_source_id);
             changed = true;
-            if (!clicked_clip) {
+            if (!clicked_clip && !clicked_connected) {
                 state.selected_clip = -1;
+                state.selected_connected_clip = -1;
             }
         }
     }
@@ -2929,9 +3318,56 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         }
     }
     
+    // Handle connected clip dragging
+    if (is_active && state.connected_clip_dragging != 0 && state.dragging_connected_clip >= 0) {
+        int idx = state.dragging_connected_clip;
+        if (idx < (int)connected_clips.size()) {
+            ConnectedClip& cc = connected_clips[idx];
+            float delta_x = mouse.x - state.trim_mouse_start_x;
+            float delta_time = (delta_x / size.x) * visible_duration;
+            int64_t delta_frames = time_to_frame_local(std::abs(delta_time));
+            if (delta_time < 0) delta_frames = -delta_frames;
+            
+            if (state.connected_clip_dragging == 1) {
+                // Left handle - trim start
+                int64_t new_start = state.connected_clip_trim_start_frame + delta_frames;
+                int64_t min_start = 0;
+                int64_t max_start = cc.end_frame - 1;
+                new_start = std::clamp(new_start, min_start, max_start);
+                cc.start_frame = new_start;
+                changed = true;
+                state.clips_modified = true;
+            } else if (state.connected_clip_dragging == 2) {
+                // Right handle - trim end
+                int64_t old_end = cc.end_frame;
+                int64_t new_end = old_end + delta_frames;
+                int64_t min_end = cc.start_frame + 1;
+                new_end = std::max(new_end, min_end);
+                cc.end_frame = new_end;
+                state.trim_mouse_start_x = mouse.x;  // Incremental for right trim
+                changed = true;
+                state.clips_modified = true;
+            } else if (state.connected_clip_dragging == 3) {
+                // Move the clip
+                int64_t new_connection = state.connected_clip_drag_start_connection + delta_frames;
+                new_connection = std::max(new_connection, (int64_t)0);
+                cc.connection_frame = new_connection;
+                changed = true;
+                state.clips_modified = true;
+            }
+        }
+    }
+    
+    // Reset connected clip dragging when mouse released
+    if (!is_active) {
+        state.connected_clip_dragging = 0;
+        state.dragging_connected_clip = -1;
+    }
+    
     // Change cursor when hovering handles
-    if (is_hovered && state.dragging == 0) {
-        for (int i = 0; i < (int)clip_positions.size(); i++) {
+    if (is_hovered && state.dragging == 0 && state.connected_clip_dragging == 0) {
+        bool cursor_set = false;
+        for (int i = 0; i < (int)clip_positions.size() && !cursor_set; i++) {
             float start_x = clip_positions[i].start_x;
             float end_x = clip_positions[i].end_x;
             
@@ -2940,10 +3376,32 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
             bool over_body = (mouse.x > start_x + handle_w + 6 && mouse.x < end_x - handle_w - 6);
             if (over_left || over_right) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-                break;
+                cursor_set = true;
             } else if (over_body) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                break;
+                cursor_set = true;
+            }
+        }
+        // Check connected clips if no main clip cursor set
+        for (int i = 0; i < (int)connected_clips.size() && !cursor_set; i++) {
+            const ConnectedClip& cc = connected_clips[i];
+            float clip_start_time = frame_to_time(cc.connection_frame);
+            float clip_dur_time = frame_to_time(cc.frame_count());
+            float start_x = time_to_x(clip_start_time);
+            float end_x = time_to_x(clip_start_time + clip_dur_time);
+            auto [lane_top, lane_bottom] = lane_y_bounds(cc.lane);
+            
+            if (mouse.y >= lane_top && mouse.y <= lane_bottom &&
+                mouse.x >= start_x && mouse.x <= end_x) {
+                bool over_left = (mouse.x <= start_x + handle_w + 6);
+                bool over_right = (mouse.x >= end_x - handle_w - 6);
+                if (over_left || over_right) {
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                    cursor_set = true;
+                } else {
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                    cursor_set = true;
+                }
             }
         }
     }
@@ -3244,7 +3702,7 @@ int main() {
                     ImGuiWindowFlags_NoScrollWithMouse);
                 
                 float ui_scale = main_window.scale;
-                float controls_height = 95 * ui_scale;
+                float controls_height = 195 * ui_scale;
                 float panel_w = 280 * ui_scale;
                 float pad = 10 * ui_scale;
                 float panel_h = viewport->Size.y - controls_height - 2 * pad;
@@ -3298,6 +3756,7 @@ int main() {
                         export_progress = 0.0f;
                         
                         std::vector<Clip> clips_copy = player.clips;
+                        std::vector<ConnectedClip> connected_clips_copy = player.connected_clips;
                         double fps_copy = player.fps;
                         std::vector<std::string> source_paths;
                         source_paths.reserve(player.sources.size());
@@ -3311,8 +3770,8 @@ int main() {
                         audio_copy.has_audio = !audio_copy.timeline_pcm.empty();
                         
                         if (export_thread.joinable()) export_thread.join();
-                        export_thread = std::thread([&, out_path, clips_copy, fps_copy, source_paths, audio_copy]() {
-                            export_clips(source_paths, out_path, clips_copy, fps_copy, audio_copy, exporting, export_progress);
+                        export_thread = std::thread([&, out_path, clips_copy, connected_clips_copy, fps_copy, source_paths, audio_copy]() {
+                            export_clips(source_paths, out_path, clips_copy, connected_clips_copy, fps_copy, audio_copy, exporting, export_progress);
                         });
                     }
                     if (!can_export) ImGui::EndDisabled();
@@ -3444,10 +3903,25 @@ int main() {
                     }
                 }
                 
-                // Backspace to delete selected timeline clip
+                // 'Q' key to connect selected library clip at playhead (above timeline)
+                if (ImGui::IsKeyPressed(ImGuiKey_Q) && library_selected >= 0) {
+                    if (player.connect_clip_at_timeline(library_selected, player.current_timeline_frame, 1)) {
+                        project_dirty = true;
+                    }
+                }
+                
+                // Backspace to delete selected timeline clip or connected clip
                 if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Backspace)) {
                     int remove_idx = timeline_state.selected_clip;
-                    if (remove_idx >= 0 && remove_idx < (int)player.clips.size()) {
+                    int remove_connected_idx = timeline_state.selected_connected_clip;
+                    
+                    // Prefer connected clip if selected, otherwise main clip
+                    if (remove_connected_idx >= 0 && remove_connected_idx < (int)player.connected_clips.size()) {
+                        player.connected_clips.erase(player.connected_clips.begin() + remove_connected_idx);
+                        timeline_state.selected_connected_clip = -1;
+                        timeline_state.clips_modified = true;
+                        project_dirty = true;
+                    } else if (remove_idx >= 0 && remove_idx < (int)player.clips.size()) {
                         player.clips.erase(player.clips.begin() + remove_idx);
                         if (player.clips.empty()) {
                             timeline_state.selected_clip = -1;
@@ -3539,8 +4013,8 @@ int main() {
                 
                 static int64_t last_seek_frame = -1;
                 
-                if (ClipsTimeline("##clips_timeline", &curr_frame, &curr_source_id, &curr_timeline_frame, player.clips, max_source_frames, player.fps,
-                                 ImVec2(viewport->Size.x - 20, 50 * ui_scale), timeline_state)) {
+                if (ClipsTimeline("##clips_timeline", &curr_frame, &curr_source_id, &curr_timeline_frame, player.clips, player.connected_clips, max_source_frames, player.fps,
+                                 ImVec2(viewport->Size.x - 20, 150 * ui_scale), timeline_state)) {
                     if (curr_timeline_frame != last_seek_frame) {
                         last_seek_frame = curr_timeline_frame;
                         player.current_timeline_frame = curr_timeline_frame;
