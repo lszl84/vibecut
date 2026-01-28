@@ -68,11 +68,16 @@ struct ConnectedClip {
     int source_id = 0;
     int64_t start_frame;      // First SOURCE frame included
     int64_t end_frame;        // First SOURCE frame NOT included
-    int64_t connection_frame; // Timeline frame where this clip connects (its start)
+    int64_t connection_frame; // Timeline frame where the connection anchor is
+    int64_t connection_offset = 0; // Frames into the clip where the connection is (0 = left edge)
     int lane = 1;             // Positive = above main timeline, negative = below
     int color_id = 0;
     
     int64_t frame_count() const { return end_frame - start_frame; }
+    // Timeline frame where the clip visually starts (may be before connection_frame)
+    int64_t timeline_start() const { return connection_frame - connection_offset; }
+    // Timeline frame where the clip ends (exclusive)
+    int64_t timeline_end() const { return timeline_start() + frame_count(); }
 };
 
 struct SourceInfo {
@@ -867,12 +872,11 @@ struct VideoPlayer {
         int best_lane = INT_MIN;
         for (int i = 0; i < (int)connected_clips.size(); i++) {
             const auto& cc = connected_clips[i];
-            int64_t cc_end = cc.connection_frame + cc.frame_count();
             
             // Clip must extend into the valid timeline range (>= 0)
-            // Active range is [max(0, connection_frame), cc_end)
-            int64_t active_start = std::max((int64_t)0, cc.connection_frame);
-            if (timeline_frame >= active_start && timeline_frame < cc_end) {
+            // Active range is [max(0, timeline_start()), timeline_end())
+            int64_t active_start = std::max((int64_t)0, cc.timeline_start());
+            if (timeline_frame >= active_start && timeline_frame < cc.timeline_end()) {
                 // For clips above (positive lane), higher is better
                 // For clips below (negative lane), they don't normally play (future audio use)
                 if (cc.lane > 0 && cc.lane > best_lane) {
@@ -895,7 +899,8 @@ struct VideoPlayer {
         int cc_idx = connected_clip_at_timeline_frame(timeline_frame);
         if (cc_idx >= 0) {
             const auto& cc = connected_clips[cc_idx];
-            int64_t offset_in_clip = timeline_frame - cc.connection_frame;
+            // Calculate offset from the clip's visual start (timeline_start)
+            int64_t offset_in_clip = timeline_frame - cc.timeline_start();
             int64_t source_frame = cc.start_frame + offset_in_clip;
             if (cc.source_id != active_source && cc.source_id >= 0) {
                 open_source(cc.source_id, false, playing);
@@ -1372,10 +1377,9 @@ int find_connected_clip_at_frame(const std::vector<ConnectedClip>& connected_cli
     int best_lane = INT_MIN;
     for (int i = 0; i < (int)connected_clips.size(); i++) {
         const auto& cc = connected_clips[i];
-        int64_t cc_end = cc.connection_frame + cc.frame_count();
-        // Active range is [max(0, connection_frame), cc_end)
-        int64_t active_start = std::max((int64_t)0, cc.connection_frame);
-        if (timeline_frame >= active_start && timeline_frame < cc_end) {
+        // Active range is [max(0, timeline_start()), timeline_end())
+        int64_t active_start = std::max((int64_t)0, cc.timeline_start());
+        if (timeline_frame >= active_start && timeline_frame < cc.timeline_end()) {
             if (cc.lane > 0 && cc.lane > best_lane) {
                 best_lane = cc.lane;
                 best_idx = i;
@@ -1873,7 +1877,7 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
                 AVFrame* rgb = nullptr;
                 if (cc_idx >= 0) {
                     const auto& cc = connected_clips[cc_idx];
-                    int64_t offset_in_cc = output_frame - cc.connection_frame;
+                    int64_t offset_in_cc = output_frame - cc.timeline_start();
                     int64_t cc_source_frame = cc.start_frame + offset_in_cc;
                     std::printf("EXPORT: Connected clip override at timeline %lld -> src %d frame %lld\n",
                                 (long long)output_frame, cc.source_id, (long long)cc_source_frame);
@@ -2302,6 +2306,7 @@ bool save_project_file(const std::string& path, const VideoPlayer& player, float
             {"start", cc.start_frame},
             {"end", cc.end_frame},
             {"connection", cc.connection_frame},
+            {"connection_offset", cc.connection_offset},
             {"lane", cc.lane},
             {"color", cc.color_id}
         });
@@ -2357,11 +2362,12 @@ bool load_project_file(const std::string& path, VideoPlayer& player, float& out_
             int64_t start = c.value("start", 0);
             int64_t end = c.value("end", 0);
             int64_t connection = c.value("connection", 0);
+            int64_t conn_offset = c.value("connection_offset", (int64_t)0);
             int lane = c.value("lane", 1);
             int color = c.value("color", 0);
             if (source_id < 0 || source_id >= (int)player.sources.size()) continue;
             if (end <= start) continue;
-            player.connected_clips.push_back({source_id, start, end, connection, lane, color});
+            player.connected_clips.push_back({source_id, start, end, connection, conn_offset, lane, color});
             max_connected_color = std::max(max_connected_color, color);
         }
     }
@@ -2526,11 +2532,14 @@ struct ClipsTimelineState {
     int64_t connected_clip_drag_start_connection = 0;
     int64_t connected_clip_trim_start_frame = 0;
     // Left-trim connected clip tracking
-    std::vector<std::pair<int, int64_t>> left_trim_original_connections;  // (cc_idx, original_connection_frame)
+    // (cc_idx, original_connection_frame, original_connection_offset)
+    std::vector<std::tuple<int, int64_t, int64_t>> left_trim_original_connections;
     int64_t left_trim_clip_timeline_start = 0;  // Timeline start of the clip being trimmed
-    // Right-trim empty clip tracking
-    int64_t right_trim_original_end = 0;  // Original clip end frame before trim
-    std::vector<std::pair<int, int64_t>> right_trim_original_connections;  // (cc_idx, original_connection_frame)
+    // Right-trim connected clip tracking
+    int64_t right_trim_original_end = 0;  // Original clip source end frame before trim
+    int64_t right_trim_clip_timeline_start = 0;  // Timeline start of clip being trimmed
+    // (cc_idx, original_connection_frame, original_connection_offset)
+    std::vector<std::tuple<int, int64_t, int64_t>> right_trim_original_connections;
     int right_trim_temp_empty_clip_idx = -1;  // Index of temporary empty clip (-1 if none)
 };
 
@@ -2722,7 +2731,8 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
     // Draw connected clips in their lanes
     for (int i = 0; i < (int)connected_clips.size(); i++) {
         const ConnectedClip& cc = connected_clips[i];
-        float clip_start_time = frame_to_time(cc.connection_frame);
+        // Use timeline_start() which accounts for connection_offset
+        float clip_start_time = frame_to_time(cc.timeline_start());
         float clip_dur_time = frame_to_time(cc.frame_count());
         
         // Skip clips outside visible range
@@ -2805,14 +2815,19 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
             draw_list->AddRect(full_min, full_max, IM_COL32(255, 215, 0, 255), rounding, 0, 2.0f);
         }
         
-        // Connection line from clip start to main timeline (only if connection is visible)
-        float conn_x = start_x;
-        if (cc.connection_frame >= 0) {
+        // Connection line from clip to main timeline at connection_frame position
+        // The connection_frame is where the anchor is on the timeline
+        // Clamp the visual connection point to be within the clip's visual bounds
+        float conn_x = time_to_x(frame_to_time(cc.connection_frame));
+        // Clamp connection line to be within the clip's visual rectangle
+        conn_x = std::clamp(conn_x, start_x, end_x);
+        // Only draw if connection point is in visible range and connection_frame >= 0 on timeline
+        if (cc.connection_frame >= 0 && conn_x >= bb_min.x && conn_x <= bb_max.x) {
             float main_y = (cc.lane > 0) ? main_track_top : main_track_bottom;
             float clip_y = (cc.lane > 0) ? lane_bottom : lane_top;
             draw_list->AddLine(ImVec2(conn_x, clip_y), ImVec2(conn_x, main_y), 
                               IM_COL32(255, 255, 255, 120), 1.5f);
-            // Small circle at connection point
+            // Small circle at connection point on main timeline
             draw_list->AddCircleFilled(ImVec2(conn_x, main_y), 3.0f, IM_COL32(255, 255, 255, 180));
         }
         
@@ -3106,7 +3121,8 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                     state.left_trim_clip_timeline_start = clip_timeline_start;
                     state.left_trim_original_connections.clear();
                     for (int ci = 0; ci < (int)connected_clips.size(); ci++) {
-                        state.left_trim_original_connections.push_back({ci, connected_clips[ci].connection_frame});
+                        const auto& cc = connected_clips[ci];
+                        state.left_trim_original_connections.push_back({ci, cc.connection_frame, cc.connection_offset});
                     }
                 }
                 break;
@@ -3131,7 +3147,8 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                     state.left_trim_clip_timeline_start = clip_timeline_start;
                     state.left_trim_original_connections.clear();
                     for (int ci = 0; ci < (int)connected_clips.size(); ci++) {
-                        state.left_trim_original_connections.push_back({ci, connected_clips[ci].connection_frame});
+                        const auto& cc = connected_clips[ci];
+                        state.left_trim_original_connections.push_back({ci, cc.connection_frame, cc.connection_offset});
                     }
                 }
                 break;
@@ -3142,11 +3159,13 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 state.dragging_clip = i;
                 // Initialize right-trim state
                 state.right_trim_original_end = clips[i].end_frame;
+                state.right_trim_clip_timeline_start = clip_positions[i].start_frame;
                 state.right_trim_original_connections.clear();
                 state.right_trim_temp_empty_clip_idx = -1;
                 // Record ALL connected clips' original positions
                 for (int ci = 0; ci < (int)connected_clips.size(); ci++) {
-                    state.right_trim_original_connections.push_back({ci, connected_clips[ci].connection_frame});
+                    const auto& cc = connected_clips[ci];
+                    state.right_trim_original_connections.push_back({ci, cc.connection_frame, cc.connection_offset});
                 }
                 break;
             } else if (on_body && !ImGui::GetIO().KeyAlt) {
@@ -3177,7 +3196,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         if (!clicked_clip) {
             for (int i = 0; i < (int)connected_clips.size(); i++) {
                 const ConnectedClip& cc = connected_clips[i];
-                float clip_start_time = frame_to_time(cc.connection_frame);
+                float clip_start_time = frame_to_time(cc.timeline_start());
                 float clip_dur_time = frame_to_time(cc.frame_count());
                 float start_x = time_to_x(clip_start_time);
                 float end_x = time_to_x(clip_start_time + clip_dur_time);
@@ -3400,34 +3419,44 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                     int64_t orig_clip_end_timeline = orig_clip_timeline_start + (clips[state.dragging_clip].end_frame - orig_start_frame);
                     int64_t new_start_frame = clip.start_frame;  // Source frame after trim
                     
-                    for (const auto& [cc_idx, orig_connection] : state.left_trim_original_connections) {
+                    for (const auto& [cc_idx, orig_connection, orig_conn_offset] : state.left_trim_original_connections) {
                         if (cc_idx >= (int)connected_clips.size()) continue;
                         auto& cc = connected_clips[cc_idx];
                         
                         // Was this connected clip in the ORIGINAL clip range?
                         if (orig_connection >= orig_clip_timeline_start && 
                             orig_connection < orig_clip_end_timeline) {
-                            // Calculate the source frame this connection was originally pointing to
-                            int64_t orig_offset_in_clip = orig_connection - orig_clip_timeline_start;
-                            int64_t connected_source_frame = orig_start_frame + orig_offset_in_clip;
+                            // Calculate the source frame in the PARENT this connection was originally pointing to
+                            int64_t orig_offset_in_parent = orig_connection - orig_clip_timeline_start;
+                            int64_t parent_source_frame = orig_start_frame + orig_offset_in_parent;
                             
                             // Check if the new left edge has passed this source frame
-                            if (new_start_frame > connected_source_frame) {
-                                // Left edge passed the connection point - stick to left edge
+                            if (new_start_frame > parent_source_frame) {
+                                // Edge passed - connection sticks to parent's left edge
+                                // connection_offset increases to point to the next frame in connected clip
+                                int64_t frames_past = new_start_frame - parent_source_frame;
                                 cc.connection_frame = clip_timeline_start;
+                                cc.connection_offset = orig_conn_offset + frames_past;
+                                // Clamp to not exceed clip length
+                                if (cc.connection_offset >= cc.frame_count()) {
+                                    cc.connection_offset = cc.frame_count() - 1;
+                                }
                             } else {
-                                // Stay at the same source frame - adjust timeline position
-                                int64_t new_offset = connected_source_frame - new_start_frame;
+                                // Normal case - stay at same source frame, adjust timeline position
+                                int64_t new_offset = parent_source_frame - new_start_frame;
                                 cc.connection_frame = clip_timeline_start + new_offset;
+                                cc.connection_offset = orig_conn_offset;  // Restore original offset
                             }
                         }
                         // Connected clips AFTER the original clip end should shift
                         else if (orig_connection >= orig_clip_end_timeline) {
                             cc.connection_frame = orig_connection - actual_delta;
+                            cc.connection_offset = orig_conn_offset;
                         }
                         // Connected clips BEFORE the clip being trimmed stay in place
                         else {
                             cc.connection_frame = orig_connection;
+                            cc.connection_offset = orig_conn_offset;
                         }
                     }
                     
@@ -3465,33 +3494,51 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 // total_delta > 0: clip grows (right edge moves right from original)
                 // total_delta < 0: clip shrinks (right edge moves left from original)
                 int64_t new_clip_end_timeline = cp.start_frame + clip.frame_count();
+                int64_t clip_timeline_start = state.right_trim_clip_timeline_start;
+                int64_t orig_start_source = clip.start_frame;  // Source start doesn't change during right-trim
                 
-                for (const auto& [cc_idx, orig_connection] : state.right_trim_original_connections) {
+                for (const auto& [cc_idx, orig_connection, orig_conn_offset] : state.right_trim_original_connections) {
                     if (cc_idx >= (int)connected_clips.size()) continue;
                     auto& cc = connected_clips[cc_idx];
                     
                     // Was this connected clip in the ORIGINAL clip range?
-                    if (orig_connection >= cp.start_frame && 
+                    if (orig_connection >= clip_timeline_start && 
                         orig_connection < orig_clip_end_timeline) {
-                        // Check if the new right edge has passed this connection
-                        if (orig_connection >= new_clip_end_timeline) {
+                        // Calculate the source frame in the PARENT this connection was originally pointing to
+                        int64_t orig_offset_in_parent = orig_connection - clip_timeline_start;
+                        int64_t parent_source_frame = orig_start_source + orig_offset_in_parent;
+                        int64_t new_end_source = clip.end_frame;
+                        
+                        // Check if the new right edge has passed this source frame
+                        if (new_end_source <= parent_source_frame) {
                             // Right edge passed the connection point - stick to right edge
+                            // connection_offset becomes negative so clip extends AFTER the anchor
+                            int64_t frames_past = parent_source_frame - new_end_source + 1;
                             cc.connection_frame = new_clip_end_timeline - 1;
-                            if (cc.connection_frame < cp.start_frame) {
-                                cc.connection_frame = cp.start_frame;
+                            if (cc.connection_frame < clip_timeline_start) {
+                                cc.connection_frame = clip_timeline_start;
+                            }
+                            // Negative offset means clip extends to the right of the anchor
+                            cc.connection_offset = orig_conn_offset - frames_past;
+                            // Clamp so anchor doesn't go past the end of the clip
+                            if (cc.connection_offset < -(cc.frame_count() - 1)) {
+                                cc.connection_offset = -(cc.frame_count() - 1);
                             }
                         } else {
                             // Stay at the original position (source frame unchanged)
                             cc.connection_frame = orig_connection;
+                            cc.connection_offset = orig_conn_offset;
                         }
                     }
                     // Connected clips AFTER the original clip end should shift
                     else if (orig_connection >= orig_clip_end_timeline) {
                         cc.connection_frame = orig_connection + total_delta;
+                        cc.connection_offset = orig_conn_offset;
                     }
                     // Connected clips BEFORE the clip being trimmed stay in place
                     else {
                         cc.connection_frame = orig_connection;
+                        cc.connection_offset = orig_conn_offset;
                     }
                 }
                 
@@ -3582,7 +3629,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         // Check connected clips if no main clip cursor set
         for (int i = 0; i < (int)connected_clips.size() && !cursor_set; i++) {
             const ConnectedClip& cc = connected_clips[i];
-            float clip_start_time = frame_to_time(cc.connection_frame);
+            float clip_start_time = frame_to_time(cc.timeline_start());
             float clip_dur_time = frame_to_time(cc.frame_count());
             float start_x = time_to_x(clip_start_time);
             float end_x = time_to_x(clip_start_time + clip_dur_time);
