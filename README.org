@@ -53,14 +53,14 @@ git submodule update --init
 * Time Tracking
 
 #+BEGIN: clocktable :maxlevel nil :scope file :block nil
-#+CAPTION: Clock summary at [2026-01-25 Sun 15:05]
+#+CAPTION: Clock summary at [2026-01-28 Wed 16:51]
 | Headline                     | Time  |       |
 |------------------------------+-------+-------|
-| *Total time*                   | *17:10* |       |
+| *Total time*                   | *18:32* |       |
 |------------------------------+-------+-------|
-| Tasks                        | 17:10 |       |
-| \_  Initial Setup / Planning |       |  0:36 |
-| \_  Vibe coding              |       | 15:41 |
+| Tasks                        | 18:32 |       |
+| \_  Initial Setup / Planning |       |  0:47 |
+| \_  Vibe coding              |       | 16:52 |
 | \_  Manual coding            |       |  0:53 |
 #+END:
 
@@ -69,6 +69,7 @@ We'll track the time spent on the tasks below:
 ** Initial Setup / Planning
 Git Setup, AGENTS.md, workflow changes, etc.
 :LOGBOOK:
+CLOCK: [2026-01-28 Wed 15:29]--[2026-01-28 Wed 15:40] =>  0:11
 CLOCK: [2026-01-20 Tue 19:17]--[2026-01-20 Tue 19:26] =>  0:09
 CLOCK: [2026-01-18 Sun 12:18]--[2026-01-18 Sun 12:32] =>  0:14
 CLOCK: [2026-01-04 Sun 15:10]--[2026-01-04 Sun 15:16] =>  0:06
@@ -76,6 +77,7 @@ CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
 :END:
 ** Vibe coding
 :LOGBOOK:
+CLOCK: [2026-01-28 Wed 15:40]--[2026-01-28 Wed 16:51] =>  1:11
 CLOCK: [2026-01-25 Sun 13:23]--[2026-01-25 Sun 15:04] =>  1:41
 CLOCK: [2026-01-22 Thu 10:52]--[2026-01-22 Thu 11:11] =>  0:19
 CLOCK: [2026-01-20 Tue 19:26]--[2026-01-20 Tue 20:34] =>  1:08
@@ -106,6 +108,15 @@ Adding/changing code by hand, debugging, etc.
 * Devlog
 
 Live Streams: https://www.youtube.com/@lukeatdevmindscape/streams
+
+** Day 17
+Very smooth session today. I used the Planning Mode for the first
+time, to create a documentation for the Connected Clips feature. It
+went quite well: I told Claude to do a web research on how that
+feature works in Apple Final Cut and it was able to expand of my basic
+description of the feature and create a comprehensive Markdown doc.
+This doc is now connected to AGENTS.md - let's see if that helps the
+Agent to not introduce regression bugs like it used to do before...
 
 ** Day 16
 Another classic AI Agent experience: one hour of frustrating back and
