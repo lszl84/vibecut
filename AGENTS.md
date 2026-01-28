@@ -1,5 +1,9 @@
 # Project Instructions
 
+## Feature Documentation
+When working on specific features, consult the relevant documentation:
+- **Connected Clips**: See [docs/CONNECTED_CLIPS.md](docs/CONNECTED_CLIPS.md) for behavioral specification (mirrors Apple Final Cut Pro behavior)
+
 ## Code Style
 - use modern C++23 features
 - prefer linear procedural/functional style over traditional OOP patterns
