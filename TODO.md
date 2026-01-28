@@ -15,6 +15,18 @@
 - ~~export with connected clips compositing~~
 - fix connected clip jumping behavior when trimming main clips
 
+# Connected Clips - behavior when trimming the parent clip
+- when resizing the parent clip, the connection points should in general stay at the same frame of both the parent clip and connected clip. Some exceptions explained below
+- if trimming the parent clip from the left side: when the left side of the parent clip passes after the connection point, then the connection point should move with the parent clip's left edge
+- if trimming the parent clip from the left and the parent clip is the first clip in the timeline and left side of the parent clip passes after the connection point of any connected clip: the part of the connected clip that is before the parent's left edge should be greyed out and not played
+- if the parent clip is not 1st, then this is not a problem - that part of the connected clip will just hover as usual over the previous clip. Unless of course a part of the connected clip starts hovering BEFORE the first clip - that part of the connected clip will be greyed out as well and won't be played
+- when trimming the parent clip from the right and the handle passes the connection point, then the connection point moves with the handle
+- if during this movement, the handle moves past the beginning of the connected clip, then a special "empty" clip is added to the main timeline just after the parent clip that was being moved in the main timeline. Then the connected clip becomes connected to the newly added empty clip
+- the empty clip is only permanently added when the user releases the mouse while it is visible. if the user holds on to the mouse and moves the right edge of the parent clip back to the right behind the connected clip start, the connection point moves back to the original parent clip
+
+
 # Undo Stack
 - implement infinite undo stack for all the operations that are saved in the project
 - use standard keyboard keys to undo and redo
+
+# Audio Clips

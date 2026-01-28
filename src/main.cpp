@@ -859,13 +859,20 @@ struct VideoPlayer {
     
     // Find topmost connected clip covering a timeline frame (highest lane takes priority)
     // Returns index into connected_clips, or -1 if none
+    // Only considers the "active" part of clips (frames >= 0 on the timeline)
     int connected_clip_at_timeline_frame(int64_t timeline_frame) const {
+        if (timeline_frame < 0) return -1;  // Nothing plays before timeline start
+        
         int best_idx = -1;
         int best_lane = INT_MIN;
         for (int i = 0; i < (int)connected_clips.size(); i++) {
             const auto& cc = connected_clips[i];
             int64_t cc_end = cc.connection_frame + cc.frame_count();
-            if (timeline_frame >= cc.connection_frame && timeline_frame < cc_end) {
+            
+            // Clip must extend into the valid timeline range (>= 0)
+            // Active range is [max(0, connection_frame), cc_end)
+            int64_t active_start = std::max((int64_t)0, cc.connection_frame);
+            if (timeline_frame >= active_start && timeline_frame < cc_end) {
                 // For clips above (positive lane), higher is better
                 // For clips below (negative lane), they don't normally play (future audio use)
                 if (cc.lane > 0 && cc.lane > best_lane) {
@@ -1357,13 +1364,18 @@ struct ExportAudio {
 };
 
 // Helper to find topmost connected clip at a timeline frame
+// Only considers active part of clips (frames >= 0 on timeline)
 int find_connected_clip_at_frame(const std::vector<ConnectedClip>& connected_clips, int64_t timeline_frame) {
+    if (timeline_frame < 0) return -1;  // Nothing plays before timeline start
+    
     int best_idx = -1;
     int best_lane = INT_MIN;
     for (int i = 0; i < (int)connected_clips.size(); i++) {
         const auto& cc = connected_clips[i];
         int64_t cc_end = cc.connection_frame + cc.frame_count();
-        if (timeline_frame >= cc.connection_frame && timeline_frame < cc_end) {
+        // Active range is [max(0, connection_frame), cc_end)
+        int64_t active_start = std::max((int64_t)0, cc.connection_frame);
+        if (timeline_frame >= active_start && timeline_frame < cc_end) {
             if (cc.lane > 0 && cc.lane > best_lane) {
                 best_lane = cc.lane;
                 best_idx = i;
@@ -2513,6 +2525,13 @@ struct ClipsTimelineState {
     int connected_clip_dragging = 0;  // 0=none, 1=left handle, 2=right handle, 3=move
     int64_t connected_clip_drag_start_connection = 0;
     int64_t connected_clip_trim_start_frame = 0;
+    // Left-trim connected clip tracking
+    std::vector<std::pair<int, int64_t>> left_trim_original_connections;  // (cc_idx, original_connection_frame)
+    int64_t left_trim_clip_timeline_start = 0;  // Timeline start of the clip being trimmed
+    // Right-trim empty clip tracking
+    int64_t right_trim_original_end = 0;  // Original clip end frame before trim
+    std::vector<std::pair<int, int64_t>> right_trim_original_connections;  // (cc_idx, original_connection_frame)
+    int right_trim_temp_empty_clip_idx = -1;  // Index of temporary empty clip (-1 if none)
 };
 
 // Modern Final Cut-style magnetic timeline widget with zoom/scroll
@@ -2718,61 +2737,95 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         // Get lane Y bounds
         auto [lane_top, lane_bottom] = lane_y_bounds(cc.lane);
         
-        // Clip bounds with margin
-        ImVec2 clip_min(start_x + clip_margin, lane_top + clip_margin);
+        // Check if part of the clip extends before timeline frame 0 (should be greyed out)
+        float timeline_zero_x = time_to_x(0.0f);
+        bool has_greyed_part = (clip_start_time < 0.0f);
+        float greyed_end_x = has_greyed_part ? std::min(timeline_zero_x, end_x) : start_x;
+        float active_start_x = has_greyed_part ? std::max(start_x, timeline_zero_x) : start_x;
+        
+        // Draw greyed-out part (before timeline start)
+        if (has_greyed_part && greyed_end_x > start_x) {
+            ImVec2 grey_min(start_x + clip_margin, lane_top + clip_margin);
+            ImVec2 grey_max(greyed_end_x - clip_margin, lane_bottom - clip_margin);
+            if (grey_max.x > grey_min.x) {
+                // Darker, desaturated color for inactive part
+                draw_list->AddRectFilled(grey_min, grey_max, IM_COL32(50, 50, 55, 200), rounding, 
+                                        ImDrawFlags_RoundCornersLeft);
+                // Diagonal lines pattern to indicate inactive
+                for (float px = grey_min.x; px < grey_max.x; px += 8.0f) {
+                    float x1 = px;
+                    float x2 = std::min(px + (grey_max.y - grey_min.y), grey_max.x);
+                    draw_list->AddLine(ImVec2(x1, grey_max.y), ImVec2(x2, grey_min.y), 
+                                      IM_COL32(80, 80, 85, 150), 1.0f);
+                }
+            }
+        }
+        
+        // Clip bounds for active part
+        ImVec2 clip_min(active_start_x + clip_margin, lane_top + clip_margin);
         ImVec2 clip_max(end_x - clip_margin, lane_bottom - clip_margin);
         
-        if (clip_max.x <= clip_min.x) continue;
-        
-        // Check mouse hover
+        // Check mouse hover (on full clip area)
         bool hover_cc = mouse_in_timeline && mouse.x >= start_x && mouse.x <= end_x &&
                         mouse.y >= lane_top && mouse.y <= lane_bottom;
         bool hover_cc_left = hover_cc && mouse.x <= start_x + handle_w + 6;
         bool hover_cc_right = hover_cc && mouse.x >= end_x - handle_w - 6;
         
-        // Draw connected clip
-        ImU32 clip_color = clip_color_for(cc.color_id);
-        draw_list->AddRectFilled(clip_min, clip_max, clip_color, rounding);
-        
-        // Subtle highlight at top edge
-        draw_list->AddLine(ImVec2(clip_min.x + rounding, clip_min.y + 1), 
-                          ImVec2(clip_max.x - rounding, clip_min.y + 1), 
-                          IM_COL32(255, 255, 255, 40), 1.0f);
-        
-        // Handle zones
-        float handle_inner = handle_w;
-        float clip_width = clip_max.x - clip_min.x;
-        if (clip_width > handle_w * 3) {
-            ImU32 left_handle_col = hover_cc_left ? IM_COL32(255, 255, 255, 60) : IM_COL32(0, 0, 0, 30);
-            draw_list->AddRectFilled(clip_min, ImVec2(clip_min.x + handle_inner, clip_max.y), 
-                                     left_handle_col, rounding, ImDrawFlags_RoundCornersLeft);
+        // Draw active part of connected clip
+        if (clip_max.x > clip_min.x) {
+            ImU32 clip_color = clip_color_for(cc.color_id);
+            ImDrawFlags corners = has_greyed_part ? ImDrawFlags_RoundCornersRight : 0;
+            draw_list->AddRectFilled(clip_min, clip_max, clip_color, rounding, corners);
             
-            ImU32 right_handle_col = hover_cc_right ? IM_COL32(255, 255, 255, 60) : IM_COL32(0, 0, 0, 30);
-            draw_list->AddRectFilled(ImVec2(clip_max.x - handle_inner, clip_min.y), clip_max, 
-                                     right_handle_col, rounding, ImDrawFlags_RoundCornersRight);
+            // Subtle highlight at top edge
+            draw_list->AddLine(ImVec2(clip_min.x + (has_greyed_part ? 0 : rounding), clip_min.y + 1), 
+                              ImVec2(clip_max.x - rounding, clip_min.y + 1), 
+                              IM_COL32(255, 255, 255, 40), 1.0f);
+            
+            // Handle zones
+            float handle_inner = handle_w;
+            float clip_width = clip_max.x - clip_min.x;
+            if (clip_width > handle_w * 3) {
+                if (!has_greyed_part) {
+                    ImU32 left_handle_col = hover_cc_left ? IM_COL32(255, 255, 255, 60) : IM_COL32(0, 0, 0, 30);
+                    draw_list->AddRectFilled(clip_min, ImVec2(clip_min.x + handle_inner, clip_max.y), 
+                                             left_handle_col, rounding, ImDrawFlags_RoundCornersLeft);
+                }
+                
+                ImU32 right_handle_col = hover_cc_right ? IM_COL32(255, 255, 255, 60) : IM_COL32(0, 0, 0, 30);
+                draw_list->AddRectFilled(ImVec2(clip_max.x - handle_inner, clip_min.y), clip_max, 
+                                         right_handle_col, rounding, ImDrawFlags_RoundCornersRight);
+            }
         }
         
-        // Selection highlight
+        // Selection highlight (covers full clip including greyed part)
         if (state.selected_connected_clip == i) {
-            draw_list->AddRect(clip_min, clip_max, IM_COL32(255, 215, 0, 255), rounding, 0, 2.0f);
+            ImVec2 full_min(start_x + clip_margin, lane_top + clip_margin);
+            ImVec2 full_max(end_x - clip_margin, lane_bottom - clip_margin);
+            draw_list->AddRect(full_min, full_max, IM_COL32(255, 215, 0, 255), rounding, 0, 2.0f);
         }
         
-        // Connection line from clip start to main timeline
+        // Connection line from clip start to main timeline (only if connection is visible)
         float conn_x = start_x;
-        float main_y = (cc.lane > 0) ? main_track_top : main_track_bottom;
-        float clip_y = (cc.lane > 0) ? lane_bottom : lane_top;
-        draw_list->AddLine(ImVec2(conn_x, clip_y), ImVec2(conn_x, main_y), 
-                          IM_COL32(255, 255, 255, 120), 1.5f);
-        // Small circle at connection point
-        draw_list->AddCircleFilled(ImVec2(conn_x, main_y), 3.0f, IM_COL32(255, 255, 255, 180));
+        if (cc.connection_frame >= 0) {
+            float main_y = (cc.lane > 0) ? main_track_top : main_track_bottom;
+            float clip_y = (cc.lane > 0) ? lane_bottom : lane_top;
+            draw_list->AddLine(ImVec2(conn_x, clip_y), ImVec2(conn_x, main_y), 
+                              IM_COL32(255, 255, 255, 120), 1.5f);
+            // Small circle at connection point
+            draw_list->AddCircleFilled(ImVec2(conn_x, main_y), 3.0f, IM_COL32(255, 255, 255, 180));
+        }
         
-        // Frame count text if wide enough (clip_width already calculated above)
-        if (clip_width > 60) {
+        // Frame count text if wide enough
+        float total_width = end_x - start_x;
+        if (total_width > 60) {
             char time_str[32];
             snprintf(time_str, sizeof(time_str), "%lld fr", (long long)cc.frame_count());
             ImVec2 text_size = ImGui::CalcTextSize(time_str);
-            ImVec2 text_pos((clip_min.x + clip_max.x - text_size.x) / 2, 
-                           (clip_min.y + clip_max.y - text_size.y) / 2);
+            // Center text in active part if there's a greyed part
+            float text_center_x = has_greyed_part ? (active_start_x + end_x) / 2 : (start_x + end_x) / 2;
+            ImVec2 text_pos(text_center_x - text_size.x / 2, 
+                           (lane_top + lane_bottom - text_size.y) / 2);
             draw_list->AddText(text_pos, IM_COL32(255, 255, 255, 180), time_str);
         }
     }
@@ -3049,6 +3102,12 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                         (playhead >= clip_timeline_start && playhead <= clip_timeline_end);
                     state.trim_playhead_source_frame = *current_source_frame;
                     state.trim_playhead_source_id = *current_source_id;
+                    // Record original connection positions for left-trim
+                    state.left_trim_clip_timeline_start = clip_timeline_start;
+                    state.left_trim_original_connections.clear();
+                    for (int ci = 0; ci < (int)connected_clips.size(); ci++) {
+                        state.left_trim_original_connections.push_back({ci, connected_clips[ci].connection_frame});
+                    }
                 }
                 break;
             } else if (on_left) {
@@ -3068,6 +3127,12 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                     state.trim_playhead_source_frame = *current_source_frame;
                     state.trim_playhead_source_id = *current_source_id;
                     state.trim_playhead_timeline = playhead;
+                    // Record original connection positions for left-trim
+                    state.left_trim_clip_timeline_start = clip_timeline_start;
+                    state.left_trim_original_connections.clear();
+                    for (int ci = 0; ci < (int)connected_clips.size(); ci++) {
+                        state.left_trim_original_connections.push_back({ci, connected_clips[ci].connection_frame});
+                    }
                 }
                 break;
             } else if (on_right) {
@@ -3075,6 +3140,14 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 state.selected_clip = i;
                 state.dragging = 2;
                 state.dragging_clip = i;
+                // Initialize right-trim state
+                state.right_trim_original_end = clips[i].end_frame;
+                state.right_trim_original_connections.clear();
+                state.right_trim_temp_empty_clip_idx = -1;
+                // Record ALL connected clips' original positions
+                for (int ci = 0; ci < (int)connected_clips.size(); ci++) {
+                    state.right_trim_original_connections.push_back({ci, connected_clips[ci].connection_frame});
+                }
                 break;
             } else if (on_body && !ImGui::GetIO().KeyAlt) {
                 clicked_clip = true;
@@ -3315,13 +3388,46 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                     }
                     // If playhead is BEFORE the clip, no adjustment needed (new_timeline = orig_timeline)
                     
-                    // Update connected clips: shift those after this clip by the trim delta
-                    // actual_delta is positive when clip grows, negative when shrinks
-                    // Connected clips AFTER this clip's end should shift by -actual_delta
-                    int64_t clip_end_timeline = clip_timeline_start + clip.frame_count();
-                    for (auto& cc : connected_clips) {
-                        if (cc.connection_frame >= clip_end_timeline) {
-                            cc.connection_frame -= actual_delta;
+                    // Update connected clips based on left-trim using ORIGINAL positions
+                    // actual_delta > 0: clip grows (left edge moves left, showing earlier source frames)
+                    // actual_delta < 0: clip shrinks (left edge moves right, hiding earlier source frames)
+                    // 
+                    // Connection points should stay at the same SOURCE frame in the parent clip.
+                    // When source content shifts, connections shift on the timeline to compensate.
+                    // Exception: if left edge passes the connection's source position, it sticks to edge.
+                    int64_t orig_clip_timeline_start = state.left_trim_clip_timeline_start;
+                    int64_t orig_start_frame = state.trim_start_frame;  // Source frame at drag start
+                    int64_t orig_clip_end_timeline = orig_clip_timeline_start + (clips[state.dragging_clip].end_frame - orig_start_frame);
+                    int64_t new_start_frame = clip.start_frame;  // Source frame after trim
+                    
+                    for (const auto& [cc_idx, orig_connection] : state.left_trim_original_connections) {
+                        if (cc_idx >= (int)connected_clips.size()) continue;
+                        auto& cc = connected_clips[cc_idx];
+                        
+                        // Was this connected clip in the ORIGINAL clip range?
+                        if (orig_connection >= orig_clip_timeline_start && 
+                            orig_connection < orig_clip_end_timeline) {
+                            // Calculate the source frame this connection was originally pointing to
+                            int64_t orig_offset_in_clip = orig_connection - orig_clip_timeline_start;
+                            int64_t connected_source_frame = orig_start_frame + orig_offset_in_clip;
+                            
+                            // Check if the new left edge has passed this source frame
+                            if (new_start_frame > connected_source_frame) {
+                                // Left edge passed the connection point - stick to left edge
+                                cc.connection_frame = clip_timeline_start;
+                            } else {
+                                // Stay at the same source frame - adjust timeline position
+                                int64_t new_offset = connected_source_frame - new_start_frame;
+                                cc.connection_frame = clip_timeline_start + new_offset;
+                            }
+                        }
+                        // Connected clips AFTER the original clip end should shift
+                        else if (orig_connection >= orig_clip_end_timeline) {
+                            cc.connection_frame = orig_connection - actual_delta;
+                        }
+                        // Connected clips BEFORE the clip being trimmed stay in place
+                        else {
+                            cc.connection_frame = orig_connection;
                         }
                     }
                     
@@ -3349,18 +3455,43 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 }
                 new_end = std::clamp(new_end, min_end, max_end);
                 
-                // Calculate the actual frame change
-                int64_t right_trim_delta = new_end - clip.end_frame;
-                int64_t old_clip_end_timeline = cp.start_frame + clip.frame_count();
+                // Calculate the actual frame change from ORIGINAL end
+                int64_t total_delta = new_end - state.right_trim_original_end;
+                int64_t orig_clip_end_timeline = cp.start_frame + (state.right_trim_original_end - clip.start_frame);
                 
                 clip.end_frame = new_end;
                 
-                // Update connected clips: shift those after this clip's end by the delta
-                if (right_trim_delta != 0) {
-                    for (auto& cc : connected_clips) {
-                        if (cc.connection_frame >= old_clip_end_timeline) {
-                            cc.connection_frame += right_trim_delta;
+                // Update connected clips based on right-trim using ORIGINAL positions
+                // total_delta > 0: clip grows (right edge moves right from original)
+                // total_delta < 0: clip shrinks (right edge moves left from original)
+                int64_t new_clip_end_timeline = cp.start_frame + clip.frame_count();
+                
+                for (const auto& [cc_idx, orig_connection] : state.right_trim_original_connections) {
+                    if (cc_idx >= (int)connected_clips.size()) continue;
+                    auto& cc = connected_clips[cc_idx];
+                    
+                    // Was this connected clip in the ORIGINAL clip range?
+                    if (orig_connection >= cp.start_frame && 
+                        orig_connection < orig_clip_end_timeline) {
+                        // Check if the new right edge has passed this connection
+                        if (orig_connection >= new_clip_end_timeline) {
+                            // Right edge passed the connection point - stick to right edge
+                            cc.connection_frame = new_clip_end_timeline - 1;
+                            if (cc.connection_frame < cp.start_frame) {
+                                cc.connection_frame = cp.start_frame;
+                            }
+                        } else {
+                            // Stay at the original position (source frame unchanged)
+                            cc.connection_frame = orig_connection;
                         }
+                    }
+                    // Connected clips AFTER the original clip end should shift
+                    else if (orig_connection >= orig_clip_end_timeline) {
+                        cc.connection_frame = orig_connection + total_delta;
+                    }
+                    // Connected clips BEFORE the clip being trimmed stay in place
+                    else {
+                        cc.connection_frame = orig_connection;
                     }
                 }
                 
