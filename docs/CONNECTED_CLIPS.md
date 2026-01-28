@@ -136,13 +136,15 @@ When trimming the right edge of a parent clip:
    - The anchor slides along the connected clip (connection_offset becomes negative)
    - The connected clip visually extends past the parent into the next clip's area
 
-### Pending Feature: Gap Clip Insertion
+### Gap Clip Insertion
 
 When right-trimming causes the handle to move past the **beginning** of a connected clip:
-- A **gap clip** (empty placeholder) should be inserted in the main timeline after the parent
+- A **gap clip** (empty placeholder) is automatically inserted in the main timeline after the parent
 - The connected clip becomes attached to this gap clip
 - The gap clip is only permanently added when the mouse is released while visible
 - If the user moves the handle back before releasing, the gap clip is removed
+
+Gap clips are rendered with a dark color and diagonal stripe pattern, labeled "Gap".
 
 > **Final Cut Pro behavior**: Gap clips are empty clips that serve as anchors for connected clips. They can be inserted manually with **Option-W** and act as placeholders in the timeline.
 
@@ -158,11 +160,11 @@ Connected clips are composited into the exported video:
 
 The following Final Cut Pro behaviors are not yet implemented:
 
-1. **Gap clip insertion**: Automatic gap clip creation when right-trim orphans a connected clip
-2. **Adjust connection point**: Command+Option+Click to move anchor within connected clip
-3. **Grave Accent key**: Edit parent clips without affecting connected clips
-4. **Lift vs Delete**: Shift+Delete to replace clip with gap, preserving connected clips
-5. **Audio connected clips**: Negative lanes for audio (currently visual only)
+1. **Adjust connection point**: Command+Option+Click to move anchor within connected clip
+2. **Grave Accent key**: Edit parent clips without affecting connected clips
+3. **Lift vs Delete**: Shift+Delete to replace clip with gap, preserving connected clips
+4. **Audio connected clips**: Negative lanes for audio (currently visual only)
+5. **Manual gap clip insertion**: Option-W to insert gap clips manually
 
 ## Project Persistence
 

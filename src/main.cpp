@@ -58,6 +58,7 @@ struct Clip {
     int64_t start_frame;  // First frame included (0-indexed)
     int64_t end_frame;    // First frame NOT included
     int color_id = 0;
+    bool is_gap = false;  // True if this is a gap clip (empty placeholder)
     
     int64_t frame_count() const { return end_frame - start_frame; }
 };
@@ -203,23 +204,40 @@ struct VideoPlayer {
         return total;
     }
     
-    int64_t timeline_to_source_frame(int64_t timeline_frame, int* out_source_id = nullptr) const {
+    // Check if a timeline frame falls on a gap clip
+    bool is_timeline_frame_on_gap(int64_t timeline_frame) const {
+        if (clips.empty()) return false;
+        int64_t pos = 0;
+        for (const auto& c : clips) {
+            int64_t count = c.frame_count();
+            if (timeline_frame >= pos && timeline_frame < pos + count) {
+                return c.is_gap;
+            }
+            pos += count;
+        }
+        return false;
+    }
+    
+    int64_t timeline_to_source_frame(int64_t timeline_frame, int* out_source_id = nullptr, bool* out_is_gap = nullptr) const {
         if (clips.empty()) return 0;
         int64_t total = total_timeline_frames();
         if (timeline_frame < 0) timeline_frame = 0;
         if (timeline_frame >= total) {
             if (out_source_id) *out_source_id = clips.back().source_id;
+            if (out_is_gap) *out_is_gap = clips.back().is_gap;
             return clips.back().end_frame;  // end position
         }
         for (const auto& c : clips) {
             int64_t count = c.frame_count();
             if (timeline_frame < count) {
                 if (out_source_id) *out_source_id = c.source_id;
+                if (out_is_gap) *out_is_gap = c.is_gap;
                 return c.start_frame + timeline_frame;
             }
             timeline_frame -= count;
         }
         if (out_source_id) *out_source_id = clips.back().source_id;
+        if (out_is_gap) *out_is_gap = clips.back().is_gap;
         return clips.back().end_frame;
     }
     
@@ -907,6 +925,12 @@ struct VideoPlayer {
                 previewing_library = false;
             }
             seek_to_frame(source_frame, reset_play_clock, false, -1, update_audio_playhead);
+            return;
+        }
+        
+        // Check if we're on a gap clip - if so, don't change the displayed frame
+        // Gap clips show empty/black content (last frame stays visible)
+        if (is_timeline_frame_on_gap(timeline_frame)) {
             return;
         }
         
@@ -2296,7 +2320,8 @@ bool save_project_file(const std::string& path, const VideoPlayer& player, float
             {"source", clip.source_id},
             {"start", clip.start_frame},
             {"end", clip.end_frame},
-            {"color", clip.color_id}
+            {"color", clip.color_id},
+            {"is_gap", clip.is_gap}
         });
     }
     j["connected_clips"] = json::array();
@@ -2346,9 +2371,10 @@ bool load_project_file(const std::string& path, VideoPlayer& player, float& out_
             int64_t start = c.value("start", 0);
             int64_t end = c.value("end", 0);
             int color = c.value("color", 0);
+            bool is_gap = c.value("is_gap", false);
             if (source_id < 0 || source_id >= (int)player.sources.size()) continue;
             if (end <= start) continue;
-            player.clips.push_back({source_id, start, end, color});
+            player.clips.push_back({source_id, start, end, color, is_gap});
             max_color = std::max(max_color, color);
         }
     }
@@ -2538,9 +2564,10 @@ struct ClipsTimelineState {
     // Right-trim connected clip tracking
     int64_t right_trim_original_end = 0;  // Original clip source end frame before trim
     int64_t right_trim_clip_timeline_start = 0;  // Timeline start of clip being trimmed
-    // (cc_idx, original_connection_frame, original_connection_offset)
-    std::vector<std::tuple<int, int64_t, int64_t>> right_trim_original_connections;
-    int right_trim_temp_empty_clip_idx = -1;  // Index of temporary empty clip (-1 if none)
+    // (cc_idx, original_connection_frame, original_connection_offset, original_timeline_start)
+    std::vector<std::tuple<int, int64_t, int64_t, int64_t>> right_trim_original_connections;
+    int right_trim_temp_gap_clip_idx = -1;  // Index of temporary gap clip (-1 if none)
+    std::vector<int> right_trim_cc_on_gap;  // Connected clip indices that are currently on the gap clip
 };
 
 // Modern Final Cut-style magnetic timeline widget with zoom/scroll
@@ -2683,20 +2710,39 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         bool hover_right = hover_clip && mouse.x >= end_x - handle_w - 4;
         
         // Stable clip colors based on clip identity
-        ImU32 clip_color = clip_color_for(clip.color_id);
+        ImU32 clip_color = clip.is_gap ? IM_COL32(60, 60, 65, 200) : clip_color_for(clip.color_id);
         
         // Draw clip with rounded corners
         draw_list->AddRectFilled(clip_min, clip_max, clip_color, rounding);
         
-        // Subtle highlight at top edge for depth
-        draw_list->AddLine(ImVec2(clip_min.x + rounding, clip_min.y + 1), 
-                          ImVec2(clip_max.x - rounding, clip_min.y + 1), 
-                          IM_COL32(255, 255, 255, 40), 1.0f);
+        // Gap clip: draw diagonal stripe pattern
+        if (clip.is_gap) {
+            for (float px = clip_min.x; px < clip_max.x; px += 10.0f) {
+                float x1 = px;
+                float x2 = std::min(px + (clip_max.y - clip_min.y), clip_max.x);
+                draw_list->AddLine(ImVec2(x1, clip_max.y), ImVec2(x2, clip_min.y), 
+                                  IM_COL32(80, 80, 85, 150), 1.0f);
+            }
+            // Add "Gap" text if wide enough
+            float clip_width_gap = clip_max.x - clip_min.x;
+            if (clip_width_gap > 40) {
+                const char* gap_text = "Gap";
+                ImVec2 text_size = ImGui::CalcTextSize(gap_text);
+                ImVec2 text_pos((clip_min.x + clip_max.x - text_size.x) / 2, 
+                               (clip_min.y + clip_max.y - text_size.y) / 2);
+                draw_list->AddText(text_pos, IM_COL32(120, 120, 130, 200), gap_text);
+            }
+        } else {
+            // Subtle highlight at top edge for depth (not for gap clips)
+            draw_list->AddLine(ImVec2(clip_min.x + rounding, clip_min.y + 1), 
+                              ImVec2(clip_max.x - rounding, clip_min.y + 1), 
+                              IM_COL32(255, 255, 255, 40), 1.0f);
+        }
         
         // Handle zones - subtle darker/lighter areas at edges
         float handle_inner = handle_w;
         
-        if (clip_max.x - clip_min.x > handle_w * 3) {
+        if (clip_max.x - clip_min.x > handle_w * 3 && !clip.is_gap) {
             // Left handle zone
             ImU32 left_handle_col = hover_left ? IM_COL32(255, 255, 255, 60) : IM_COL32(0, 0, 0, 30);
             draw_list->AddRectFilled(clip_min, ImVec2(clip_min.x + handle_inner, clip_max.y), 
@@ -3161,11 +3207,12 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 state.right_trim_original_end = clips[i].end_frame;
                 state.right_trim_clip_timeline_start = clip_positions[i].start_frame;
                 state.right_trim_original_connections.clear();
-                state.right_trim_temp_empty_clip_idx = -1;
-                // Record ALL connected clips' original positions
+                state.right_trim_temp_gap_clip_idx = -1;
+                state.right_trim_cc_on_gap.clear();
+                // Record ALL connected clips' original positions including timeline_start
                 for (int ci = 0; ci < (int)connected_clips.size(); ci++) {
                     const auto& cc = connected_clips[ci];
-                    state.right_trim_original_connections.push_back({ci, cc.connection_frame, cc.connection_offset});
+                    state.right_trim_original_connections.push_back({ci, cc.connection_frame, cc.connection_offset, cc.timeline_start()});
                 }
                 break;
             } else if (on_body && !ImGui::GetIO().KeyAlt) {
@@ -3251,6 +3298,21 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
     }
     
     if (!is_active && state.dragging != 4) {  // Don't reset for middle-mouse panning
+        // Finalize gap clip on right-trim release
+        if (state.dragging == 2 && state.right_trim_temp_gap_clip_idx != -1) {
+            int gap_idx = state.right_trim_temp_gap_clip_idx;
+            if (gap_idx < (int)clips.size() && clips[gap_idx].is_gap) {
+                // Check if any connected clips are still on the gap
+                if (state.right_trim_cc_on_gap.empty()) {
+                    // No connected clips on gap - remove it
+                    clips.erase(clips.begin() + gap_idx);
+                }
+                // Otherwise keep the gap clip (it's now permanent)
+            }
+            state.right_trim_temp_gap_clip_idx = -1;
+            state.right_trim_cc_on_gap.clear();
+        }
+        
         state.dragging = 0;
         state.dragging_clip = -1;
         state.pending_clip = -1;
@@ -3497,42 +3559,130 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 int64_t clip_timeline_start = state.right_trim_clip_timeline_start;
                 int64_t orig_start_source = clip.start_frame;  // Source start doesn't change during right-trim
                 
-                for (const auto& [cc_idx, orig_connection, orig_conn_offset] : state.right_trim_original_connections) {
+                // First pass: determine which connected clips need gap clip
+                std::vector<int> need_gap_clip;
+                
+                for (const auto& [cc_idx, orig_connection, orig_conn_offset, orig_tl_start] : state.right_trim_original_connections) {
+                    if (cc_idx >= (int)connected_clips.size()) continue;
+                    
+                    // Was this connected clip in the ORIGINAL clip range?
+                    if (orig_connection >= clip_timeline_start && 
+                        orig_connection < orig_clip_end_timeline) {
+                        // Check if connected clip's original timeline_start is past new parent end
+                        // This means the connected clip is "orphaned" - needs gap clip
+                        if (orig_tl_start >= new_clip_end_timeline) {
+                            need_gap_clip.push_back(cc_idx);
+                        }
+                    }
+                }
+                
+                // Manage gap clip - ONLY insert if this is the last clip in timeline
+                // If there's a next clip, connected clips can hover over it (no gap needed)
+                bool is_last_clip = (state.dragging_clip == (int)clips.size() - 1);
+                int gap_clip_idx = state.right_trim_temp_gap_clip_idx;
+                int64_t gap_timeline_start = new_clip_end_timeline;
+                
+                if (!need_gap_clip.empty() && gap_clip_idx == -1 && is_last_clip) {
+                    // Need to insert a gap clip after the parent clip (only for last clip)
+                    // Find where to insert it (after the clip being trimmed)
+                    int insert_pos = state.dragging_clip + 1;
+                    
+                    // Calculate the duration needed - at least covers the furthest connected clip
+                    int64_t max_cc_end = 0;
+                    for (int cc_idx : need_gap_clip) {
+                        const auto& orig = state.right_trim_original_connections[cc_idx];
+                        int64_t orig_tl_end = std::get<3>(orig) + connected_clips[cc_idx].frame_count();
+                        max_cc_end = std::max(max_cc_end, orig_tl_end);
+                    }
+                    int64_t gap_duration = max_cc_end - new_clip_end_timeline;
+                    if (gap_duration < 1) gap_duration = 1;
+                    
+                    // Create gap clip - use source_id 0 with virtual frames
+                    Clip gap_clip;
+                    gap_clip.source_id = clip.source_id;  // Use same source for frame reference
+                    gap_clip.start_frame = 0;
+                    gap_clip.end_frame = gap_duration;
+                    gap_clip.color_id = -1;  // Special color for gap
+                    gap_clip.is_gap = true;
+                    
+                    clips.insert(clips.begin() + insert_pos, gap_clip);
+                    state.right_trim_temp_gap_clip_idx = insert_pos;
+                    gap_clip_idx = insert_pos;
+                    state.right_trim_cc_on_gap.clear();
+                } else if (need_gap_clip.empty() && gap_clip_idx != -1) {
+                    // No longer need gap clip - remove it
+                    if (gap_clip_idx < (int)clips.size() && clips[gap_clip_idx].is_gap) {
+                        clips.erase(clips.begin() + gap_clip_idx);
+                    }
+                    state.right_trim_temp_gap_clip_idx = -1;
+                    state.right_trim_cc_on_gap.clear();
+                    gap_clip_idx = -1;
+                }
+                
+                // Adjust gap clip duration if it exists
+                if (gap_clip_idx != -1 && gap_clip_idx < (int)clips.size()) {
+                    int64_t max_cc_end = 0;
+                    for (const auto& [cc_idx, orig_connection, orig_conn_offset, orig_tl_start] : state.right_trim_original_connections) {
+                        if (orig_tl_start >= new_clip_end_timeline) {
+                            int64_t orig_tl_end = orig_tl_start + connected_clips[cc_idx].frame_count();
+                            max_cc_end = std::max(max_cc_end, orig_tl_end);
+                        }
+                    }
+                    int64_t gap_duration = max_cc_end - new_clip_end_timeline;
+                    if (gap_duration < 1) gap_duration = 1;
+                    clips[gap_clip_idx].end_frame = gap_duration;
+                }
+                
+                // Second pass: update connected clips
+                state.right_trim_cc_on_gap.clear();
+                
+                for (const auto& [cc_idx, orig_connection, orig_conn_offset, orig_tl_start] : state.right_trim_original_connections) {
                     if (cc_idx >= (int)connected_clips.size()) continue;
                     auto& cc = connected_clips[cc_idx];
                     
                     // Was this connected clip in the ORIGINAL clip range?
                     if (orig_connection >= clip_timeline_start && 
                         orig_connection < orig_clip_end_timeline) {
-                        // Calculate the source frame in the PARENT this connection was originally pointing to
-                        int64_t orig_offset_in_parent = orig_connection - clip_timeline_start;
-                        int64_t parent_source_frame = orig_start_source + orig_offset_in_parent;
-                        int64_t new_end_source = clip.end_frame;
                         
-                        // Check if the new right edge has passed this source frame
-                        if (new_end_source <= parent_source_frame) {
-                            // Right edge passed the connection point - stick to right edge
-                            // connection_offset becomes negative so clip extends AFTER the anchor
-                            int64_t frames_past = parent_source_frame - new_end_source + 1;
-                            cc.connection_frame = new_clip_end_timeline - 1;
-                            if (cc.connection_frame < clip_timeline_start) {
-                                cc.connection_frame = clip_timeline_start;
-                            }
-                            // Negative offset means clip extends to the right of the anchor
-                            cc.connection_offset = orig_conn_offset - frames_past;
-                            // Clamp so anchor doesn't go past the end of the clip
-                            if (cc.connection_offset < -(cc.frame_count() - 1)) {
-                                cc.connection_offset = -(cc.frame_count() - 1);
-                            }
-                        } else {
-                            // Stay at the original position (source frame unchanged)
+                        // Check if connected clip is orphaned (timeline_start past parent end)
+                        if (orig_tl_start >= new_clip_end_timeline && gap_clip_idx != -1) {
+                            // Move to gap clip - keep at original timeline position
                             cc.connection_frame = orig_connection;
                             cc.connection_offset = orig_conn_offset;
+                            state.right_trim_cc_on_gap.push_back(cc_idx);
+                        } else {
+                            // Calculate the source frame in the PARENT this connection was originally pointing to
+                            int64_t orig_offset_in_parent = orig_connection - clip_timeline_start;
+                            int64_t parent_source_frame = orig_start_source + orig_offset_in_parent;
+                            int64_t new_end_source = clip.end_frame;
+                            
+                            // Check if the new right edge has passed this source frame
+                            if (new_end_source <= parent_source_frame) {
+                                // Right edge passed the connection point - stick to right edge
+                                // connection_offset becomes negative so clip extends AFTER the anchor
+                                int64_t frames_past = parent_source_frame - new_end_source + 1;
+                                cc.connection_frame = new_clip_end_timeline - 1;
+                                if (cc.connection_frame < clip_timeline_start) {
+                                    cc.connection_frame = clip_timeline_start;
+                                }
+                                // Negative offset means clip extends to the right of the anchor
+                                cc.connection_offset = orig_conn_offset - frames_past;
+                                // Clamp so anchor doesn't go past the end of the clip
+                                if (cc.connection_offset < -(cc.frame_count() - 1)) {
+                                    cc.connection_offset = -(cc.frame_count() - 1);
+                                }
+                            } else {
+                                // Stay at the original position (source frame unchanged)
+                                cc.connection_frame = orig_connection;
+                                cc.connection_offset = orig_conn_offset;
+                            }
                         }
                     }
                     // Connected clips AFTER the original clip end should shift
                     else if (orig_connection >= orig_clip_end_timeline) {
-                        cc.connection_frame = orig_connection + total_delta;
+                        // Account for gap clip if present
+                        int64_t extra_shift = (gap_clip_idx != -1) ? clips[gap_clip_idx].frame_count() : 0;
+                        cc.connection_frame = orig_connection + total_delta + extra_shift;
                         cc.connection_offset = orig_conn_offset;
                     }
                     // Connected clips BEFORE the clip being trimmed stay in place
