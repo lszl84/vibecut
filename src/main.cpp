@@ -928,8 +928,8 @@ struct VideoPlayer {
             return;
         }
         
-        // Check if we're on a gap clip - if so, don't change the displayed frame
-        // Gap clips show empty/black content (last frame stays visible)
+        // Check if we're on a gap clip - if so, don't seek to any video
+        // (Connected clips are already handled above, so this is a true gap with no overlay)
         if (is_timeline_frame_on_gap(timeline_frame)) {
             return;
         }
@@ -1791,8 +1791,45 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
         return nullptr;
     };
 
+    // Create a black frame for gap clips
+    AVFrame* black_rgb = av_frame_alloc();
+    black_rgb->format = AV_PIX_FMT_RGB24;
+    black_rgb->width = enc_ctx->width;
+    black_rgb->height = enc_ctx->height;
+    av_frame_get_buffer(black_rgb, 0);
+    memset(black_rgb->data[0], 0, black_rgb->height * black_rgb->linesize[0]);
+    
     // Process each clip
     for (const auto& clip : clips) {
+        // Handle gap clips - output black frames
+        if (clip.is_gap) {
+            std::printf("EXPORT: Processing GAP clip [%lld, %lld) - %lld black frames\n",
+                        (long long)clip.start_frame, (long long)clip.end_frame, (long long)clip.frame_count());
+            for (int64_t i = 0; i < clip.frame_count(); i++) {
+                // Check for connected clip override even on gap clips
+                int cc_idx = find_connected_clip_at_frame(connected_clips, output_frame);
+                if (cc_idx >= 0) {
+                    const auto& cc = connected_clips[cc_idx];
+                    int64_t offset_in_cc = output_frame - cc.timeline_start();
+                    int64_t cc_source_frame = cc.start_frame + offset_in_cc;
+                    std::printf("EXPORT: Connected clip on gap at timeline %lld -> src %d frame %lld\n",
+                                (long long)output_frame, cc.source_id, (long long)cc_source_frame);
+                    AVFrame* rgb = decode_frame_from_source(connected_state, cc.source_id, cc_source_frame, 
+                                                            "cc_gap_" + std::to_string(output_frame));
+                    if (rgb) {
+                        encode_from_rgb(rgb, output_frame);
+                    } else {
+                        encode_from_rgb(black_rgb, output_frame);
+                    }
+                } else {
+                    encode_from_rgb(black_rgb, output_frame);
+                }
+                output_frame++;
+                update_export_progress();
+            }
+            continue;
+        }
+        
         if (clip.source_id < 0 || clip.source_id >= (int)source_paths.size()) continue;
         if (clip.source_id != current_source_id) {
             current_source_id = clip.source_id;
@@ -2066,6 +2103,7 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
     
     // Cleanup
     sws_freeContext(rgb_to_yuv);
+    av_frame_free(&black_rgb);
     av_frame_free(&dec_frame);
     av_packet_free(&enc_pkt);
     av_packet_free(&pkt);
@@ -4224,7 +4262,20 @@ int main() {
                     float img_h = player.height * img_scale;
                     ImVec2 img_pos((preview_size.x - img_w) * 0.5f, (preview_size.y - img_h) * 0.5f);
                     ImGui::SetCursorPos(img_pos);
-                    ImGui::Image((ImTextureID)(intptr_t)player.texture_id, ImVec2(img_w, img_h));
+                    
+                    // Check if we're on a gap clip with no connected clip covering it
+                    bool on_gap = player.is_timeline_frame_on_gap(player.current_timeline_frame);
+                    bool has_connected = player.connected_clip_at_timeline_frame(player.current_timeline_frame) >= 0;
+                    if (on_gap && !has_connected) {
+                        ImDrawList* draw_list = ImGui::GetWindowDrawList();
+                        ImVec2 window_pos = ImGui::GetWindowPos();
+                        ImVec2 rect_min(window_pos.x + img_pos.x, window_pos.y + img_pos.y);
+                        ImVec2 rect_max(window_pos.x + img_pos.x + img_w, window_pos.y + img_pos.y + img_h);
+                        draw_list->AddRectFilled(rect_min, rect_max, IM_COL32(0, 0, 0, 255));
+                        ImGui::Dummy(ImVec2(img_w, img_h));  // Required after SetCursorPos
+                    } else {
+                        ImGui::Image((ImTextureID)(intptr_t)player.texture_id, ImVec2(img_w, img_h));
+                    }
                     
                     if (player.at_timeline_end()) {
                         ImDrawList* draw_list = ImGui::GetWindowDrawList();
