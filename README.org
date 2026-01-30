@@ -53,14 +53,14 @@ git submodule update --init
 * Time Tracking
 
 #+BEGIN: clocktable :maxlevel nil :scope file :block nil
-#+CAPTION: Clock summary at [2026-01-28 Wed 16:51]
+#+CAPTION: Clock summary at [2026-01-30 Fri 20:48]
 | Headline                     | Time  |       |
 |------------------------------+-------+-------|
-| *Total time*                   | *18:32* |       |
+| *Total time*                   | *19:52* |       |
 |------------------------------+-------+-------|
-| Tasks                        | 18:32 |       |
+| Tasks                        | 19:52 |       |
 | \_  Initial Setup / Planning |       |  0:47 |
-| \_  Vibe coding              |       | 16:52 |
+| \_  Vibe coding              |       | 18:12 |
 | \_  Manual coding            |       |  0:53 |
 #+END:
 
@@ -77,6 +77,7 @@ CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
 :END:
 ** Vibe coding
 :LOGBOOK:
+CLOCK: [2026-01-30 Fri 19:28]--[2026-01-30 Fri 20:48] =>  1:20
 CLOCK: [2026-01-28 Wed 15:40]--[2026-01-28 Wed 16:51] =>  1:11
 CLOCK: [2026-01-25 Sun 13:23]--[2026-01-25 Sun 15:04] =>  1:41
 CLOCK: [2026-01-22 Thu 10:52]--[2026-01-22 Thu 11:11] =>  0:19
@@ -108,6 +109,12 @@ Adding/changing code by hand, debugging, etc.
 * Devlog
 
 Live Streams: https://www.youtube.com/@lukeatdevmindscape/streams
+
+** Day 18
+Added audio clips with cute waveform rendering, a menu, and the undo
+stack. The last part needs some more testing; also there are still
+small bugs with splitting connected clips, but overall a good progress
+for an hour of work!
 
 ** Day 17
 Very smooth session today. I used the Planning Mode for the first
