@@ -1,9 +1,4 @@
-# VibeCut TODO
-
-# Connected Clips
-
-# Undo Stack
-- implement infinite undo stack for all the operations that are saved in the project
-- use standard keyboard keys to undo and redo
-
-# Audio Clips
+- FIXED: The main menu is obstructed by clip list panel and the video preview
+- The split clips functionality with B should also work for connected clips
+- FIXED: When the playhead is above a connected audio clips extending beyond the main timeline and we pause the playback, and start the playback again, the played audio is incorrect (we hear sounds from before the playhead?)
+- FIXED: the rendered waveform does not seem to match what is being played at the current playhead position

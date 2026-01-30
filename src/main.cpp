@@ -81,6 +81,16 @@ struct ConnectedClip {
     int64_t timeline_end() const { return timeline_start() + frame_count(); }
 };
 
+// Undo/redo state snapshot
+struct UndoState {
+    std::string operation_name;
+    std::vector<Clip> clips;
+    std::vector<ConnectedClip> connected_clips;
+    int selected_clip = -1;
+    int selected_connected_clip = -1;
+    int64_t current_timeline_frame = 0;
+};
+
 struct SourceInfo {
     std::string path;
     int64_t total_frames = 0;
@@ -138,6 +148,9 @@ struct VideoPlayer {
     int active_clip = 0;      // Currently selected/playing clip
     int next_connected_clip_color_id = 0;
     
+    std::vector<UndoState> undo_stack;
+    std::vector<UndoState> redo_stack;
+    
     std::string source_path;
     std::vector<SourceInfo> sources;
     int active_source = -1;
@@ -178,7 +191,42 @@ struct VideoPlayer {
             remaining -= take;
             if (remaining <= 0) break;
         }
+        // Handle frames beyond main clips (connected clips extending past main timeline)
+        if (remaining > 0) {
+            // Use default fps for extended region
+            t += remaining / fps;
+        }
         return t;
+    }
+    
+    // Convert time (seconds) to timeline frame - inverse of timeline_frame_to_time
+    int64_t time_to_timeline_frame(double target_time) const {
+        if (clips.empty()) return 0;
+        double accumulated_time = 0.0;
+        int64_t accumulated_frames = 0;
+        for (const auto& clip : clips) {
+            int64_t count = clip.frame_count();
+            double clip_fps = fps;  // Default
+            if (clip.source_id >= 0 && clip.source_id < (int)sources.size()) {
+                clip_fps = sources[clip.source_id].fps;
+                if (clip_fps <= 0.0) clip_fps = fps;
+            }
+            double clip_duration = count / clip_fps;
+            if (accumulated_time + clip_duration >= target_time) {
+                // Target time is within this clip
+                double time_into_clip = target_time - accumulated_time;
+                int64_t frames_into_clip = static_cast<int64_t>(time_into_clip * clip_fps + 0.5);
+                return accumulated_frames + std::min(frames_into_clip, count);
+            }
+            accumulated_time += clip_duration;
+            accumulated_frames += count;
+        }
+        // Past all clips - use default fps for extended region
+        double extra_time = target_time - accumulated_time;
+        if (extra_time > 0) {
+            accumulated_frames += static_cast<int64_t>(extra_time * fps + 0.5);
+        }
+        return accumulated_frames;
     }
     
     int64_t ts_to_frame(int64_t ts) const {
@@ -465,6 +513,16 @@ struct VideoPlayer {
         source.audio_pcm = std::move(decoded);
         source.audio_rate = out_rate;
         source.audio_channels = out_layout.nb_channels;
+        
+        // For audio-only sources, update duration and total_frames based on actual decoded audio
+        // This fixes mismatch between container metadata and actual audio length
+        if (source.is_audio_only && !source.audio_pcm.empty()) {
+            size_t total_samples = source.audio_pcm.size() / source.audio_channels;
+            double actual_duration = static_cast<double>(total_samples) / source.audio_rate;
+            source.duration = actual_duration;
+            source.total_frames = static_cast<int64_t>(actual_duration * source.fps + 0.5);
+        }
+        
         return !source.audio_pcm.empty();
     }
     
@@ -557,11 +615,19 @@ struct VideoPlayer {
         }
         // Calculate how much extra audio we need for connected clips extending beyond main timeline
         int64_t main_audio_samples = static_cast<int64_t>(audio.timeline_pcm.size() / audio.channels);
+        int64_t main_frames = main_timeline_frames();
+        double main_time = timeline_frame_to_time(main_frames);
         int64_t max_audio_samples = main_audio_samples;
         for (const auto& cc : connected_clips) {
             int64_t tl_end = cc.timeline_end();
-            if (tl_end > 0) {
-                double tl_end_time = tl_end / fps;
+            if (tl_end > main_frames) {
+                // Use connected clip's source fps for the extended region
+                double cc_fps = fps;
+                if (cc.source_id >= 0 && cc.source_id < (int)sources.size()) {
+                    cc_fps = sources[cc.source_id].fps;
+                }
+                double extra_frames = tl_end - main_frames;
+                double tl_end_time = main_time + extra_frames / cc_fps;
                 int64_t tl_end_sample = static_cast<int64_t>(tl_end_time * audio.sample_rate);
                 max_audio_samples = std::max(max_audio_samples, tl_end_sample);
             }
@@ -588,10 +654,19 @@ struct VideoPlayer {
             int64_t tl_end = cc.timeline_end();
             if (tl_end <= 0) continue;  // Completely before timeline
             
-            // Convert timeline frames to audio samples
-            double tl_start_time = tl_start / fps;
-            double tl_end_time = tl_end / fps;
-            int64_t tl_start_sample = static_cast<int64_t>(tl_start_time * audio.sample_rate);
+            // Convert timeline frames to audio samples using proper time conversion
+            // Use source fps for the connected clip's time calculations
+            double cc_fps = src.fps;
+            double tl_start_time = (tl_start >= 0) ? timeline_frame_to_time(tl_start) : -((double)(-tl_start) / cc_fps);
+            double tl_end_time = timeline_frame_to_time(std::max<int64_t>(0, tl_end));
+            // For extended region past main clips, add the extra time
+            int64_t main_frames = main_timeline_frames();
+            if (tl_end > main_frames) {
+                double main_time = timeline_frame_to_time(main_frames);
+                double extra_frames = tl_end - main_frames;
+                tl_end_time = main_time + extra_frames / cc_fps;
+            }
+            int64_t tl_start_sample = static_cast<int64_t>(std::max(0.0, tl_start_time) * audio.sample_rate);
             int64_t tl_end_sample = static_cast<int64_t>(tl_end_time * audio.sample_rate);
             
             // Clamp to valid range (now includes extended buffer)
@@ -605,9 +680,9 @@ struct VideoPlayer {
             int64_t src_start_sample = static_cast<int64_t>(src_start_time * audio.sample_rate);
             int64_t src_end_sample = static_cast<int64_t>(src_end_time * audio.sample_rate);
             
-            // Adjust if timeline start is after 0 (clip extends before timeline)
+            // Adjust if timeline start is before 0 (clip extends before timeline)
             if (tl_start < 0) {
-                double offset_time = (-tl_start) / fps;
+                double offset_time = (-tl_start) / cc_fps;
                 int64_t offset_samples = static_cast<int64_t>(offset_time * audio.sample_rate);
                 src_start_sample += offset_samples;
             }
@@ -861,6 +936,10 @@ struct VideoPlayer {
                         if (sources[source_id].waveform_cache.empty()) {
                             generate_waveform_cache(sources[source_id]);
                         }
+                        // Update clip end_frame if source total_frames was corrected after decode
+                        if (!clips.empty() && clips.back().source_id == source_id) {
+                            clips.back().end_frame = sources[source_id].total_frames;
+                        }
                         init_audio_device();
                         rebuild_timeline_audio();
                     }
@@ -985,6 +1064,10 @@ struct VideoPlayer {
                 if (sources[source_id].waveform_cache.empty()) {
                     generate_waveform_cache(sources[source_id]);
                 }
+                // Update clip end_frame if source total_frames was corrected after decode
+                if (!clips.empty() && clips.back().source_id == source_id) {
+                    clips.back().end_frame = sources[source_id].total_frames;
+                }
                 init_audio_device();
                 rebuild_timeline_audio();
             }
@@ -1015,6 +1098,49 @@ struct VideoPlayer {
         preview_restore_timeline_frame = 0;
         shutdown_audio();
         audio_dirty = false;
+        undo_stack.clear();
+        redo_stack.clear();
+    }
+    
+    UndoState capture_state(const std::string& op_name, int sel_clip, int sel_cc) const {
+        UndoState state;
+        state.operation_name = op_name;
+        state.clips = clips;
+        state.connected_clips = connected_clips;
+        state.selected_clip = sel_clip;
+        state.selected_connected_clip = sel_cc;
+        state.current_timeline_frame = current_timeline_frame;
+        return state;
+    }
+    
+    void apply_state(const UndoState& state, int& sel_clip, int& sel_cc) {
+        clips = state.clips;
+        connected_clips = state.connected_clips;
+        sel_clip = state.selected_clip;
+        sel_cc = state.selected_connected_clip;
+        current_timeline_frame = state.current_timeline_frame;
+        audio_dirty = true;
+    }
+    
+    void push_undo(const std::string& operation_name, int sel_clip, int sel_cc) {
+        undo_stack.push_back(capture_state(operation_name, sel_clip, sel_cc));
+        redo_stack.clear();
+    }
+    
+    bool undo(int& sel_clip, int& sel_cc) {
+        if (undo_stack.empty()) return false;
+        redo_stack.push_back(capture_state(undo_stack.back().operation_name, sel_clip, sel_cc));
+        apply_state(undo_stack.back(), sel_clip, sel_cc);
+        undo_stack.pop_back();
+        return true;
+    }
+    
+    bool redo(int& sel_clip, int& sel_cc) {
+        if (redo_stack.empty()) return false;
+        undo_stack.push_back(capture_state(redo_stack.back().operation_name, sel_clip, sel_cc));
+        apply_state(redo_stack.back(), sel_clip, sel_cc);
+        redo_stack.pop_back();
+        return true;
     }
     
     bool decode_frame() {
@@ -1116,6 +1242,7 @@ struct VideoPlayer {
     // Find topmost connected clip covering a timeline frame (highest lane takes priority)
     // Returns index into connected_clips, or -1 if none
     // Only considers the "active" part of clips (frames >= 0 on the timeline)
+    // Only returns clips in positive lanes (for video playback)
     int connected_clip_at_timeline_frame(int64_t timeline_frame) const {
         if (timeline_frame < 0) return -1;  // Nothing plays before timeline start
         
@@ -1137,6 +1264,21 @@ struct VideoPlayer {
             }
         }
         return best_idx;
+    }
+    
+    // Find any connected clip at a timeline frame (for splitting, regardless of lane)
+    // Returns index into connected_clips, or -1 if none
+    int any_connected_clip_at_timeline_frame(int64_t timeline_frame) const {
+        if (timeline_frame < 0) return -1;
+        
+        for (int i = 0; i < (int)connected_clips.size(); i++) {
+            const auto& cc = connected_clips[i];
+            int64_t active_start = std::max((int64_t)0, cc.timeline_start());
+            if (timeline_frame >= active_start && timeline_frame < cc.timeline_end()) {
+                return i;  // Return first match
+            }
+        }
+        return -1;
     }
 
     // Seek by timeline frame (clip order)
@@ -1219,10 +1361,55 @@ struct VideoPlayer {
     void split_at(double source_time) {
         split_at_frame(active_source, time_to_frame(source_time));
     }
+    
+    // Split a connected clip at a given timeline frame
+    // Returns true if split was performed
+    bool split_connected_at_timeline(int64_t timeline_frame) {
+        int cc_idx = any_connected_clip_at_timeline_frame(timeline_frame);
+        if (cc_idx < 0) return false;
+        
+        ConnectedClip& cc = connected_clips[cc_idx];
+        
+        // Calculate source frame at this timeline position
+        int64_t offset_in_clip = timeline_frame - cc.timeline_start();
+        int64_t source_split_frame = cc.start_frame + offset_in_clip;
+        
+        // Don't split if too close to edges (need at least 1 frame per clip)
+        if (source_split_frame - cc.start_frame < 1 || cc.end_frame - source_split_frame < 1) return false;
+        
+        // Create the second half of the clip (after the split)
+        ConnectedClip new_cc;
+        new_cc.source_id = cc.source_id;
+        new_cc.start_frame = source_split_frame;
+        new_cc.end_frame = cc.end_frame;
+        new_cc.connection_frame = timeline_frame;  // Connect at the split point
+        new_cc.connection_offset = 0;               // Left edge is the connection point
+        new_cc.lane = cc.lane;
+        new_cc.color_id = next_connected_clip_color_id++;
+        
+        // Trim the original clip to end at the split point
+        cc.end_frame = source_split_frame;
+        
+        // Insert new clip after the original
+        connected_clips.insert(connected_clips.begin() + cc_idx + 1, new_cc);
+        
+        audio_dirty = true;
+        return true;
+    }
 
     bool insert_clip_at_timeline(int source_id, int64_t timeline_frame) {
         if (source_id < 0 || source_id >= (int)sources.size()) return false;
         if (sources[source_id].total_frames <= 0) return false;
+        
+        // For audio-only sources, decode audio first to get accurate total_frames
+        SourceInfo& src = sources[source_id];
+        if (src.is_audio_only && src.audio_pcm.empty()) {
+            decode_audio_for_source(src);
+            if (src.waveform_cache.empty() && !src.audio_pcm.empty()) {
+                generate_waveform_cache(src);
+            }
+        }
+        
         int64_t total = total_timeline_frames();
         timeline_frame = std::clamp<int64_t>(timeline_frame, 0, total);
         int insert_index = (int)clips.size();
@@ -1264,6 +1451,15 @@ struct VideoPlayer {
     bool connect_clip_at_timeline(int source_id, int64_t timeline_frame, int preferred_lane = 1) {
         if (source_id < 0 || source_id >= (int)sources.size()) return false;
         if (sources[source_id].total_frames <= 0) return false;
+        
+        // For audio-only sources, decode audio first to get accurate total_frames
+        SourceInfo& src = sources[source_id];
+        if (src.is_audio_only && src.audio_pcm.empty()) {
+            decode_audio_for_source(src);
+            if (src.waveform_cache.empty() && !src.audio_pcm.empty()) {
+                generate_waveform_cache(src);
+            }
+        }
         
         int64_t new_clip_frames = sources[source_id].total_frames;
         int64_t new_start = timeline_frame;
@@ -1398,7 +1594,12 @@ struct VideoPlayer {
         if (!loaded || !playing) return;
         if (previewing_library) {
             double elapsed = glfwGetTime() - play_start_time;
-            int64_t target_frame = play_start_frame + (int64_t)(elapsed * fps);
+            // Use active source's fps for library preview
+            double preview_fps = fps;
+            if (active_source >= 0 && active_source < (int)sources.size()) {
+                preview_fps = sources[active_source].fps;
+            }
+            int64_t target_frame = play_start_frame + static_cast<int64_t>(elapsed * preview_fps);
             if (target_frame >= total_frames) {
                 seek_to_frame(total_frames > 0 ? total_frames - 1 : 0, true, false, -1, false);
                 pause();
@@ -1410,8 +1611,12 @@ struct VideoPlayer {
         }
         if (clips.empty()) return;
         double elapsed = glfwGetTime() - play_start_time;
-        int64_t target_timeline = play_start_timeline_frame + (int64_t)(elapsed * fps);
+        // Calculate target time and convert to timeline frame using per-clip fps
+        double start_time = timeline_frame_to_time(play_start_timeline_frame);
+        double target_time = start_time + elapsed;
+        int64_t target_timeline = time_to_timeline_frame(target_time);
         int64_t max_timeline = total_timeline_frames();
+        
         if (target_timeline >= max_timeline) {
             seek_to_timeline_frame(max_timeline, true, true);
             pause();
@@ -2708,6 +2913,48 @@ bool save_project_file(const std::string& path, const VideoPlayer& player, float
             {"color", cc.color_id}
         });
     }
+    
+    // Serialize undo/redo stacks
+    auto serialize_undo_state = [](const UndoState& state) -> json {
+        json js;
+        js["operation"] = state.operation_name;
+        js["selected_clip"] = state.selected_clip;
+        js["selected_connected_clip"] = state.selected_connected_clip;
+        js["timeline_frame"] = state.current_timeline_frame;
+        js["clips"] = json::array();
+        for (const auto& clip : state.clips) {
+            js["clips"].push_back({
+                {"source", clip.source_id},
+                {"start", clip.start_frame},
+                {"end", clip.end_frame},
+                {"color", clip.color_id},
+                {"is_gap", clip.is_gap}
+            });
+        }
+        js["connected_clips"] = json::array();
+        for (const auto& cc : state.connected_clips) {
+            js["connected_clips"].push_back({
+                {"source", cc.source_id},
+                {"start", cc.start_frame},
+                {"end", cc.end_frame},
+                {"connection", cc.connection_frame},
+                {"connection_offset", cc.connection_offset},
+                {"lane", cc.lane},
+                {"color", cc.color_id}
+            });
+        }
+        return js;
+    };
+    
+    j["undo_stack"] = json::array();
+    for (const auto& state : player.undo_stack) {
+        j["undo_stack"].push_back(serialize_undo_state(state));
+    }
+    j["redo_stack"] = json::array();
+    for (const auto& state : player.redo_stack) {
+        j["redo_stack"].push_back(serialize_undo_state(state));
+    }
+    
     std::ofstream out(path);
     if (!out) return false;
     out << j.dump(2);
@@ -2776,6 +3023,56 @@ bool load_project_file(const std::string& path, VideoPlayer& player, float& out_
         player.current_timeline_frame, 0, player.total_timeline_frames());
     out_zoom = j.value("timeline_zoom", 1.0f);
     out_zoom = std::clamp(out_zoom, 0.25f, 50.0f);
+    
+    // Deserialize undo/redo stacks
+    auto deserialize_undo_state = [&](const json& js) -> UndoState {
+        UndoState state;
+        state.operation_name = js.value("operation", "");
+        state.selected_clip = js.value("selected_clip", -1);
+        state.selected_connected_clip = js.value("selected_connected_clip", -1);
+        state.current_timeline_frame = js.value("timeline_frame", (int64_t)0);
+        if (js.contains("clips") && js["clips"].is_array()) {
+            for (const auto& c : js["clips"]) {
+                int source_id = c.value("source", 0);
+                int64_t start = c.value("start", (int64_t)0);
+                int64_t end = c.value("end", (int64_t)0);
+                int color = c.value("color", 0);
+                bool is_gap = c.value("is_gap", false);
+                if (end > start) {
+                    state.clips.push_back({source_id, start, end, color, is_gap});
+                }
+            }
+        }
+        if (js.contains("connected_clips") && js["connected_clips"].is_array()) {
+            for (const auto& c : js["connected_clips"]) {
+                int source_id = c.value("source", 0);
+                int64_t start = c.value("start", (int64_t)0);
+                int64_t end = c.value("end", (int64_t)0);
+                int64_t connection = c.value("connection", (int64_t)0);
+                int64_t conn_offset = c.value("connection_offset", (int64_t)0);
+                int lane = c.value("lane", 1);
+                int color = c.value("color", 0);
+                if (end > start) {
+                    state.connected_clips.push_back({source_id, start, end, connection, conn_offset, lane, color});
+                }
+            }
+        }
+        return state;
+    };
+    
+    player.undo_stack.clear();
+    player.redo_stack.clear();
+    if (j.contains("undo_stack") && j["undo_stack"].is_array()) {
+        for (const auto& s : j["undo_stack"]) {
+            player.undo_stack.push_back(deserialize_undo_state(s));
+        }
+    }
+    if (j.contains("redo_stack") && j["redo_stack"].is_array()) {
+        for (const auto& s : j["redo_stack"]) {
+            player.redo_stack.push_back(deserialize_undo_state(s));
+        }
+    }
+    
     player.audio_dirty = true;
     player.rebuild_timeline_audio();
     player.audio_dirty = false;
@@ -2903,6 +3200,8 @@ struct ClipsTimelineState {
     int pending_clip = -1;  // Clip clicked (waiting to see if it becomes a drag)
     int selected_clip = -1;
     bool pending_click = false;
+    bool undo_capture_pending = false;  // Signal to capture undo state
+    std::string pending_undo_operation;  // Name of the operation to capture
     float pending_click_x = 0.0f;
     ImVec2 pending_mouse_start{0.0f, 0.0f};
     float pending_grab_offset_time = 0.0f; // Mouse offset into clip (timeline time)
@@ -3061,11 +3360,54 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         return palette[color_id % (int)(sizeof(palette) / sizeof(palette[0]))];
     };
     
+    // Helper to convert timeline frame to time (accounting for varying fps per clip)
+    auto timeline_frame_to_time_local = [&](int64_t timeline_frame) -> double {
+        double t = 0.0;
+        int64_t remaining = timeline_frame;
+        for (const auto& clip : clips) {
+            int64_t count = clip.frame_count();
+            int64_t take = std::min<int64_t>(remaining, count);
+            double clip_fps = fps;
+            if (clip.source_id >= 0 && clip.source_id < (int)sources.size()) {
+                clip_fps = sources[clip.source_id].fps;
+                if (clip_fps <= 0.0) clip_fps = fps;
+            }
+            t += take / clip_fps;
+            remaining -= take;
+            if (remaining <= 0) break;
+        }
+        // For frames beyond main clips, use default fps
+        if (remaining > 0) {
+            t += remaining / fps;
+        }
+        return t;
+    };
+    
+    // Calculate total main timeline duration in time
+    double main_timeline_time = 0.0;
+    for (const auto& clip : clips) {
+        double clip_fps = fps;
+        if (clip.source_id >= 0 && clip.source_id < (int)sources.size()) {
+            clip_fps = sources[clip.source_id].fps;
+            if (clip_fps <= 0.0) clip_fps = fps;
+        }
+        main_timeline_time += clip.frame_count() / clip_fps;
+    }
+    int64_t main_timeline_frames = 0;
+    for (const auto& clip : clips) {
+        main_timeline_frames += clip.frame_count();
+    }
+    
     // Draw each clip - positioned sequentially (magnetic/ripple style)
     float timeline_pos = 0.0f;  // Current position on timeline (in time units)
     for (int i = 0; i < (int)clips.size(); i++) {
         const Clip& clip = clips[i];
-        float clip_dur_time = frame_to_time(clip.frame_count());
+        // Use source fps for duration calculation to ensure waveform matches audio
+        double source_fps = fps;
+        if (clip.source_id >= 0 && clip.source_id < (int)sources.size()) {
+            source_fps = sources[clip.source_id].fps;
+        }
+        float clip_dur_time = static_cast<float>(clip.frame_count() / source_fps);
         
         // Skip clips outside visible range (convert view to timeline space)
         if (timeline_pos + clip_dur_time < view_start_timeline || timeline_pos > view_end_timeline) {
@@ -3201,9 +3543,28 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
     // Draw connected clips in their lanes
     for (int i = 0; i < (int)connected_clips.size(); i++) {
         const ConnectedClip& cc = connected_clips[i];
-        // Use timeline_start() which accounts for connection_offset
-        float clip_start_time = frame_to_time(cc.timeline_start());
-        float clip_dur_time = frame_to_time(cc.frame_count());
+        // Use source fps for duration calculation
+        double cc_source_fps = fps;
+        if (cc.source_id >= 0 && cc.source_id < (int)sources.size()) {
+            cc_source_fps = sources[cc.source_id].fps;
+            if (cc_source_fps <= 0.0) cc_source_fps = fps;
+        }
+        
+        // Convert timeline frame position to time using proper per-clip fps calculation
+        int64_t tl_start_frame = cc.timeline_start();
+        float clip_start_time;
+        if (tl_start_frame >= 0 && tl_start_frame <= main_timeline_frames) {
+            // Within main timeline - use proper conversion
+            clip_start_time = static_cast<float>(timeline_frame_to_time_local(tl_start_frame));
+        } else if (tl_start_frame < 0) {
+            // Before main timeline - use source fps for the negative portion
+            clip_start_time = static_cast<float>(tl_start_frame / cc_source_fps);
+        } else {
+            // After main timeline - main time + extra frames at source fps
+            double extra_frames = tl_start_frame - main_timeline_frames;
+            clip_start_time = static_cast<float>(main_timeline_time + extra_frames / cc_source_fps);
+        }
+        float clip_dur_time = static_cast<float>(cc.frame_count() / cc_source_fps);
         
         // Skip clips outside visible range
         if (clip_start_time + clip_dur_time < view_start_timeline || clip_start_time > view_end_timeline) {
@@ -3273,7 +3634,15 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                     double samples_per_second = 100.0;
                     int64_t total_waveform_samples = static_cast<int64_t>(src.waveform_cache.size() / 2);
                     
-                    double start_sec = cc.start_frame / src.fps;
+                    // Adjust start frame if part of clip is before timeline 0 (greyed out)
+                    int64_t visible_start_frame = cc.start_frame;
+                    if (has_greyed_part && clip_start_time < 0.0f) {
+                        // Skip the frames before timeline 0
+                        int64_t frames_before_zero = static_cast<int64_t>(-clip_start_time * src.fps);
+                        visible_start_frame = cc.start_frame + frames_before_zero;
+                    }
+                    
+                    double start_sec = visible_start_frame / src.fps;
                     double end_sec = cc.end_frame / src.fps;
                     int64_t wave_start = static_cast<int64_t>(start_sec * samples_per_second);
                     int64_t wave_end = static_cast<int64_t>(end_sec * samples_per_second);
@@ -3613,8 +3982,12 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 state.selected_clip = i;
                 if (std::abs(click_x - start_x) < std::abs(click_x - end_x)) {
                     state.dragging = 1;
+                    state.undo_capture_pending = true;
+                    state.pending_undo_operation = "Trim clip";
                 } else {
                     state.dragging = 2;
+                    state.undo_capture_pending = true;
+                    state.pending_undo_operation = "Trim clip";
                 }
                 state.dragging_clip = i;
                 state.trim_mouse_start_x = mouse.x;
@@ -3641,6 +4014,8 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 clicked_clip = true;
                 state.selected_clip = i;
                 state.dragging = 1;
+                state.undo_capture_pending = true;
+                state.pending_undo_operation = "Trim clip";
                 state.dragging_clip = i;
                 state.trim_mouse_start_x = mouse.x;
                 state.lead_in_start = state.lead_in_time;
@@ -3667,6 +4042,8 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 clicked_clip = true;
                 state.selected_clip = i;
                 state.dragging = 2;
+                state.undo_capture_pending = true;
+                state.pending_undo_operation = "Trim clip";
                 state.dragging_clip = i;
                 // Initialize right-trim state
                 state.right_trim_original_end = clips[i].end_frame;
@@ -3725,18 +4102,24 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 state.selected_clip = -1;  // Deselect main clip
                 state.selected_connected_clip = i;
                 
+                state.undo_capture_pending = true;
                 if (on_left && on_right) {
                     if (std::abs(click_x - start_x) < std::abs(click_x - end_x)) {
                         state.connected_clip_dragging = 1;
+                        state.pending_undo_operation = "Trim connected clip";
                     } else {
                         state.connected_clip_dragging = 2;
+                        state.pending_undo_operation = "Trim connected clip";
                     }
                 } else if (on_left) {
                     state.connected_clip_dragging = 1;
+                    state.pending_undo_operation = "Trim connected clip";
                 } else if (on_right) {
                     state.connected_clip_dragging = 2;
+                    state.pending_undo_operation = "Trim connected clip";
                 } else {
                     state.connected_clip_dragging = 3;  // Move the clip
+                    state.pending_undo_operation = "Move connected clip";
                 }
                 state.dragging_connected_clip = i;
                 state.connected_clip_drag_start_connection = cc.connection_frame;
@@ -3795,6 +4178,8 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         float thresh = ImGui::GetIO().MouseDragThreshold;
         if (dist2 >= thresh * thresh) {
             state.dragging = 5;
+            state.undo_capture_pending = true;
+            state.pending_undo_operation = "Move clip";
             state.dragging_clip = state.pending_clip;
             state.pending_click = false;
             state.drag_grab_offset_time = state.pending_grab_offset_time;
@@ -4545,13 +4930,126 @@ int main() {
         bool open_browser = false;
         render_window(main_window, [&]() {
             ImGuiViewport* viewport = ImGui::GetMainViewport();
+            
+            // Main menu bar
+            float menu_bar_height = 0.0f;
+            if (ImGui::BeginMainMenuBar()) {
+                menu_bar_height = ImGui::GetWindowHeight();
+                
+                if (ImGui::BeginMenu("File")) {
+                    if (ImGui::MenuItem("New", "Ctrl+N")) {
+                        if (project_dirty) {
+                            show_exit_confirm = true;
+                        } else {
+                            player.close();
+                            project_open = false;
+                            project_path.clear();
+                            project_dirty = false;
+                        }
+                    }
+                    if (ImGui::MenuItem("Open...", "Ctrl+O")) {
+                        if (!browser_window.window) {
+                            browser_mode = BrowserMode::OpenProject;
+                            open_browser = true;
+                        }
+                    }
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Save", "Ctrl+S", false, project_open)) {
+                        if (!project_path.empty()) {
+                            pending_project_save = project_path;
+                        } else if (!browser_window.window) {
+                            browser_mode = BrowserMode::SaveProject;
+                            open_browser = true;
+                        }
+                    }
+                    if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S", false, project_open)) {
+                        if (!browser_window.window) {
+                            browser_mode = BrowserMode::SaveProject;
+                            open_browser = true;
+                        }
+                    }
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Exit", "Alt+F4")) {
+                        if (project_dirty) {
+                            show_exit_confirm = true;
+                        } else {
+                            glfwSetWindowShouldClose(main_window.window, GLFW_TRUE);
+                        }
+                    }
+                    ImGui::EndMenu();
+                }
+                
+                if (ImGui::BeginMenu("Edit")) {
+                    std::string undo_label = player.undo_stack.empty() ? "Undo" 
+                        : "Undo " + player.undo_stack.back().operation_name;
+                    if (ImGui::MenuItem(undo_label.c_str(), "Ctrl+Z", false, !player.undo_stack.empty())) {
+                        if (player.undo(timeline_state.selected_clip, timeline_state.selected_connected_clip)) {
+                            timeline_state.clips_modified = true;
+                            player.seek_to_timeline_frame(player.current_timeline_frame);
+                            project_dirty = true;
+                        }
+                    }
+                    std::string redo_label = player.redo_stack.empty() ? "Redo" 
+                        : "Redo " + player.redo_stack.back().operation_name;
+                    if (ImGui::MenuItem(redo_label.c_str(), "Ctrl+Shift+Z", false, !player.redo_stack.empty())) {
+                        if (player.redo(timeline_state.selected_clip, timeline_state.selected_connected_clip)) {
+                            timeline_state.clips_modified = true;
+                            player.seek_to_timeline_frame(player.current_timeline_frame);
+                            project_dirty = true;
+                        }
+                    }
+                    ImGui::EndMenu();
+                }
+                
+                ImGui::EndMainMenuBar();
+            }
+            
+            // Global keyboard shortcuts (work regardless of focus)
+            ImGuiIO& io = ImGui::GetIO();
+            if (!io.WantTextInput) {
+                // Ctrl+N: New project
+                if (ImGui::IsKeyPressed(ImGuiKey_N) && io.KeyCtrl) {
+                    if (project_dirty) {
+                        show_exit_confirm = true;
+                    } else {
+                        player.close();
+                        project_open = false;
+                        project_path.clear();
+                        project_dirty = false;
+                    }
+                }
+                // Ctrl+O: Open project
+                if (ImGui::IsKeyPressed(ImGuiKey_O) && io.KeyCtrl) {
+                    if (!browser_window.window) {
+                        browser_mode = BrowserMode::OpenProject;
+                        open_browser = true;
+                    }
+                }
+                // Ctrl+S: Save project
+                if (ImGui::IsKeyPressed(ImGuiKey_S) && io.KeyCtrl && !io.KeyShift && project_open) {
+                    if (!project_path.empty()) {
+                        pending_project_save = project_path;
+                    } else if (!browser_window.window) {
+                        browser_mode = BrowserMode::SaveProject;
+                        open_browser = true;
+                    }
+                }
+                // Ctrl+Shift+S: Save As
+                if (ImGui::IsKeyPressed(ImGuiKey_S) && io.KeyCtrl && io.KeyShift && project_open) {
+                    if (!browser_window.window) {
+                        browser_mode = BrowserMode::SaveProject;
+                        open_browser = true;
+                    }
+                }
+            }
+            
             if (show_exit_confirm) {
                 ImGui::BeginDisabled();
             }
             
             if (project_open) {
-                ImGui::SetNextWindowPos(ImVec2(0, 0));
-                ImGui::SetNextWindowSize(viewport->Size);
+                ImGui::SetNextWindowPos(ImVec2(0, menu_bar_height));
+                ImGui::SetNextWindowSize(ImVec2(viewport->Size.x, viewport->Size.y - menu_bar_height));
                 ImGui::Begin("##VideoView", nullptr,
                     ImGuiWindowFlags_NoTitleBar |
                     ImGuiWindowFlags_NoResize |
@@ -4564,7 +5062,8 @@ int main() {
                 float controls_height = 195 * ui_scale;
                 float panel_w = 280 * ui_scale;
                 float pad = 10 * ui_scale;
-                float panel_h = viewport->Size.y - controls_height - 2 * pad;
+                float available_height = viewport->Size.y - menu_bar_height;
+                float panel_h = available_height - controls_height - 2 * pad;
                 
                 ImGui::SetCursorPos(ImVec2(pad, pad));
                 ImGui::BeginChild("##ProjectPanel", ImVec2(panel_w, panel_h), true);
@@ -4739,7 +5238,7 @@ int main() {
                 ImGui::EndChild();
                 
                 // Controls
-                ImGui::SetCursorPos(ImVec2(10, viewport->Size.y - controls_height + 5));
+                ImGui::SetCursorPos(ImVec2(10, available_height - controls_height + 5));
                 
                 if (ImGui::Button(player.playing ? "Pause" : "Play", ImVec2(60 * ui_scale, 0))) {
                     if (player.previewing_library) {
@@ -4772,15 +5271,28 @@ int main() {
                     }
                 }
                 
-                // 'B' key to split clip at playhead
-                if (ImGui::IsKeyPressed(ImGuiKey_B) && !player.clips.empty()) {
-                    player.split_at(player.current_time);
-                    player.audio_dirty = true;
-                    project_dirty = true;
+                // 'B' key to split clip at playhead (main clips or connected clips)
+                if (ImGui::IsKeyPressed(ImGuiKey_B)) {
+                    // First try to split a connected clip at the playhead (any lane)
+                    int cc_at_playhead = player.any_connected_clip_at_timeline_frame(player.current_timeline_frame);
+                    if (cc_at_playhead >= 0) {
+                        player.push_undo("Split connected clip", timeline_state.selected_clip, timeline_state.selected_connected_clip);
+                        if (player.split_connected_at_timeline(player.current_timeline_frame)) {
+                            player.audio_dirty = true;
+                            project_dirty = true;
+                        }
+                    } else if (!player.clips.empty()) {
+                        // Fall back to splitting main clip
+                        player.push_undo("Split clip", timeline_state.selected_clip, timeline_state.selected_connected_clip);
+                        player.split_at(player.current_time);
+                        player.audio_dirty = true;
+                        project_dirty = true;
+                    }
                 }
                 
                 // 'W' key to insert selected library clip at playhead
                 if (ImGui::IsKeyPressed(ImGuiKey_W) && library_selected >= 0) {
+                    player.push_undo("Add clip", timeline_state.selected_clip, timeline_state.selected_connected_clip);
                     if (player.insert_clip_at_timeline(library_selected, player.current_timeline_frame)) {
                         player.audio_dirty = true;
                         project_dirty = true;
@@ -4789,6 +5301,7 @@ int main() {
                 
                 // 'Q' key to connect selected library clip at playhead (above timeline)
                 if (ImGui::IsKeyPressed(ImGuiKey_Q) && library_selected >= 0) {
+                    player.push_undo("Add connected clip", timeline_state.selected_clip, timeline_state.selected_connected_clip);
                     if (player.connect_clip_at_timeline(library_selected, player.current_timeline_frame, 1)) {
                         project_dirty = true;
                     }
@@ -4801,11 +5314,13 @@ int main() {
                     
                     // Prefer connected clip if selected, otherwise main clip
                     if (remove_connected_idx >= 0 && remove_connected_idx < (int)player.connected_clips.size()) {
+                        player.push_undo("Delete connected clip", timeline_state.selected_clip, timeline_state.selected_connected_clip);
                         player.connected_clips.erase(player.connected_clips.begin() + remove_connected_idx);
                         timeline_state.selected_connected_clip = -1;
                         timeline_state.clips_modified = true;
                         project_dirty = true;
                     } else if (remove_idx >= 0 && remove_idx < (int)player.clips.size()) {
+                        player.push_undo("Delete clip", timeline_state.selected_clip, timeline_state.selected_connected_clip);
                         // Calculate deleted clip's timeline position before removal
                         int64_t deleted_timeline_start = 0;
                         for (int i = 0; i < remove_idx; i++) {
@@ -4835,6 +5350,25 @@ int main() {
                         }
                         timeline_state.clips_modified = true;
                         player.audio_dirty = true;
+                        project_dirty = true;
+                    }
+                }
+                
+                // Ctrl+Z: Undo
+                if (ImGui::IsKeyPressed(ImGuiKey_Z) && ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeyShift) {
+                    if (player.undo(timeline_state.selected_clip, timeline_state.selected_connected_clip)) {
+                        timeline_state.clips_modified = true;
+                        player.seek_to_timeline_frame(player.current_timeline_frame);
+                        project_dirty = true;
+                    }
+                }
+                
+                // Ctrl+Shift+Z or Ctrl+Y: Redo
+                if ((ImGui::IsKeyPressed(ImGuiKey_Z) && ImGui::GetIO().KeyCtrl && ImGui::GetIO().KeyShift) ||
+                    (ImGui::IsKeyPressed(ImGuiKey_Y) && ImGui::GetIO().KeyCtrl)) {
+                    if (player.redo(timeline_state.selected_clip, timeline_state.selected_connected_clip)) {
+                        timeline_state.clips_modified = true;
+                        player.seek_to_timeline_frame(player.current_timeline_frame);
                         project_dirty = true;
                     }
                 }
@@ -4901,7 +5435,7 @@ int main() {
                 ImGui::Dummy(ImVec2(0, 2 * ui_scale));
                 
                 // Timeline with clips
-                ImGui::SetCursorPos(ImVec2(10, viewport->Size.y - controls_height + 45 * ui_scale));
+                ImGui::SetCursorPos(ImVec2(10, available_height - controls_height + 45 * ui_scale));
                 int64_t curr_frame = player.current_frame;
                 int curr_source_id = player.active_source;
                 int64_t curr_timeline_frame = player.current_timeline_frame;
@@ -4911,6 +5445,13 @@ int main() {
                 }
                 
                 static int64_t last_seek_frame = -1;
+                
+                // Capture undo state before timeline modifications
+                if (timeline_state.undo_capture_pending) {
+                    player.push_undo(timeline_state.pending_undo_operation, timeline_state.selected_clip, timeline_state.selected_connected_clip);
+                    timeline_state.undo_capture_pending = false;
+                    timeline_state.pending_undo_operation.clear();
+                }
                 
                 if (ClipsTimeline("##clips_timeline", &curr_frame, &curr_source_id, &curr_timeline_frame, player.clips, player.connected_clips, player.sources, max_source_frames, player.fps,
                                  ImVec2(viewport->Size.x - 20, 150 * ui_scale), timeline_state)) {
@@ -4925,6 +5466,7 @@ int main() {
                     player.stop_library_preview();
                 }
                 if (timeline_state.pending_library_source >= 0) {
+                    player.push_undo("Add clip", timeline_state.selected_clip, timeline_state.selected_connected_clip);
                     if (player.insert_clip_at_timeline(timeline_state.pending_library_source,
                                                       timeline_state.pending_library_timeline)) {
                         player.audio_dirty = true;
