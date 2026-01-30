@@ -102,6 +102,15 @@ This feature is not yet implemented in VibeCut.
 - Parts of connected clips extending before timeline frame 0 are **skipped** during playback
 - Parts extending over other main clips play normally (they override those clips)
 
+### Extended Timeline
+When connected clips extend past the end of the main timeline:
+- **Playback continues** until the furthest connected clip ends
+- The main video shows black, but connected clips play their content
+- **Export includes** all frames up to the end of the furthest connected clip
+- Audio from extended connected clips is included in the mix
+
+This ensures that connected clips that overlap the end of the main timeline are fully played and exported.
+
 ## Trimming Parent Clips
 
 This is the most complex aspect of connected clips behavior.

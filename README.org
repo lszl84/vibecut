@@ -113,7 +113,7 @@ Live Streams: https://www.youtube.com/@lukeatdevmindscape/streams
 Very smooth session today. I used the Planning Mode for the first
 time, to create a documentation for the Connected Clips feature. It
 went quite well: I told Claude to do a web research on how that
-feature works in Apple Final Cut and it was able to expand of my basic
+feature works in Apple Final Cut and it was able to expand my basic
 description of the feature and create a comprehensive Markdown doc.
 This doc is now connected to AGENTS.md - let's see if that helps the
 Agent to not introduce regression bugs like it used to do before...

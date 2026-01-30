@@ -92,6 +92,8 @@ struct SourceInfo {
     int audio_rate = 48000;
     int audio_channels = 2;
     std::vector<float> audio_pcm;
+    bool is_audio_only = false;
+    std::vector<float> waveform_cache;  // Downsampled waveform for display (min/max pairs)
 };
 
 struct VideoPlayer {
@@ -198,7 +200,23 @@ struct VideoPlayer {
     }
     
     // Total frames across all clips in the edited timeline
+    // Includes connected clips that extend past the main timeline
     int64_t total_timeline_frames() const {
+        int64_t total = 0;
+        for (const auto& clip : clips) total += clip.frame_count();
+        
+        // Check if any connected clips extend past the main timeline
+        for (const auto& cc : connected_clips) {
+            int64_t cc_end = cc.timeline_end();
+            if (cc_end > total) {
+                total = cc_end;
+            }
+        }
+        return total;
+    }
+    
+    // Total frames from main clips only (not including connected clip extensions)
+    int64_t main_timeline_frames() const {
         int64_t total = 0;
         for (const auto& clip : clips) total += clip.frame_count();
         return total;
@@ -212,6 +230,23 @@ struct VideoPlayer {
             int64_t count = c.frame_count();
             if (timeline_frame >= pos && timeline_frame < pos + count) {
                 return c.is_gap;
+            }
+            pos += count;
+        }
+        return false;
+    }
+    
+    // Check if a timeline frame falls on an audio-only clip
+    bool is_timeline_frame_on_audio_only(int64_t timeline_frame) const {
+        if (clips.empty()) return false;
+        int64_t pos = 0;
+        for (const auto& c : clips) {
+            int64_t count = c.frame_count();
+            if (timeline_frame >= pos && timeline_frame < pos + count) {
+                if (c.source_id >= 0 && c.source_id < (int)sources.size()) {
+                    return sources[c.source_id].is_audio_only;
+                }
+                return false;
             }
             pos += count;
         }
@@ -432,6 +467,47 @@ struct VideoPlayer {
         source.audio_channels = out_layout.nb_channels;
         return !source.audio_pcm.empty();
     }
+    
+    // Generate downsampled waveform data for display
+    // Stores min/max pairs per sample window for proper waveform visualization
+    void generate_waveform_cache(SourceInfo& source) {
+        if (source.audio_pcm.empty()) return;
+        
+        // Target: ~100 samples per second of audio for smooth display
+        const int samples_per_second = 100;
+        const int window_size = source.audio_rate / samples_per_second;
+        if (window_size <= 0) return;
+        
+        const int channels = source.audio_channels;
+        const size_t total_samples = source.audio_pcm.size() / channels;
+        const size_t num_windows = (total_samples + window_size - 1) / window_size;
+        
+        source.waveform_cache.clear();
+        source.waveform_cache.reserve(num_windows * 2);  // min/max pairs
+        
+        for (size_t w = 0; w < num_windows; w++) {
+            size_t start = w * window_size;
+            size_t end = std::min(start + window_size, total_samples);
+            
+            float min_val = 1.0f;
+            float max_val = -1.0f;
+            
+            for (size_t s = start; s < end; s++) {
+                // Average across channels
+                float sample = 0.0f;
+                for (int c = 0; c < channels; c++) {
+                    sample += source.audio_pcm[s * channels + c];
+                }
+                sample /= channels;
+                
+                min_val = std::min(min_val, sample);
+                max_val = std::max(max_val, sample);
+            }
+            
+            source.waveform_cache.push_back(min_val);
+            source.waveform_cache.push_back(max_val);
+        }
+    }
 
     void rebuild_timeline_audio() {
         audio.playing.store(false);
@@ -447,6 +523,9 @@ struct VideoPlayer {
             SourceInfo& src = sources[clip.source_id];
             if (src.audio_pcm.empty()) {
                 decode_audio_for_source(src);
+                if (src.waveform_cache.empty() && !src.audio_pcm.empty()) {
+                    generate_waveform_cache(src);
+                }
             }
             double start_time = clip.start_frame / src.fps;
             double end_time = clip.end_frame / src.fps;
@@ -476,6 +555,84 @@ struct VideoPlayer {
                                           static_cast<size_t>(pad_samples) * audio.channels, 0.0f);
             }
         }
+        // Calculate how much extra audio we need for connected clips extending beyond main timeline
+        int64_t main_audio_samples = static_cast<int64_t>(audio.timeline_pcm.size() / audio.channels);
+        int64_t max_audio_samples = main_audio_samples;
+        for (const auto& cc : connected_clips) {
+            int64_t tl_end = cc.timeline_end();
+            if (tl_end > 0) {
+                double tl_end_time = tl_end / fps;
+                int64_t tl_end_sample = static_cast<int64_t>(tl_end_time * audio.sample_rate);
+                max_audio_samples = std::max(max_audio_samples, tl_end_sample);
+            }
+        }
+        // Extend timeline audio buffer with silence if connected clips extend beyond
+        if (max_audio_samples > main_audio_samples) {
+            audio.timeline_pcm.resize(static_cast<size_t>(max_audio_samples) * audio.channels, 0.0f);
+        }
+        
+        // Mix in audio from connected clips
+        for (const auto& cc : connected_clips) {
+            if (cc.source_id < 0 || cc.source_id >= (int)sources.size()) continue;
+            SourceInfo& src = sources[cc.source_id];
+            if (src.audio_pcm.empty()) {
+                decode_audio_for_source(src);
+                if (src.waveform_cache.empty() && !src.audio_pcm.empty()) {
+                    generate_waveform_cache(src);
+                }
+            }
+            if (src.audio_pcm.empty()) continue;
+            
+            // Calculate timeline position of this connected clip
+            int64_t tl_start = cc.timeline_start();
+            int64_t tl_end = cc.timeline_end();
+            if (tl_end <= 0) continue;  // Completely before timeline
+            
+            // Convert timeline frames to audio samples
+            double tl_start_time = tl_start / fps;
+            double tl_end_time = tl_end / fps;
+            int64_t tl_start_sample = static_cast<int64_t>(tl_start_time * audio.sample_rate);
+            int64_t tl_end_sample = static_cast<int64_t>(tl_end_time * audio.sample_rate);
+            
+            // Clamp to valid range (now includes extended buffer)
+            tl_start_sample = std::max<int64_t>(0, tl_start_sample);
+            tl_end_sample = std::min<int64_t>(tl_end_sample, static_cast<int64_t>(audio.timeline_pcm.size() / audio.channels));
+            if (tl_start_sample >= tl_end_sample) continue;
+            
+            // Calculate source audio range
+            double src_start_time = cc.start_frame / src.fps;
+            double src_end_time = cc.end_frame / src.fps;
+            int64_t src_start_sample = static_cast<int64_t>(src_start_time * audio.sample_rate);
+            int64_t src_end_sample = static_cast<int64_t>(src_end_time * audio.sample_rate);
+            
+            // Adjust if timeline start is after 0 (clip extends before timeline)
+            if (tl_start < 0) {
+                double offset_time = (-tl_start) / fps;
+                int64_t offset_samples = static_cast<int64_t>(offset_time * audio.sample_rate);
+                src_start_sample += offset_samples;
+            }
+            
+            const int64_t src_total_samples = static_cast<int64_t>(src.audio_pcm.size() / src.audio_channels);
+            src_start_sample = std::clamp<int64_t>(src_start_sample, 0, src_total_samples);
+            src_end_sample = std::clamp<int64_t>(src_end_sample, 0, src_total_samples);
+            
+            // Mix audio samples (additive mixing with soft clipping)
+            int64_t samples_to_mix = std::min(tl_end_sample - tl_start_sample, src_end_sample - src_start_sample);
+            for (int64_t i = 0; i < samples_to_mix; i++) {
+                for (int c = 0; c < audio.channels; c++) {
+                    size_t tl_idx = (tl_start_sample + i) * audio.channels + c;
+                    size_t src_idx = (src_start_sample + i) * src.audio_channels + (c % src.audio_channels);
+                    if (tl_idx < audio.timeline_pcm.size() && src_idx < src.audio_pcm.size()) {
+                        float mixed = audio.timeline_pcm[tl_idx] + src.audio_pcm[src_idx];
+                        // Soft clipping
+                        if (mixed > 1.0f) mixed = 1.0f - 1.0f / (mixed + 1.0f);
+                        else if (mixed < -1.0f) mixed = -1.0f + 1.0f / (-mixed + 1.0f);
+                        audio.timeline_pcm[tl_idx] = mixed;
+                    }
+                }
+            }
+        }
+        
         audio_loaded = !audio.timeline_pcm.empty();
         if (audio_loaded && !audio.device_initialized) {
             init_audio_device();
@@ -496,40 +653,71 @@ struct VideoPlayer {
             avformat_close_input(&ctx);
             return std::nullopt;
         }
+        
         int video_idx = -1;
+        int audio_idx = -1;
         for (unsigned i = 0; i < ctx->nb_streams; i++) {
-            if (ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            if (ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && video_idx < 0) {
                 video_idx = i;
-                break;
+            } else if (ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && audio_idx < 0) {
+                audio_idx = i;
             }
         }
-        if (video_idx < 0) {
+        
+        SourceInfo info;
+        info.path = path;
+        
+        if (video_idx >= 0) {
+            // Video file (may also have audio)
+            AVStream* stream = ctx->streams[video_idx];
+            AVCodecParameters* codecpar = stream->codecpar;
+            info.width = codecpar->width;
+            info.height = codecpar->height;
+            if (stream->avg_frame_rate.num && stream->avg_frame_rate.den) {
+                info.fps_q = stream->avg_frame_rate;
+            } else if (stream->r_frame_rate.num && stream->r_frame_rate.den) {
+                info.fps_q = stream->r_frame_rate;
+            } else {
+                info.fps_q = {30, 1};
+            }
+            info.fps = av_q2d(info.fps_q);
+            double time_base_local = av_q2d(stream->time_base);
+            info.duration = (stream->duration != AV_NOPTS_VALUE)
+                ? (stream->duration * time_base_local)
+                : (ctx->duration / (double)AV_TIME_BASE);
+            if (stream->nb_frames > 0) {
+                info.total_frames = stream->nb_frames;
+            } else if (stream->duration != AV_NOPTS_VALUE) {
+                info.total_frames = (int64_t)(info.duration * info.fps + 0.5);
+            }
+            info.is_audio_only = false;
+        } else if (audio_idx >= 0) {
+            // Audio-only file
+            AVStream* stream = ctx->streams[audio_idx];
+            info.is_audio_only = true;
+            info.width = 0;
+            info.height = 0;
+            info.fps_q = {30, 1};  // Use 30fps for frame calculations
+            info.fps = 30.0;
+            info.audio_rate = stream->codecpar->sample_rate;
+            info.audio_channels = stream->codecpar->ch_layout.nb_channels;
+            
+            // Get duration from audio stream or container
+            if (stream->duration != AV_NOPTS_VALUE) {
+                double time_base_local = av_q2d(stream->time_base);
+                info.duration = stream->duration * time_base_local;
+            } else if (ctx->duration != AV_NOPTS_VALUE) {
+                info.duration = ctx->duration / (double)AV_TIME_BASE;
+            } else {
+                info.duration = 0.0;
+            }
+            info.total_frames = (int64_t)(info.duration * info.fps + 0.5);
+        } else {
+            // No video or audio stream found
             avformat_close_input(&ctx);
             return std::nullopt;
         }
-        AVStream* stream = ctx->streams[video_idx];
-        AVCodecParameters* codecpar = stream->codecpar;
-        SourceInfo info;
-        info.path = path;
-        info.width = codecpar->width;
-        info.height = codecpar->height;
-        if (stream->avg_frame_rate.num && stream->avg_frame_rate.den) {
-            info.fps_q = stream->avg_frame_rate;
-        } else if (stream->r_frame_rate.num && stream->r_frame_rate.den) {
-            info.fps_q = stream->r_frame_rate;
-        } else {
-            info.fps_q = {30, 1};
-        }
-        info.fps = av_q2d(info.fps_q);
-        double time_base_local = av_q2d(stream->time_base);
-        info.duration = (stream->duration != AV_NOPTS_VALUE)
-            ? (stream->duration * time_base_local)
-            : (ctx->duration / (double)AV_TIME_BASE);
-        if (stream->nb_frames > 0) {
-            info.total_frames = stream->nb_frames;
-        } else if (stream->duration != AV_NOPTS_VALUE) {
-            info.total_frames = (int64_t)(info.duration * info.fps + 0.5);
-        }
+        
         avformat_close_input(&ctx);
         return info;
     }
@@ -639,6 +827,48 @@ struct VideoPlayer {
         }
         
         if (video_stream < 0) {
+            // Check if this is an audio-only source
+            if (sources[source_id].is_audio_only) {
+                // Audio-only source: set up minimal state without video decoder
+                width = 0;
+                height = 0;
+                fps = sources[source_id].fps;
+                fps_q = sources[source_id].fps_q;
+                duration = sources[source_id].duration;
+                total_frames = sources[source_id].total_frames;
+                loaded = true;
+                
+                if (!keep_playing) {
+                    current_time = 0.0;
+                    current_frame = 0;
+                    playing = false;
+                } else {
+                    playing = was_playing;
+                }
+                
+                std::printf("Audio-only source: %.5f fps, %lld frames, %.3f sec\n",
+                            fps, (long long)total_frames, duration);
+                
+                if (reset_timeline) {
+                    clips.clear();
+                    next_clip_color_id = 0;
+                    clips.push_back({source_id, 0, total_frames, next_clip_color_id++});
+                    active_clip = 0;
+                    current_frame = 0;
+                    current_timeline_frame = 0;
+                    audio_dirty = true;
+                    if (decode_audio_for_source(sources[source_id])) {
+                        if (sources[source_id].waveform_cache.empty()) {
+                            generate_waveform_cache(sources[source_id]);
+                        }
+                        init_audio_device();
+                        rebuild_timeline_audio();
+                    }
+                    audio_dirty = false;
+                }
+                
+                return true;
+            }
             std::fprintf(stderr, "No video stream found\n");
             close_decoder();
             return false;
@@ -752,6 +982,9 @@ struct VideoPlayer {
             current_timeline_frame = 0;
             audio_dirty = true;
             if (decode_audio_for_source(sources[source_id])) {
+                if (sources[source_id].waveform_cache.empty()) {
+                    generate_waveform_cache(sources[source_id]);
+                }
                 init_audio_device();
                 rebuild_timeline_audio();
             }
@@ -928,14 +1161,22 @@ struct VideoPlayer {
             return;
         }
         
-        // Check if we're on a gap clip - if so, don't seek to any video
-        // (Connected clips are already handled above, so this is a true gap with no overlay)
-        if (is_timeline_frame_on_gap(timeline_frame)) {
+        // Check if we're past the main timeline but still have connected clips
+        // (Connected clips already handled above, so if we get here there's no video)
+        int64_t main_end = main_timeline_frames();
+        if (timeline_frame >= main_end) {
+            // Past main timeline, no connected clip - show black
+            return;
+        }
+        
+        // Check if we're on a gap clip or audio-only clip - if so, don't seek to any video
+        // (Connected clips are already handled above, so this is a true gap/audio with no video overlay)
+        if (is_timeline_frame_on_gap(timeline_frame) || is_timeline_frame_on_audio_only(timeline_frame)) {
             return;
         }
         
         int64_t display_override = -1;
-        if (timeline_frame == max_timeline) {
+        if (timeline_frame == main_end) {
             int64_t last_clip_frame = clips.back().end_frame - 1;
             if (last_clip_frame >= 0) {
                 display_override = last_clip_frame;
@@ -1100,6 +1341,9 @@ struct VideoPlayer {
         seek_to_frame(0, true, false, -1, false);
         if (sources[source_id].audio_pcm.empty()) {
             decode_audio_for_source(sources[source_id]);
+            if (sources[source_id].waveform_cache.empty() && !sources[source_id].audio_pcm.empty()) {
+                generate_waveform_cache(sources[source_id]);
+            }
         }
         audio.playing.store(false);
         audio.use_preview.store(false);
@@ -1414,7 +1658,8 @@ int find_connected_clip_at_frame(const std::vector<ConnectedClip>& connected_cli
 }
 
 // SIMPLIFIED LINEAR EXPORT: decode → encode → write immediately, no buffering
-bool export_clips(const std::vector<std::string>& source_paths, const std::string& output, const std::vector<Clip>& clips,
+bool export_clips(const std::vector<std::string>& source_paths, const std::vector<bool>& source_audio_only,
+                  const std::string& output, const std::vector<Clip>& clips,
                   const std::vector<ConnectedClip>& connected_clips,
                   double fps, const ExportAudio& audio_export, std::atomic<bool>& exporting, std::atomic<float>& progress) {
     if (clips.empty()) {
@@ -1424,12 +1669,19 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
     
     std::printf("EXPORT: === SIMPLIFIED LINEAR EXPORT ===\n");
     
-    // Calculate total frames
-    int64_t total_frames = 0;
+    // Calculate total frames (including connected clips that extend past main timeline)
+    int64_t main_frames = 0;
     for (const auto& clip : clips) {
-        total_frames += clip.frame_count();
+        main_frames += clip.frame_count();
     }
-    std::printf("EXPORT: Total frames to export: %lld\n", (long long)total_frames);
+    int64_t total_frames = main_frames;
+    for (const auto& cc : connected_clips) {
+        int64_t cc_end = cc.timeline_end();
+        if (cc_end > total_frames) {
+            total_frames = cc_end;
+        }
+    }
+    std::printf("EXPORT: Total frames to export: %lld (main: %lld)\n", (long long)total_frames, (long long)main_frames);
     
     struct SourceDecodeState {
         AVFormatContext* in_ctx = nullptr;
@@ -1498,16 +1750,38 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
         return true;
     };
 
-    if (clips.front().source_id < 0 || clips.front().source_id >= (int)source_paths.size()) {
-        exporting = false;
-        return false;
+    // Find first video source to get dimensions for encoder
+    int first_video_source = -1;
+    for (const auto& clip : clips) {
+        if (clip.source_id >= 0 && clip.source_id < (int)source_audio_only.size() && 
+            !source_audio_only[clip.source_id] && !clip.is_gap) {
+            first_video_source = clip.source_id;
+            break;
+        }
     }
+    // Also check connected clips
+    if (first_video_source < 0) {
+        for (const auto& cc : connected_clips) {
+            if (cc.source_id >= 0 && cc.source_id < (int)source_audio_only.size() && 
+                !source_audio_only[cc.source_id]) {
+                first_video_source = cc.source_id;
+                break;
+            }
+        }
+    }
+    
     SourceDecodeState source_state;
-    if (!open_source(source_paths[clips.front().source_id], source_state)) {
-        exporting = false;
-        return false;
+    int video_width = 1920;   // Default dimensions if no video source
+    int video_height = 1080;
+    
+    if (first_video_source >= 0 && first_video_source < (int)source_paths.size()) {
+        if (open_source(source_paths[first_video_source], source_state)) {
+            video_width = source_state.dec_ctx->width;
+            video_height = source_state.dec_ctx->height;
+        }
     }
-    AVRational fps_q = av_d2q(fps > 0.0 ? fps : av_q2d(source_state.fps_q), 100000);
+    
+    AVRational fps_q = av_d2q(fps > 0.0 ? fps : (source_state.fps_q.num ? av_q2d(source_state.fps_q) : 30.0), 100000);
     if (fps_q.num == 0 || fps_q.den == 0) {
         fps_q = {30, 1};
     }
@@ -1523,8 +1797,8 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
     
     AVStream* out_video = avformat_new_stream(out_ctx, nullptr);
     AVCodecContext* enc_ctx = avcodec_alloc_context3(encoder);
-    enc_ctx->width = source_state.dec_ctx->width;
-    enc_ctx->height = source_state.dec_ctx->height;
+    enc_ctx->width = video_width;
+    enc_ctx->height = video_height;
     enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
     enc_ctx->time_base = frame_tb;
     enc_ctx->framerate = fps_q;
@@ -1604,6 +1878,7 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
     fs::path debug_dir = fs::path(output).parent_path() / "export_debug";
     fs::create_directories(debug_dir);
     auto ensure_source_converters = [&]() {
+        if (!source_state.dec_ctx) return;  // No video source to convert
         if (!source_state.debug_sws) {
             source_state.debug_sws = sws_getContext(
                 source_state.dec_ctx->width, source_state.dec_ctx->height, source_state.dec_ctx->pix_fmt,
@@ -1619,7 +1894,7 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
             av_frame_get_buffer(source_state.debug_rgb, 0);
         }
     };
-    ensure_source_converters();
+    if (source_state.dec_ctx) ensure_source_converters();
     
     // Convert to RGB and save PPM - returns the RGB frame for encoding
     auto convert_and_save_ppm = [&](AVFrame* src, const std::string& name) -> AVFrame* {
@@ -1720,7 +1995,7 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
         }
     };
     
-    int current_source_id = clips.front().source_id;
+    int current_source_id = first_video_source >= 0 ? first_video_source : clips.front().source_id;
     
     // Second decoder state for connected clips
     SourceDecodeState connected_state;
@@ -1824,6 +2099,37 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
                 } else {
                     encode_from_rgb(black_rgb, output_frame);
                 }
+                output_frame++;
+                update_export_progress();
+            }
+            continue;
+        }
+        
+        // Handle audio-only clips - output black frames (same as gap clips)
+        if (clip.source_id >= 0 && clip.source_id < (int)source_audio_only.size() && source_audio_only[clip.source_id]) {
+            std::printf("EXPORT: Processing AUDIO-ONLY clip [%lld, %lld) - %lld black frames\n",
+                        (long long)clip.start_frame, (long long)clip.end_frame, (long long)clip.frame_count());
+            for (int64_t i = 0; i < clip.frame_count(); i++) {
+                // Check for connected video clip override
+                int cc_idx = find_connected_clip_at_frame(connected_clips, output_frame);
+                if (cc_idx >= 0) {
+                    const auto& cc = connected_clips[cc_idx];
+                    // Only show video from non-audio-only connected clips
+                    if (cc.source_id >= 0 && cc.source_id < (int)source_audio_only.size() && 
+                        !source_audio_only[cc.source_id]) {
+                        int64_t offset_in_cc = output_frame - cc.timeline_start();
+                        int64_t cc_source_frame = cc.start_frame + offset_in_cc;
+                        AVFrame* rgb = decode_frame_from_source(connected_state, cc.source_id, cc_source_frame, 
+                                                                "cc_audio_" + std::to_string(output_frame));
+                        if (rgb) {
+                            encode_from_rgb(rgb, output_frame);
+                            output_frame++;
+                            update_export_progress();
+                            continue;
+                        }
+                    }
+                }
+                encode_from_rgb(black_rgb, output_frame);
                 output_frame++;
                 update_export_progress();
             }
@@ -2009,6 +2315,34 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::strin
             }
         }
         std::printf("EXPORT: Clip done, got %lld/%lld frames\n", (long long)frames_got, (long long)frames_needed);
+    }
+    
+    // Handle frames past main timeline (connected clips that extend beyond)
+    while (output_frame < total_frames) {
+        int cc_idx = find_connected_clip_at_frame(connected_clips, output_frame);
+        if (cc_idx >= 0) {
+            const auto& cc = connected_clips[cc_idx];
+            // Only show video from non-audio-only connected clips
+            if (cc.source_id >= 0 && cc.source_id < (int)source_audio_only.size() && 
+                !source_audio_only[cc.source_id]) {
+                int64_t offset_in_cc = output_frame - cc.timeline_start();
+                int64_t cc_source_frame = cc.start_frame + offset_in_cc;
+                std::printf("EXPORT: Extended timeline frame %lld -> connected clip src %d frame %lld\n",
+                            (long long)output_frame, cc.source_id, (long long)cc_source_frame);
+                AVFrame* rgb = decode_frame_from_source(connected_state, cc.source_id, cc_source_frame, 
+                                                        "cc_ext_" + std::to_string(output_frame));
+                if (rgb) {
+                    encode_from_rgb(rgb, output_frame);
+                    output_frame++;
+                    update_export_progress();
+                    continue;
+                }
+            }
+        }
+        // No video - output black frame
+        encode_from_rgb(black_rgb, output_frame);
+        output_frame++;
+        update_export_progress();
     }
     
     // Flush video encoder
@@ -2611,7 +2945,7 @@ struct ClipsTimelineState {
 // Modern Final Cut-style magnetic timeline widget with zoom/scroll
 // Clips are frame-based for precision
 // Returns true if anything changed
-bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* current_source_id, int64_t* current_timeline_frame, std::vector<Clip>& clips, std::vector<ConnectedClip>& connected_clips, int64_t total_source_frames, double fps, const ImVec2& size, ClipsTimelineState& state) {
+bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* current_source_id, int64_t* current_timeline_frame, std::vector<Clip>& clips, std::vector<ConnectedClip>& connected_clips, const std::vector<SourceInfo>& sources, int64_t total_source_frames, double fps, const ImVec2& size, ClipsTimelineState& state) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     
@@ -2630,9 +2964,16 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
     float source_duration = frame_to_time(total_source_frames);
     float frame_duration = (float)(1.0 / fps);
     
-    // Calculate total timeline frames (sum of all clip frame counts)
+    // Calculate total timeline frames (sum of all clip frame counts + connected clip extensions)
     int64_t total_timeline_frames = 0;
     for (const auto& c : clips) total_timeline_frames += c.frame_count();
+    // Include connected clips that extend past the main timeline
+    for (const auto& cc : connected_clips) {
+        int64_t cc_end = cc.timeline_end();
+        if (cc_end > total_timeline_frames) {
+            total_timeline_frames = cc_end;
+        }
+    }
     float total_duration = frame_to_time(total_timeline_frames);
     if (total_duration < 0.01f) total_duration = source_duration;
     float display_duration = total_duration + state.lead_in_time;
@@ -2775,6 +3116,51 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
             draw_list->AddLine(ImVec2(clip_min.x + rounding, clip_min.y + 1), 
                               ImVec2(clip_max.x - rounding, clip_min.y + 1), 
                               IM_COL32(255, 255, 255, 40), 1.0f);
+            
+            // Draw waveform for audio-only clips
+            if (clip.source_id >= 0 && clip.source_id < (int)sources.size()) {
+                const SourceInfo& src = sources[clip.source_id];
+                if (src.is_audio_only && !src.waveform_cache.empty()) {
+                    float wave_height = (clip_max.y - clip_min.y) * 0.8f;
+                    float wave_center = (clip_min.y + clip_max.y) / 2.0f;
+                    float clip_width_px = clip_max.x - clip_min.x;
+                    
+                    // Calculate which waveform samples to draw
+                    int64_t clip_frames = clip.frame_count();
+                    double samples_per_second = 100.0;  // Matches generate_waveform_cache
+                    double clip_duration_sec = clip_frames / src.fps;
+                    int64_t total_waveform_samples = static_cast<int64_t>(src.waveform_cache.size() / 2);
+                    
+                    // Map clip source range to waveform indices
+                    double start_sec = clip.start_frame / src.fps;
+                    double end_sec = clip.end_frame / src.fps;
+                    int64_t wave_start = static_cast<int64_t>(start_sec * samples_per_second);
+                    int64_t wave_end = static_cast<int64_t>(end_sec * samples_per_second);
+                    wave_start = std::clamp<int64_t>(wave_start, 0, total_waveform_samples);
+                    wave_end = std::clamp<int64_t>(wave_end, 0, total_waveform_samples);
+                    
+                    if (wave_end > wave_start) {
+                        float samples_per_px = (float)(wave_end - wave_start) / clip_width_px;
+                        
+                        for (float px = 0; px < clip_width_px; px += 1.0f) {
+                            int64_t sample_idx = wave_start + static_cast<int64_t>(px * samples_per_px);
+                            if (sample_idx >= total_waveform_samples) break;
+                            
+                            float min_val = src.waveform_cache[sample_idx * 2];
+                            float max_val = src.waveform_cache[sample_idx * 2 + 1];
+                            
+                            float y_top = wave_center - max_val * wave_height / 2.0f;
+                            float y_bottom = wave_center - min_val * wave_height / 2.0f;
+                            
+                            draw_list->AddLine(
+                                ImVec2(clip_min.x + px, y_top),
+                                ImVec2(clip_min.x + px, y_bottom),
+                                IM_COL32(180, 200, 255, 200), 1.0f
+                            );
+                        }
+                    }
+                }
+            }
         }
         
         // Handle zones - subtle darker/lighter areas at edges
@@ -2875,6 +3261,47 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
             draw_list->AddLine(ImVec2(clip_min.x + (has_greyed_part ? 0 : rounding), clip_min.y + 1), 
                               ImVec2(clip_max.x - rounding, clip_min.y + 1), 
                               IM_COL32(255, 255, 255, 40), 1.0f);
+            
+            // Draw waveform for audio-only connected clips
+            if (cc.source_id >= 0 && cc.source_id < (int)sources.size()) {
+                const SourceInfo& src = sources[cc.source_id];
+                if (src.is_audio_only && !src.waveform_cache.empty()) {
+                    float wave_height = (clip_max.y - clip_min.y) * 0.8f;
+                    float wave_center = (clip_min.y + clip_max.y) / 2.0f;
+                    float clip_width_px = clip_max.x - clip_min.x;
+                    
+                    double samples_per_second = 100.0;
+                    int64_t total_waveform_samples = static_cast<int64_t>(src.waveform_cache.size() / 2);
+                    
+                    double start_sec = cc.start_frame / src.fps;
+                    double end_sec = cc.end_frame / src.fps;
+                    int64_t wave_start = static_cast<int64_t>(start_sec * samples_per_second);
+                    int64_t wave_end = static_cast<int64_t>(end_sec * samples_per_second);
+                    wave_start = std::clamp<int64_t>(wave_start, 0, total_waveform_samples);
+                    wave_end = std::clamp<int64_t>(wave_end, 0, total_waveform_samples);
+                    
+                    if (wave_end > wave_start && clip_width_px > 0) {
+                        float samples_per_px = (float)(wave_end - wave_start) / clip_width_px;
+                        
+                        for (float px = 0; px < clip_width_px; px += 1.0f) {
+                            int64_t sample_idx = wave_start + static_cast<int64_t>(px * samples_per_px);
+                            if (sample_idx >= total_waveform_samples) break;
+                            
+                            float min_val = src.waveform_cache[sample_idx * 2];
+                            float max_val = src.waveform_cache[sample_idx * 2 + 1];
+                            
+                            float y_top = wave_center - max_val * wave_height / 2.0f;
+                            float y_bottom = wave_center - min_val * wave_height / 2.0f;
+                            
+                            draw_list->AddLine(
+                                ImVec2(clip_min.x + px, y_top),
+                                ImVec2(clip_min.x + px, y_bottom),
+                                IM_COL32(180, 200, 255, 200), 1.0f
+                            );
+                        }
+                    }
+                }
+            }
             
             // Handle zones
             float handle_inner = handle_w;
@@ -4191,9 +4618,12 @@ int main() {
                         std::vector<ConnectedClip> connected_clips_copy = player.connected_clips;
                         double fps_copy = player.fps;
                         std::vector<std::string> source_paths;
+                        std::vector<bool> source_audio_only;
                         source_paths.reserve(player.sources.size());
+                        source_audio_only.reserve(player.sources.size());
                         for (const auto& src : player.sources) {
                             source_paths.push_back(src.path);
+                            source_audio_only.push_back(src.is_audio_only);
                         }
                         ExportAudio audio_copy;
                         audio_copy.timeline_pcm = player.audio.timeline_pcm;
@@ -4202,8 +4632,8 @@ int main() {
                         audio_copy.has_audio = !audio_copy.timeline_pcm.empty();
                         
                         if (export_thread.joinable()) export_thread.join();
-                        export_thread = std::thread([&, out_path, clips_copy, connected_clips_copy, fps_copy, source_paths, audio_copy]() {
-                            export_clips(source_paths, out_path, clips_copy, connected_clips_copy, fps_copy, audio_copy, exporting, export_progress);
+                        export_thread = std::thread([&, out_path, clips_copy, connected_clips_copy, fps_copy, source_paths, source_audio_only, audio_copy]() {
+                            export_clips(source_paths, source_audio_only, out_path, clips_copy, connected_clips_copy, fps_copy, audio_copy, exporting, export_progress);
                         });
                     }
                     if (!can_export) ImGui::EndDisabled();
@@ -4263,10 +4693,19 @@ int main() {
                     ImVec2 img_pos((preview_size.x - img_w) * 0.5f, (preview_size.y - img_h) * 0.5f);
                     ImGui::SetCursorPos(img_pos);
                     
-                    // Check if we're on a gap clip with no connected clip covering it
+                    // Check if we're on a gap, audio-only clip, or past main timeline with no connected video
                     bool on_gap = player.is_timeline_frame_on_gap(player.current_timeline_frame);
-                    bool has_connected = player.connected_clip_at_timeline_frame(player.current_timeline_frame) >= 0;
-                    if (on_gap && !has_connected) {
+                    bool on_audio_only = player.is_timeline_frame_on_audio_only(player.current_timeline_frame);
+                    bool past_main = player.current_timeline_frame >= player.main_timeline_frames();
+                    int cc_idx = player.connected_clip_at_timeline_frame(player.current_timeline_frame);
+                    bool has_video_connected = false;
+                    if (cc_idx >= 0 && cc_idx < (int)player.connected_clips.size()) {
+                        int cc_src = player.connected_clips[cc_idx].source_id;
+                        if (cc_src >= 0 && cc_src < (int)player.sources.size()) {
+                            has_video_connected = !player.sources[cc_src].is_audio_only;
+                        }
+                    }
+                    if ((on_gap || on_audio_only || past_main) && !has_video_connected) {
                         ImDrawList* draw_list = ImGui::GetWindowDrawList();
                         ImVec2 window_pos = ImGui::GetWindowPos();
                         ImVec2 rect_min(window_pos.x + img_pos.x, window_pos.y + img_pos.y);
@@ -4473,7 +4912,7 @@ int main() {
                 
                 static int64_t last_seek_frame = -1;
                 
-                if (ClipsTimeline("##clips_timeline", &curr_frame, &curr_source_id, &curr_timeline_frame, player.clips, player.connected_clips, max_source_frames, player.fps,
+                if (ClipsTimeline("##clips_timeline", &curr_frame, &curr_source_id, &curr_timeline_frame, player.clips, player.connected_clips, player.sources, max_source_frames, player.fps,
                                  ImVec2(viewport->Size.x - 20, 150 * ui_scale), timeline_state)) {
                     if (curr_timeline_frame != last_seek_frame) {
                         last_seek_frame = curr_timeline_frame;
