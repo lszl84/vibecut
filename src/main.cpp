@@ -680,6 +680,11 @@ struct VideoPlayer {
         // Mix in audio from connected clips
         std::printf("AUDIO MIX: %zu connected clips, main_audio_samples=%lld\n", 
                     connected_clips.size(), (long long)main_audio_samples);
+        
+        // Track last end sample and source frame for each source to ensure sample-perfect continuity
+        // Key: source_id, Value: {last_tl_end_sample, last_src_end_frame}
+        std::map<int, std::pair<int64_t, int64_t>> source_continuity;
+        
         for (size_t cc_idx = 0; cc_idx < connected_clips.size(); cc_idx++) {
             const auto& cc = connected_clips[cc_idx];
             if (cc.source_id < 0 || cc.source_id >= (int)sources.size()) continue;
@@ -726,6 +731,27 @@ struct VideoPlayer {
             }
             int64_t tl_start_sample = static_cast<int64_t>(std::max(0.0, tl_start_time) * audio.sample_rate);
             int64_t tl_end_sample = static_cast<int64_t>(tl_end_time * audio.sample_rate);
+            
+            // Check for source continuity - if this clip continues from where another clip
+            // of the same source ended AND is actually adjacent on the timeline, 
+            // use the exact end sample to avoid gaps/overlaps from rounding errors
+            auto cont_it = source_continuity.find(cc.source_id);
+            if (cont_it != source_continuity.end()) {
+                int64_t last_tl_end = cont_it->second.first;
+                int64_t last_src_end_frame = cont_it->second.second;
+                // If this clip's source frames start exactly where the last one ended
+                // AND the timeline position is close (within 0.1 seconds = ~5000 samples)
+                // This ensures we only adjust for split clips that haven't been moved
+                int64_t sample_diff = std::abs(tl_start_sample - last_tl_end);
+                if (cc.start_frame == last_src_end_frame && sample_diff < audio.sample_rate / 10) {
+                    // Calculate expected samples based on source frame difference
+                    int64_t src_samples = static_cast<int64_t>((cc.end_frame - cc.start_frame) / src.fps * audio.sample_rate);
+                    tl_start_sample = last_tl_end;
+                    tl_end_sample = tl_start_sample + src_samples;
+                    std::printf("  CC[%zu]: CONTINUITY ADJUSTED - using last_tl_end=%lld as start (diff was %lld samples)\n",
+                                cc_idx, (long long)last_tl_end, (long long)sample_diff);
+                }
+            }
             
             std::printf("  CC[%zu]: tl_start_sample=%lld, tl_end_sample=%lld (before clamp)\n",
                         cc_idx, (long long)tl_start_sample, (long long)tl_end_sample);
@@ -780,6 +806,9 @@ struct VideoPlayer {
                     }
                 }
             }
+            
+            // Update continuity tracking for this source
+            source_continuity[cc.source_id] = {tl_start_sample + samples_to_mix, cc.end_frame};
         }
         
         audio_loaded = !audio.timeline_pcm.empty();
@@ -3444,6 +3473,15 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         return cc.timeline_start() + static_cast<int64_t>(duration * fps + 0.5);
     };
     
+    // Helper to get correct duration in seconds for a connected clip
+    auto cc_duration_seconds = [&sources, fps](const ConnectedClip& cc) -> float {
+        double cc_fps = fps;  // Default to project fps
+        if (cc.source_id >= 0 && cc.source_id < (int)sources.size()) {
+            cc_fps = sources[cc.source_id].fps;
+        }
+        return static_cast<float>(cc.frame_count() / cc_fps);
+    };
+    
     float source_duration = frame_to_time(total_source_frames);
     float frame_duration = (float)(1.0 / fps);
     
@@ -4295,7 +4333,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
             for (int i = 0; i < (int)connected_clips.size(); i++) {
                 const ConnectedClip& cc = connected_clips[i];
                 float clip_start_time = frame_to_time(cc.timeline_start());
-                float clip_dur_time = frame_to_time(cc.frame_count());
+                float clip_dur_time = cc_duration_seconds(cc);
                 float start_x = time_to_x(clip_start_time);
                 float end_x = time_to_x(clip_start_time + clip_dur_time);
                 auto [lane_top, lane_bottom] = lane_y_bounds(cc.lane);
@@ -4860,7 +4898,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         for (int i = 0; i < (int)connected_clips.size() && !cursor_set; i++) {
             const ConnectedClip& cc = connected_clips[i];
             float clip_start_time = frame_to_time(cc.timeline_start());
-            float clip_dur_time = frame_to_time(cc.frame_count());
+            float clip_dur_time = cc_duration_seconds(cc);
             float start_x = time_to_x(clip_start_time);
             float end_x = time_to_x(clip_start_time + clip_dur_time);
             auto [lane_top, lane_bottom] = lane_y_bounds(cc.lane);
