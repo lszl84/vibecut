@@ -587,6 +587,10 @@ struct VideoPlayer {
 
     void rebuild_timeline_audio() {
         audio.playing.store(false);
+        // Stop audio device to prevent race condition with audio callback
+        if (audio.device_initialized) {
+            ma_device_stop(&audio.device);
+        }
         audio.timeline_pcm.clear();
         if (clips.empty()) {
             audio_loaded = false;
@@ -717,18 +721,8 @@ struct VideoPlayer {
             double clip_duration = cc.frame_count() / cc_fps;
             double tl_end_time = tl_start_time + clip_duration;
             
-            std::printf("  CC[%zu]: src_id=%d, start_frame=%lld, end_frame=%lld, frame_count=%lld\n",
-                        cc_idx, cc.source_id, (long long)cc.start_frame, (long long)cc.end_frame, (long long)cc.frame_count());
-            std::printf("  CC[%zu]: connection_frame=%lld, connection_offset=%lld, tl_start=%lld\n",
-                        cc_idx, (long long)cc.connection_frame, (long long)cc.connection_offset, (long long)tl_start);
-            std::printf("  CC[%zu]: cc_fps=%.2f, tl_start_time=%.3f, clip_duration=%.3f, tl_end_time=%.3f\n",
-                        cc_idx, cc_fps, tl_start_time, clip_duration, tl_end_time);
-            
             // Skip if completely before timeline
-            if (tl_end_time <= 0.0) {
-                std::printf("  CC[%zu]: SKIP - completely before timeline\n", cc_idx);
-                continue;
-            }
+            if (tl_end_time <= 0.0) continue;
             int64_t tl_start_sample = static_cast<int64_t>(std::max(0.0, tl_start_time) * audio.sample_rate);
             int64_t tl_end_sample = static_cast<int64_t>(tl_end_time * audio.sample_rate);
             
@@ -748,21 +742,13 @@ struct VideoPlayer {
                     int64_t src_samples = static_cast<int64_t>((cc.end_frame - cc.start_frame) / src.fps * audio.sample_rate);
                     tl_start_sample = last_tl_end;
                     tl_end_sample = tl_start_sample + src_samples;
-                    std::printf("  CC[%zu]: CONTINUITY ADJUSTED - using last_tl_end=%lld as start (diff was %lld samples)\n",
-                                cc_idx, (long long)last_tl_end, (long long)sample_diff);
                 }
             }
-            
-            std::printf("  CC[%zu]: tl_start_sample=%lld, tl_end_sample=%lld (before clamp)\n",
-                        cc_idx, (long long)tl_start_sample, (long long)tl_end_sample);
             
             // Clamp to valid range (now includes extended buffer)
             tl_start_sample = std::max<int64_t>(0, tl_start_sample);
             tl_end_sample = std::min<int64_t>(tl_end_sample, static_cast<int64_t>(audio.timeline_pcm.size() / audio.channels));
-            if (tl_start_sample >= tl_end_sample) {
-                std::printf("  CC[%zu]: SKIP - tl_start_sample >= tl_end_sample after clamp\n", cc_idx);
-                continue;
-            }
+            if (tl_start_sample >= tl_end_sample) continue;
             
             // Calculate source audio range
             double src_start_time = cc.start_frame / src.fps;
@@ -770,17 +756,11 @@ struct VideoPlayer {
             int64_t src_start_sample = static_cast<int64_t>(src_start_time * audio.sample_rate);
             int64_t src_end_sample = static_cast<int64_t>(src_end_time * audio.sample_rate);
             
-            std::printf("  CC[%zu]: src_start_time=%.3f, src_end_time=%.3f\n", cc_idx, src_start_time, src_end_time);
-            std::printf("  CC[%zu]: src_start_sample=%lld, src_end_sample=%lld\n",
-                        cc_idx, (long long)src_start_sample, (long long)src_end_sample);
-            
             // Adjust if timeline start is before 0 (clip extends before timeline)
             if (tl_start < 0) {
                 double offset_time = (-tl_start) / cc_fps;
                 int64_t offset_samples = static_cast<int64_t>(offset_time * audio.sample_rate);
                 src_start_sample += offset_samples;
-                std::printf("  CC[%zu]: adjusted src_start_sample by %lld for negative tl_start\n",
-                            cc_idx, (long long)offset_samples);
             }
             
             const int64_t src_total_samples = static_cast<int64_t>(src.audio_pcm.size() / src.audio_channels);
@@ -789,10 +769,6 @@ struct VideoPlayer {
             
             // Mix audio samples (additive mixing with soft clipping)
             int64_t samples_to_mix = std::min(tl_end_sample - tl_start_sample, src_end_sample - src_start_sample);
-            std::printf("  CC[%zu]: MIXING %lld samples from src[%lld..%lld] to tl[%lld..%lld]\n",
-                        cc_idx, (long long)samples_to_mix, 
-                        (long long)src_start_sample, (long long)(src_start_sample + samples_to_mix),
-                        (long long)tl_start_sample, (long long)(tl_start_sample + samples_to_mix));
             for (int64_t i = 0; i < samples_to_mix; i++) {
                 for (int c = 0; c < audio.channels; c++) {
                     size_t tl_idx = (tl_start_sample + i) * audio.channels + c;
@@ -814,6 +790,9 @@ struct VideoPlayer {
         audio_loaded = !audio.timeline_pcm.empty();
         if (audio_loaded && !audio.device_initialized) {
             init_audio_device();
+        } else if (audio_loaded && audio.device_initialized) {
+            // Restart device that was stopped at the beginning
+            ma_device_start(&audio.device);
         }
         set_audio_playhead_from_timeline(current_timeline_frame);
     }
@@ -1633,7 +1612,42 @@ struct VideoPlayer {
         return true;
     }
 
-    bool connect_clip_at_timeline(int source_id, int64_t timeline_frame, int preferred_lane = 1) {
+    // Find an available lane for a connected clip at the given timeline range
+    // exclude_idx: index of clip to exclude from overlap check (for moving existing clips)
+    // prefer_negative: if true, search negative lanes first (for audio), else positive (for video)
+    int find_available_lane(int64_t new_start, int64_t new_end, int preferred_lane, 
+                           int exclude_idx = -1, bool prefer_negative = false) {
+        auto lane_overlaps = [&](int lane) {
+            for (size_t i = 0; i < connected_clips.size(); i++) {
+                if ((int)i == exclude_idx) continue;
+                const ConnectedClip& cc = connected_clips[i];
+                if (cc.lane != lane) continue;
+                int64_t cc_start = cc.timeline_start();
+                int64_t cc_end = connected_clip_timeline_end(cc);
+                if (new_start < cc_end && new_end > cc_start) return true;
+            }
+            return false;
+        };
+        
+        // Try preferred lane first
+        if (!lane_overlaps(preferred_lane)) return preferred_lane;
+        
+        // Interleaved search to prefer lanes closer to main track
+        // Audio stays in negative lanes only, video stays in positive lanes only
+        for (int dist = 1; dist <= 10; dist++) {
+            if (prefer_negative) {
+                // Audio: only negative lanes
+                if (!lane_overlaps(-dist)) return -dist;
+            } else {
+                // Video: only positive lanes
+                if (!lane_overlaps(dist)) return dist;
+            }
+        }
+        
+        return preferred_lane;  // Fallback
+    }
+
+    bool connect_clip_at_timeline(int source_id, int64_t timeline_frame, int preferred_lane = 0) {
         if (source_id < 0 || source_id >= (int)sources.size()) return false;
         if (sources[source_id].total_frames <= 0) return false;
         
@@ -1646,42 +1660,21 @@ struct VideoPlayer {
             }
         }
         
-        int64_t new_clip_frames = sources[source_id].total_frames;
-        int64_t new_start = timeline_frame;
-        int64_t new_end = timeline_frame + new_clip_frames;
-        
-        // Find available lane (check positive lanes 1, 2 first, then negative -1, -2)
-        auto lane_available = [&](int lane) {
-            for (const auto& cc : connected_clips) {
-                if (cc.lane != lane) continue;
-                int64_t cc_end = cc.connection_frame + cc.frame_count();
-                // Check for overlap
-                if (new_start < cc_end && new_end > cc.connection_frame) {
-                    return false;  // Overlap found
-                }
-            }
-            return true;
-        };
-        
-        int lane = preferred_lane;
-        if (!lane_available(lane)) {
-            // Try other positive lanes
-            for (int try_lane = 1; try_lane <= 2; try_lane++) {
-                if (lane_available(try_lane)) {
-                    lane = try_lane;
-                    break;
-                }
-            }
-            // If still not found, try negative lanes
-            if (!lane_available(lane)) {
-                for (int try_lane = -1; try_lane >= -2; try_lane--) {
-                    if (lane_available(try_lane)) {
-                        lane = try_lane;
-                        break;
-                    }
-                }
-            }
+        // Auto-select preferred lane: negative for audio-only, positive for video
+        bool prefer_negative = src.is_audio_only;
+        if (preferred_lane == 0) {
+            preferred_lane = prefer_negative ? -1 : 1;
         }
+        
+        // Calculate timeline range using FPS conversion
+        int64_t new_clip_source_frames = sources[source_id].total_frames;
+        double new_clip_fps = sources[source_id].fps > 0 ? sources[source_id].fps : fps;
+        double new_clip_duration = new_clip_source_frames / new_clip_fps;
+        int64_t new_clip_timeline_frames = static_cast<int64_t>(new_clip_duration * fps + 0.5);
+        int64_t new_start = timeline_frame;
+        int64_t new_end = timeline_frame + new_clip_timeline_frames;
+        
+        int lane = find_available_lane(new_start, new_end, preferred_lane, -1, prefer_negative);
         
         ConnectedClip cc;
         cc.source_id = source_id;
@@ -3442,6 +3435,8 @@ struct ClipsTimelineState {
     std::vector<std::tuple<int, int64_t, int64_t, int64_t>> right_trim_original_connections;
     int right_trim_temp_gap_clip_idx = -1;  // Index of temporary gap clip (-1 if none)
     std::vector<int> right_trim_cc_on_gap;  // Connected clip indices that are currently on the gap clip
+    // Vertical lane scrolling
+    float lane_scroll_offset = 0.0f;  // Vertical scroll offset for lanes (pixels)
 };
 
 // Modern Final Cut-style magnetic timeline widget with zoom/scroll
@@ -3544,23 +3539,45 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
     // Always leave room for scrollbar
     float clip_area_bottom = scroll_bar_y - 4;
     
-    // Lane layout: main track in center, lanes above and below
-    float total_lane_area = clip_area_bottom - bb_min.y - playhead_head_size;
-    float lane_height = total_lane_area / 5.0f;  // 2 lanes above, 1 main, 2 lanes below
-    float main_track_top = bb_min.y + playhead_head_size + lane_height * 2;
+    // Lane layout with fixed height and vertical scrolling
+    const float lane_height = 40.0f;  // Fixed lane height
+    float lanes_area_top = bb_min.y + playhead_head_size;
+    float lanes_area_height = clip_area_bottom - lanes_area_top;
+    
+    // Determine max/min lanes in use
+    int max_pos_lane = 0, max_neg_lane = 0;
+    for (const auto& cc : connected_clips) {
+        if (cc.lane > max_pos_lane) max_pos_lane = cc.lane;
+        if (cc.lane < max_neg_lane) max_neg_lane = cc.lane;
+    }
+    int total_lanes = 1 + max_pos_lane + (-max_neg_lane);  // main + positive + negative
+    float total_lanes_height = total_lanes * lane_height;
+    
+    // Calculate scroll limits
+    float max_lane_scroll = std::max(0.0f, total_lanes_height - lanes_area_height);
+    state.lane_scroll_offset = std::clamp(state.lane_scroll_offset, 0.0f, max_lane_scroll);
+    
+    // Main track position (centered in view when no scroll, scrolls with content otherwise)
+    // Lane 0 (main) is always at position: max_pos_lane lanes from the top
+    float main_track_virtual_top = max_pos_lane * lane_height;  // Virtual Y of main track (before scroll)
+    float main_track_top = lanes_area_top + main_track_virtual_top - state.lane_scroll_offset;
     float main_track_bottom = main_track_top + lane_height;
     
     // Helper to get Y bounds for a lane (lane 1, 2 = above; -1, -2 = below; 0 = main)
+    // Returns virtual coordinates that may be outside visible area
     auto lane_y_bounds = [&](int lane) -> std::pair<float, float> {
-        if (lane == 0) return {main_track_top, main_track_bottom};
-        if (lane > 0) {
-            float top = main_track_top - lane * lane_height;
-            return {top, top + lane_height};
+        // Lane n is n lanes above main (for positive) or |n| lanes below main (for negative)
+        float virtual_lane_top;
+        if (lane >= 0) {
+            virtual_lane_top = (max_pos_lane - lane) * lane_height;
         } else {
-            float top = main_track_bottom + (-lane - 1) * lane_height;
-            return {top, top + lane_height};
+            virtual_lane_top = (max_pos_lane + 1 + (-lane - 1)) * lane_height;
         }
+        float top = lanes_area_top + virtual_lane_top - state.lane_scroll_offset;
+        return {top, top + lane_height};
     };
+    
+    bool needs_vertical_scroll = total_lanes_height > lanes_area_height;
     
     // Track if mouse is over scrollbar area (for click priority)
     bool mouse_over_scrollbar = (mouse.y >= scroll_bar_y - 2 && mouse.y <= bb_max.y &&
@@ -3763,6 +3780,9 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         timeline_pos += clip_dur_time;
     }
     
+    // Push clip rect to limit lane rendering to visible area
+    draw_list->PushClipRect(ImVec2(bb_min.x, lanes_area_top), ImVec2(bb_max.x, clip_area_bottom), true);
+    
     // Draw connected clips in their lanes
     for (int i = 0; i < (int)connected_clips.size(); i++) {
         const ConnectedClip& cc = connected_clips[i];
@@ -3948,6 +3968,9 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         }
     }
     
+    // Pop the clip rect for lane rendering
+    draw_list->PopClipRect();
+    
     // Draw lane separator lines
     draw_list->AddLine(ImVec2(bb_min.x, main_track_top), ImVec2(bb_max.x, main_track_top), 
                       IM_COL32(60, 60, 65, 255), 1.0f);
@@ -4015,7 +4038,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         ImGui::EndDragDropTarget();
     }
     
-    // Mouse wheel: Shift+wheel for scroll, plain wheel for zoom
+    // Mouse wheel: Shift+wheel for scroll, Ctrl+wheel for vertical scroll, plain wheel for zoom
     // Also support horizontal scroll (touchpad, horizontal mouse wheel)
     if (is_hovered) {
         float wheel = ImGui::GetIO().MouseWheel;
@@ -4028,7 +4051,11 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         }
         
         if (std::abs(wheel) > 0.01f) {
-            if (ImGui::GetIO().KeyShift && state.zoom > 1.01f) {
+            if (ImGui::GetIO().KeyCtrl && needs_vertical_scroll) {
+                // Ctrl+wheel for vertical lane scrolling
+                state.lane_scroll_offset -= wheel * lane_height;
+                state.lane_scroll_offset = std::clamp(state.lane_scroll_offset, 0.0f, max_lane_scroll);
+            } else if (ImGui::GetIO().KeyShift && state.zoom > 1.01f) {
                 // Shift+wheel for horizontal scrolling
                 state.scroll -= wheel * visible_duration * 0.15f;
                 state.scroll = std::clamp(state.scroll, 0.0f, max_scroll);
@@ -4872,6 +4899,43 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
     
     // Reset connected clip dragging when mouse released
     if (!is_active) {
+        // Re-evaluate lane when move ends
+        if (state.connected_clip_dragging == 3 && state.dragging_connected_clip >= 0 && 
+            state.dragging_connected_clip < (int)connected_clips.size()) {
+            ConnectedClip& cc = connected_clips[state.dragging_connected_clip];
+            int64_t cc_start = cc.timeline_start();
+            int64_t cc_end = cc_timeline_end_local(cc);
+            bool prefer_negative = (cc.source_id >= 0 && cc.source_id < (int)sources.size()) 
+                                   ? sources[cc.source_id].is_audio_only : false;
+            // Find optimal lane excluding self
+            auto lane_overlaps_local = [&](int lane) {
+                for (int i = 0; i < (int)connected_clips.size(); i++) {
+                    if (i == state.dragging_connected_clip) continue;
+                    const ConnectedClip& other = connected_clips[i];
+                    if (other.lane != lane) continue;
+                    int64_t other_start = other.timeline_start();
+                    int64_t other_end = cc_timeline_end_local(other);
+                    if (cc_start < other_end && cc_end > other_start) return true;
+                }
+                return false;
+            };
+            // Search for optimal lane - audio stays in negative lanes, video in positive
+            int new_lane = cc.lane;
+            bool found = false;
+            for (int dist = 1; dist <= 10 && !found; dist++) {
+                if (prefer_negative) {
+                    // Audio: only search negative lanes
+                    if (!lane_overlaps_local(-dist)) { new_lane = -dist; found = true; }
+                } else {
+                    // Video: only search positive lanes
+                    if (!lane_overlaps_local(dist)) { new_lane = dist; found = true; }
+                }
+            }
+            if (found && new_lane != cc.lane) {
+                cc.lane = new_lane;
+                state.clips_modified = true;
+            }
+        }
         state.connected_clip_dragging = 0;
         state.dragging_connected_clip = -1;
     }
@@ -5110,6 +5174,10 @@ int main() {
     enum class BrowserMode { None, AddLibrary, OpenProject, SaveProject, NewProjectFromVideo };
     BrowserMode browser_mode = BrowserMode::None;
     ClipsTimelineState timeline_state;
+    float timeline_height = 150.0f;  // Timeline panel height (resizable via splitter)
+    bool dragging_splitter = false;
+    float splitter_drag_start_y = 0.0f;
+    float splitter_drag_start_height = 0.0f;
     std::string window_title_cache;
     
     std::atomic<bool> exporting{false};
@@ -5327,7 +5395,7 @@ int main() {
                     ImGuiWindowFlags_NoScrollWithMouse);
                 
                 float ui_scale = main_window.scale;
-                float controls_height = 195 * ui_scale;
+                float controls_height = (timeline_height + 45) * ui_scale;  // Timeline + controls above it
                 float panel_w = 280 * ui_scale;
                 float properties_w = 220 * ui_scale;  // Properties panel width
                 float pad = 10 * ui_scale;
@@ -5831,6 +5899,40 @@ int main() {
                 
                 ImGui::Dummy(ImVec2(0, 2 * ui_scale));
                 
+                // Splitter between preview and timeline
+                float splitter_y = available_height - controls_height;
+                float splitter_height = 6 * ui_scale;
+                ImVec2 splitter_min(0, splitter_y);
+                ImVec2 splitter_max(viewport->Size.x, splitter_y + splitter_height);
+                ImVec2 mouse_pos = ImGui::GetMousePos();
+                bool mouse_over_splitter = (mouse_pos.x >= splitter_min.x && mouse_pos.x <= splitter_max.x &&
+                                           mouse_pos.y >= splitter_min.y - 3 && mouse_pos.y <= splitter_max.y + 3);
+                
+                // Draw splitter
+                ImDrawList* splitter_draw = ImGui::GetWindowDrawList();
+                ImU32 splitter_color = mouse_over_splitter || dragging_splitter 
+                    ? IM_COL32(100, 100, 110, 255) 
+                    : IM_COL32(60, 60, 65, 255);
+                splitter_draw->AddRectFilled(splitter_min, splitter_max, splitter_color);
+                
+                // Handle splitter drag
+                if (mouse_over_splitter && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    dragging_splitter = true;
+                    splitter_drag_start_y = mouse_pos.y;
+                    splitter_drag_start_height = timeline_height;
+                }
+                if (dragging_splitter) {
+                    if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                        float delta_y = splitter_drag_start_y - mouse_pos.y;  // Moving up increases timeline
+                        timeline_height = std::clamp(splitter_drag_start_height + delta_y / ui_scale, 80.0f, 400.0f);
+                        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+                    } else {
+                        dragging_splitter = false;
+                    }
+                } else if (mouse_over_splitter) {
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+                }
+                
                 // Timeline with clips
                 ImGui::SetCursorPos(ImVec2(10, available_height - controls_height + 45 * ui_scale));
                 int64_t curr_frame = player.current_frame;
@@ -5851,7 +5953,7 @@ int main() {
                 }
                 
                 if (ClipsTimeline("##clips_timeline", &curr_frame, &curr_source_id, &curr_timeline_frame, player.clips, player.connected_clips, player.sources, max_source_frames, player.fps,
-                                 ImVec2(viewport->Size.x - 20, 150 * ui_scale), timeline_state)) {
+                                 ImVec2(viewport->Size.x - 20, timeline_height * ui_scale), timeline_state)) {
                     if (curr_timeline_frame != last_seek_frame) {
                         last_seek_frame = curr_timeline_frame;
                         player.current_timeline_frame = curr_timeline_frame;

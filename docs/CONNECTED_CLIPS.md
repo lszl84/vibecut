@@ -40,6 +40,30 @@ The clip will automatically be placed in an available lane to avoid overlap with
 - **Negative lanes** (-1, -2, ...): Displayed below the main timeline track
 - Higher lane numbers appear further from the main track
 
+### Smart Lane Positioning
+
+VibeCut automatically manages lane assignments to prevent clips from overlapping:
+
+**Automatic Lane Assignment**
+- When adding a clip, VibeCut finds the first available lane without overlaps
+- Video clips default to positive lanes (above the main track)
+- Audio clips default to negative lanes (below the main track)
+
+**Lane Optimization**
+- The system prefers lanes closer to the main track (lane 1 or -1)
+- When moving clips, VibeCut automatically reassigns to the optimal lane
+- This minimizes visual clutter by keeping clips as close to the main track as possible
+
+**Dynamic Lane Display**
+- Lanes have a fixed height for consistent appearance
+- The timeline dynamically shows only the lanes in use
+- Vertical scrolling is available when many lanes are in use (**Ctrl+Mouse Wheel** to scroll)
+- The timeline area can be resized by dragging the splitter between the preview and timeline
+
+**Split Behavior**
+- When splitting a connected clip, both parts stay in the same lane (they don't overlap)
+- If a split would cause overlap with another clip, the new part is moved to an available lane
+
 ### Connection Anchor
 - A vertical line connects the clip to the main timeline
 - A small circle marks the anchor point on the main track
@@ -172,8 +196,7 @@ The following Final Cut Pro behaviors are not yet implemented:
 1. **Adjust connection point**: Command+Option+Click to move anchor within connected clip
 2. **Grave Accent key**: Edit parent clips without affecting connected clips
 3. **Lift vs Delete**: Shift+Delete to replace clip with gap, preserving connected clips
-4. **Audio connected clips**: Negative lanes for audio (currently visual only)
-5. **Manual gap clip insertion**: Option-W to insert gap clips manually
+4. **Manual gap clip insertion**: Option-W to insert gap clips manually
 
 ## Project Persistence
 
@@ -183,3 +206,5 @@ Connected clips are saved and loaded with project files. All properties are pers
 - Connection frame and offset
 - Lane assignment
 - Color ID
+- Volume (0.0 to 2.0)
+- Speed (0.25x to 8x)
