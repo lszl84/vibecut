@@ -53,14 +53,14 @@ git submodule update --init
 * Time Tracking
 
 #+BEGIN: clocktable :maxlevel nil :scope file :block nil
-#+CAPTION: Clock summary at [2026-01-30 Fri 20:48]
+#+CAPTION: Clock summary at [2026-02-02 Mon 22:44]
 | Headline                     | Time  |       |
 |------------------------------+-------+-------|
-| *Total time*                   | *19:52* |       |
+| *Total time*                   | *21:49* |       |
 |------------------------------+-------+-------|
-| Tasks                        | 19:52 |       |
-| \_  Initial Setup / Planning |       |  0:47 |
-| \_  Vibe coding              |       | 18:12 |
+| Tasks                        | 21:49 |       |
+| \_  Initial Setup / Planning |       |  0:56 |
+| \_  Vibe coding              |       | 20:00 |
 | \_  Manual coding            |       |  0:53 |
 #+END:
 
@@ -78,7 +78,7 @@ CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
 :END:
 ** Vibe coding
 :LOGBOOK:
-CLOCK: [2026-02-02 Mon 20:56]
+CLOCK: [2026-02-02 Mon 20:56]--[2026-02-02 Mon 22:44] =>  1:48
 CLOCK: [2026-01-30 Fri 19:28]--[2026-01-30 Fri 20:48] =>  1:20
 CLOCK: [2026-01-28 Wed 15:40]--[2026-01-28 Wed 16:51] =>  1:11
 CLOCK: [2026-01-25 Sun 13:23]--[2026-01-25 Sun 15:04] =>  1:41
@@ -111,6 +111,15 @@ Adding/changing code by hand, debugging, etc.
 * Devlog
 
 Live Streams: https://www.youtube.com/@lukeatdevmindscape/streams
+
+** Day 19
+Fixed splitting the connected clips, added an algorithm for
+positioning the connected clips around the timeline. Also, added a
+basic properties panel to change clip volume and speed.
+
+I think we are getting closer to finalizing this experiment. When I am
+able to edit and export my programming tutorials with this fully
+vibe-coded software, I will consider this to be a success.
 
 ** Day 18
 Added audio clips with cute waveform rendering, a menu, and the undo
