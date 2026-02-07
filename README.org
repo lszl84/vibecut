@@ -53,14 +53,14 @@ git submodule update --init
 * Time Tracking
 
 #+BEGIN: clocktable :maxlevel nil :scope file :block nil
-#+CAPTION: Clock summary at [2026-02-02 Mon 22:44]
+#+CAPTION: Clock summary at [2026-02-07 Sat 11:55]
 | Headline                     | Time  |       |
 |------------------------------+-------+-------|
-| *Total time*                   | *21:49* |       |
+| *Total time*                   | *23:04* |       |
 |------------------------------+-------+-------|
-| Tasks                        | 21:49 |       |
-| \_  Initial Setup / Planning |       |  0:56 |
-| \_  Vibe coding              |       | 20:00 |
+| Tasks                        | 23:04 |       |
+| \_  Initial Setup / Planning |       |  1:00 |
+| \_  Vibe coding              |       | 21:11 |
 | \_  Manual coding            |       |  0:53 |
 #+END:
 
@@ -79,6 +79,7 @@ CLOCK: [2026-01-04 Sun 14:57]--[2026-01-04 Sun 15:04] =>  0:07
 :END:
 ** Vibe coding
 :LOGBOOK:
+CLOCK: [2026-02-07 Sat 10:44]--[2026-02-07 Sat 11:55] =>  1:11
 CLOCK: [2026-02-02 Mon 20:56]--[2026-02-02 Mon 22:44] =>  1:48
 CLOCK: [2026-01-30 Fri 19:28]--[2026-01-30 Fri 20:48] =>  1:20
 CLOCK: [2026-01-28 Wed 15:40]--[2026-01-28 Wed 16:51] =>  1:11
@@ -112,6 +113,10 @@ Adding/changing code by hand, debugging, etc.
 * Devlog
 
 Live Streams: https://www.youtube.com/@lukeatdevmindscape/streams
+
+** Day 20
+Another productive session - implemented speeding up and slowing down
+clips, and that's in just an hour!
 
 ** Day 19
 Fixed splitting the connected clips, added an algorithm for
