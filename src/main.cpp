@@ -175,6 +175,7 @@ struct VideoPlayer {
         std::atomic<int64_t> playhead_frames{0};
         std::atomic<bool> playing{false};
         std::atomic<bool> use_preview{false};
+        std::atomic<bool> rebuilding{false};  // True while swapping audio buffer
     } audio;
     
     // Convert between frames and time
@@ -278,13 +279,14 @@ struct VideoPlayer {
     }
     
     // Calculate the correct timeline end frame for a connected clip
-    // This properly converts source frames to timeline frames using FPS
+    // This properly converts source frames to timeline frames using FPS and speed
     int64_t connected_clip_timeline_end(const ConnectedClip& cc) const {
         double cc_fps = fps;  // Default to project fps
         if (cc.source_id >= 0 && cc.source_id < (int)sources.size()) {
             cc_fps = sources[cc.source_id].fps;
         }
-        double duration = cc.frame_count() / cc_fps;
+        double speed = cc.speed > 0.0f ? cc.speed : 1.0f;
+        double duration = (cc.frame_count() / cc_fps) / speed;
         return cc.timeline_start() + static_cast<int64_t>(duration * fps + 0.5);
     }
     
@@ -359,7 +361,7 @@ struct VideoPlayer {
     static void audio_data_callback(ma_device* device, void* output, const void*, ma_uint32 frameCount) {
         auto* audio = reinterpret_cast<AudioEngine*>(device->pUserData);
         float* out = static_cast<float*>(output);
-        if (!audio || !audio->playing.load()) {
+        if (!audio || !audio->playing.load() || audio->rebuilding.load()) {
             std::fill(out, out + frameCount * audio->channels, 0.0f);
             return;
         }
@@ -586,13 +588,17 @@ struct VideoPlayer {
     }
 
     void rebuild_timeline_audio() {
-        audio.playing.store(false);
-        // Stop audio device to prevent race condition with audio callback
-        if (audio.device_initialized) {
-            ma_device_stop(&audio.device);
-        }
-        audio.timeline_pcm.clear();
+        bool was_playing = audio.playing.load();
+        int64_t saved_playhead = audio.playhead_frames.load();
+        
+        // Signal callback to output silence while we rebuild
+        audio.rebuilding.store(true);
+        
+        // Build new audio into a temporary buffer
+        std::vector<float> new_pcm;
         if (clips.empty()) {
+            audio.rebuilding.store(false);
+            audio.timeline_pcm.clear();
             audio_loaded = false;
             return;
         }
@@ -601,11 +607,10 @@ struct VideoPlayer {
         for (const auto& clip : clips) {
             // Handle gap clips - add silence using project fps
             if (clip.is_gap || clip.source_id < 0 || clip.source_id >= (int)sources.size()) {
-                // Use project fps for gap clips
                 double gap_duration = clip.frame_count() / fps;
                 int64_t gap_samples = static_cast<int64_t>(gap_duration * audio.sample_rate);
-                audio.timeline_pcm.insert(audio.timeline_pcm.end(),
-                                          static_cast<size_t>(gap_samples) * audio.channels, 0.0f);
+                new_pcm.insert(new_pcm.end(),
+                               static_cast<size_t>(gap_samples) * audio.channels, 0.0f);
                 continue;
             }
             SourceInfo& src = sources[clip.source_id];
@@ -615,38 +620,45 @@ struct VideoPlayer {
                     generate_waveform_cache(src);
                 }
             }
+            double speed = clip.speed > 0.0f ? clip.speed : 1.0f;
             double start_time = clip.start_frame / src.fps;
             double end_time = clip.end_frame / src.fps;
+            double src_duration = end_time - start_time;
+            double output_duration = src_duration / speed;
             int64_t start_sample = static_cast<int64_t>(start_time * audio.sample_rate);
-            int64_t end_sample = static_cast<int64_t>(end_time * audio.sample_rate);
-            int64_t clip_samples = std::max<int64_t>(0, end_sample - start_sample);
-            if (clip_samples == 0) continue;
+            int64_t src_end_sample = static_cast<int64_t>(end_time * audio.sample_rate);
+            int64_t output_samples = static_cast<int64_t>(output_duration * audio.sample_rate);
+            if (output_samples == 0) continue;
             if (src.audio_pcm.empty()) {
-                audio.timeline_pcm.insert(audio.timeline_pcm.end(),
-                                          static_cast<size_t>(clip_samples) * audio.channels, 0.0f);
+                new_pcm.insert(new_pcm.end(),
+                               static_cast<size_t>(output_samples) * audio.channels, 0.0f);
                 continue;
             }
             const int64_t source_frames = static_cast<int64_t>(src.audio_pcm.size() / src.audio_channels);
             start_sample = std::clamp<int64_t>(start_sample, 0, source_frames);
-            end_sample = std::clamp<int64_t>(end_sample, 0, source_frames);
-            int64_t available = std::max<int64_t>(0, end_sample - start_sample);
-            if (available > 0) {
-                size_t begin = static_cast<size_t>(start_sample) * audio.channels;
-                size_t end_idx = static_cast<size_t>(end_sample) * audio.channels;
-                // Apply volume when copying audio
-                float vol = clip.volume;
-                for (size_t s = begin; s < end_idx; s++) {
-                    audio.timeline_pcm.push_back(src.audio_pcm[s] * vol);
+            src_end_sample = std::clamp<int64_t>(src_end_sample, 0, source_frames);
+            float vol = clip.volume;
+            for (int64_t i = 0; i < output_samples; i++) {
+                double src_pos = start_sample + i * speed;
+                int64_t src_sample = static_cast<int64_t>(src_pos);
+                if (src_sample >= src_end_sample) {
+                    int64_t remaining = output_samples - i;
+                    new_pcm.insert(new_pcm.end(),
+                                   static_cast<size_t>(remaining) * audio.channels, 0.0f);
+                    break;
                 }
-            }
-            if (available < clip_samples) {
-                int64_t pad_samples = clip_samples - available;
-                audio.timeline_pcm.insert(audio.timeline_pcm.end(),
-                                          static_cast<size_t>(pad_samples) * audio.channels, 0.0f);
+                for (int c = 0; c < audio.channels; c++) {
+                    size_t src_idx = src_sample * src.audio_channels + (c % src.audio_channels);
+                    if (src_idx < src.audio_pcm.size()) {
+                        new_pcm.push_back(src.audio_pcm[src_idx] * vol);
+                    } else {
+                        new_pcm.push_back(0.0f);
+                    }
+                }
             }
         }
         // Calculate how much extra audio we need for connected clips extending beyond main timeline
-        int64_t main_audio_samples = static_cast<int64_t>(audio.timeline_pcm.size() / audio.channels);
+        int64_t main_audio_samples = static_cast<int64_t>(new_pcm.size() / audio.channels);
         int64_t main_frames = main_timeline_frames();
         double main_time = timeline_frame_to_time(main_frames);
         int64_t max_audio_samples = main_audio_samples;
@@ -678,13 +690,10 @@ struct VideoPlayer {
         }
         // Extend timeline audio buffer with silence if connected clips extend beyond
         if (max_audio_samples > main_audio_samples) {
-            audio.timeline_pcm.resize(static_cast<size_t>(max_audio_samples) * audio.channels, 0.0f);
+            new_pcm.resize(static_cast<size_t>(max_audio_samples) * audio.channels, 0.0f);
         }
         
         // Mix in audio from connected clips
-        std::printf("AUDIO MIX: %zu connected clips, main_audio_samples=%lld\n", 
-                    connected_clips.size(), (long long)main_audio_samples);
-        
         // Track last end sample and source frame for each source to ensure sample-perfect continuity
         // Key: source_id, Value: {last_tl_end_sample, last_src_end_frame}
         std::map<int, std::pair<int64_t, int64_t>> source_continuity;
@@ -718,7 +727,9 @@ struct VideoPlayer {
             }
             
             // Calculate duration from source frames (not timeline frames)
-            double clip_duration = cc.frame_count() / cc_fps;
+            // Speed affects duration: faster = shorter duration
+            double speed = cc.speed > 0.0f ? cc.speed : 1.0f;
+            double clip_duration = (cc.frame_count() / cc_fps) / speed;
             double tl_end_time = tl_start_time + clip_duration;
             
             // Skip if completely before timeline
@@ -747,7 +758,7 @@ struct VideoPlayer {
             
             // Clamp to valid range (now includes extended buffer)
             tl_start_sample = std::max<int64_t>(0, tl_start_sample);
-            tl_end_sample = std::min<int64_t>(tl_end_sample, static_cast<int64_t>(audio.timeline_pcm.size() / audio.channels));
+            tl_end_sample = std::min<int64_t>(tl_end_sample, static_cast<int64_t>(new_pcm.size() / audio.channels));
             if (tl_start_sample >= tl_end_sample) continue;
             
             // Calculate source audio range
@@ -768,33 +779,45 @@ struct VideoPlayer {
             src_end_sample = std::clamp<int64_t>(src_end_sample, 0, src_total_samples);
             
             // Mix audio samples (additive mixing with soft clipping)
-            int64_t samples_to_mix = std::min(tl_end_sample - tl_start_sample, src_end_sample - src_start_sample);
-            for (int64_t i = 0; i < samples_to_mix; i++) {
+            // With speed adjustment: read source samples at speed rate
+            int64_t timeline_samples_to_mix = tl_end_sample - tl_start_sample;
+            for (int64_t i = 0; i < timeline_samples_to_mix; i++) {
+                // Calculate source sample position with speed adjustment
+                double src_pos = src_start_sample + i * speed;
+                int64_t src_sample = static_cast<int64_t>(src_pos);
+                if (src_sample >= src_end_sample) break;
+                
                 for (int c = 0; c < audio.channels; c++) {
                     size_t tl_idx = (tl_start_sample + i) * audio.channels + c;
-                    size_t src_idx = (src_start_sample + i) * src.audio_channels + (c % src.audio_channels);
-                    if (tl_idx < audio.timeline_pcm.size() && src_idx < src.audio_pcm.size()) {
-                        float mixed = audio.timeline_pcm[tl_idx] + src.audio_pcm[src_idx] * cc.volume;
-                        // Soft clipping
-                        if (mixed > 1.0f) mixed = 1.0f - 1.0f / (mixed + 1.0f);
-                        else if (mixed < -1.0f) mixed = -1.0f + 1.0f / (-mixed + 1.0f);
-                        audio.timeline_pcm[tl_idx] = mixed;
+                    size_t src_idx = src_sample * src.audio_channels + (c % src.audio_channels);
+                    if (tl_idx < new_pcm.size() && src_idx < src.audio_pcm.size()) {
+                        float mixed = new_pcm[tl_idx] + src.audio_pcm[src_idx] * cc.volume;
+                        // Soft clipping only at extremes
+                        if (mixed > 1.5f) mixed = 1.5f + 0.5f * tanhf(mixed - 1.5f);
+                        else if (mixed < -1.5f) mixed = -1.5f + 0.5f * tanhf(mixed + 1.5f);
+                        new_pcm[tl_idx] = mixed;
                     }
                 }
             }
             
             // Update continuity tracking for this source
-            source_continuity[cc.source_id] = {tl_start_sample + samples_to_mix, cc.end_frame};
+            source_continuity[cc.source_id] = {tl_end_sample, cc.end_frame};
         }
+        
+        // Swap the new buffer in (callback outputs silence during this)
+        audio.timeline_pcm = std::move(new_pcm);
+        audio.rebuilding.store(false);
         
         audio_loaded = !audio.timeline_pcm.empty();
         if (audio_loaded && !audio.device_initialized) {
             init_audio_device();
-        } else if (audio_loaded && audio.device_initialized) {
-            // Restart device that was stopped at the beginning
-            ma_device_start(&audio.device);
         }
+        
+        // Restore playhead position and playback state
         set_audio_playhead_from_timeline(current_timeline_frame);
+        if (was_playing) {
+            audio.playing.store(true);
+        }
     }
     
     std::optional<SourceInfo> probe_source(const std::string& path) {
@@ -3458,23 +3481,25 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
     auto frame_to_time = [fps](int64_t f) -> float { return (float)(f / fps); };
     auto time_to_frame_local = [fps](float t) -> int64_t { return (int64_t)(t * fps + 0.5); };
     
-    // Helper to calculate correct timeline end for a connected clip (accounts for FPS differences)
+    // Helper to calculate correct timeline end for a connected clip (accounts for FPS and speed)
     auto cc_timeline_end_local = [&sources, fps](const ConnectedClip& cc) -> int64_t {
         double cc_fps = fps;  // Default to project fps
         if (cc.source_id >= 0 && cc.source_id < (int)sources.size()) {
             cc_fps = sources[cc.source_id].fps;
         }
-        double duration = cc.frame_count() / cc_fps;
+        double speed = cc.speed > 0.0f ? cc.speed : 1.0f;
+        double duration = (cc.frame_count() / cc_fps) / speed;
         return cc.timeline_start() + static_cast<int64_t>(duration * fps + 0.5);
     };
     
-    // Helper to get correct duration in seconds for a connected clip
+    // Helper to get correct duration in seconds for a connected clip (accounts for speed)
     auto cc_duration_seconds = [&sources, fps](const ConnectedClip& cc) -> float {
         double cc_fps = fps;  // Default to project fps
         if (cc.source_id >= 0 && cc.source_id < (int)sources.size()) {
             cc_fps = sources[cc.source_id].fps;
         }
-        return static_cast<float>(cc.frame_count() / cc_fps);
+        double speed = cc.speed > 0.0f ? cc.speed : 1.0f;
+        return static_cast<float>((cc.frame_count() / cc_fps) / speed);
     };
     
     float source_duration = frame_to_time(total_source_frames);
@@ -3540,7 +3565,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
     float clip_area_bottom = scroll_bar_y - 4;
     
     // Lane layout with fixed height and vertical scrolling
-    const float lane_height = 40.0f;  // Fixed lane height
+    const float lane_height = 60.0f;  // Fixed lane height
     float lanes_area_top = bb_min.y + playhead_head_size;
     float lanes_area_height = clip_area_bottom - lanes_area_top;
     
@@ -3807,7 +3832,8 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
             double extra_frames = tl_start_frame - main_timeline_frames;
             clip_start_time = static_cast<float>(main_timeline_time + extra_frames / cc_source_fps);
         }
-        float clip_dur_time = static_cast<float>(cc.frame_count() / cc_source_fps);
+        double cc_speed = cc.speed > 0.0f ? cc.speed : 1.0f;
+        float clip_dur_time = static_cast<float>((cc.frame_count() / cc_source_fps) / cc_speed);
         
         // Skip clips outside visible range
         if (clip_start_time + clip_dur_time < view_start_timeline || clip_start_time > view_end_timeline) {
@@ -4051,14 +4077,10 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         }
         
         if (std::abs(wheel) > 0.01f) {
-            if (ImGui::GetIO().KeyCtrl && needs_vertical_scroll) {
-                // Ctrl+wheel for vertical lane scrolling
+            if (ImGui::GetIO().KeyShift && needs_vertical_scroll) {
+                // Shift+wheel for vertical lane scrolling
                 state.lane_scroll_offset -= wheel * lane_height;
                 state.lane_scroll_offset = std::clamp(state.lane_scroll_offset, 0.0f, max_lane_scroll);
-            } else if (ImGui::GetIO().KeyShift && state.zoom > 1.01f) {
-                // Shift+wheel for horizontal scrolling
-                state.scroll -= wheel * visible_duration * 0.15f;
-                state.scroll = std::clamp(state.scroll, 0.0f, max_scroll);
             } else {
                 // Plain wheel for zooming (centered on mouse position)
                 float mouse_time = x_to_time(mouse.x);
@@ -5049,6 +5071,83 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         }
     }
     
+    // Draw vertical scrollbar for lane scrolling (only when needed)
+    static float v_scroll_drag_start_y = 0.0f;
+    static float v_scroll_drag_start_offset = 0.0f;
+    static bool dragging_v_scrollbar = false;
+    
+    if (needs_vertical_scroll) {
+        float v_scroll_bar_w = 10.0f;
+        float v_scroll_bar_x = bb_max.x - v_scroll_bar_w - 2;
+        float v_scroll_area_top = lanes_area_top;
+        float v_scroll_area_height = clip_area_bottom - lanes_area_top;
+        
+        // Track
+        draw_list->AddRectFilled(ImVec2(v_scroll_bar_x, v_scroll_area_top), 
+                                 ImVec2(v_scroll_bar_x + v_scroll_bar_w, v_scroll_area_top + v_scroll_area_height), 
+                                 IM_COL32(15, 15, 18, 255), 5.0f);
+        
+        // Thumb size and position
+        float visible_ratio = v_scroll_area_height / total_lanes_height;
+        float thumb_height = std::max(20.0f, v_scroll_area_height * visible_ratio);
+        float scroll_range = v_scroll_area_height - thumb_height;
+        float thumb_y = v_scroll_area_top + (max_lane_scroll > 0 ? (state.lane_scroll_offset / max_lane_scroll) * scroll_range : 0);
+        
+        ImVec2 v_thumb_min(v_scroll_bar_x, thumb_y);
+        ImVec2 v_thumb_max(v_scroll_bar_x + v_scroll_bar_w, thumb_y + thumb_height);
+        bool v_thumb_hovered = (mouse.x >= v_thumb_min.x - 4 && mouse.x <= v_thumb_max.x + 4 &&
+                                mouse.y >= v_thumb_min.y && mouse.y <= v_thumb_max.y);
+        bool v_track_hovered = (mouse.x >= v_scroll_bar_x - 4 && mouse.x <= v_scroll_bar_x + v_scroll_bar_w + 4 &&
+                                mouse.y >= v_scroll_area_top && mouse.y <= v_scroll_area_top + v_scroll_area_height);
+        
+        // Thumb color
+        ImU32 v_thumb_color = IM_COL32(70, 70, 80, 255);
+        if (dragging_v_scrollbar) {
+            v_thumb_color = IM_COL32(110, 110, 130, 255);
+        } else if (v_thumb_hovered) {
+            v_thumb_color = IM_COL32(90, 90, 105, 255);
+        }
+        
+        draw_list->AddRectFilled(v_thumb_min, v_thumb_max, v_thumb_color, 5.0f);
+        
+        // Handle vertical scrollbar click/drag
+        if (v_track_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && state.dragging == 0 && !dragging_v_scrollbar) {
+            if (v_thumb_hovered) {
+                dragging_v_scrollbar = true;
+                v_scroll_drag_start_y = mouse.y;
+                v_scroll_drag_start_offset = state.lane_scroll_offset;
+            } else {
+                // Click on track - jump to that position
+                float click_ratio = (mouse.y - v_scroll_area_top - thumb_height/2) / scroll_range;
+                state.lane_scroll_offset = click_ratio * max_lane_scroll;
+                state.lane_scroll_offset = std::clamp(state.lane_scroll_offset, 0.0f, max_lane_scroll);
+            }
+        }
+        
+        // Cursor feedback
+        if (v_track_hovered && state.dragging == 0 && !dragging_v_scrollbar) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        }
+    }
+    
+    // Handle vertical scrollbar dragging
+    if (dragging_v_scrollbar) {
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            float v_scroll_area_height = clip_area_bottom - lanes_area_top;
+            float visible_ratio = v_scroll_area_height / total_lanes_height;
+            float thumb_height = std::max(20.0f, v_scroll_area_height * visible_ratio);
+            float scroll_range = v_scroll_area_height - thumb_height;
+            
+            float delta_y = mouse.y - v_scroll_drag_start_y;
+            float delta_scroll = (scroll_range > 0) ? (delta_y / scroll_range) * max_lane_scroll : 0;
+            state.lane_scroll_offset = v_scroll_drag_start_offset + delta_scroll;
+            state.lane_scroll_offset = std::clamp(state.lane_scroll_offset, 0.0f, max_lane_scroll);
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        } else {
+            dragging_v_scrollbar = false;
+        }
+    }
+    
     return changed;
 }
 
@@ -5604,7 +5703,11 @@ int main() {
                     
                     float full_w = ImGui::GetContentRegionAvail().x;
                     ImGui::SetNextItemWidth(full_w);
-                    if (ImGui::SliderFloat("##Volume", &volume_value, 0.0f, 2.0f, "%.2f")) {
+                    // Display as dB for perceptual uniformity
+                    float db_value = (volume_value > 0.001f) ? 20.0f * log10f(volume_value) : -60.0f;
+                    char vol_label[32];
+                    snprintf(vol_label, sizeof(vol_label), "%.1f dB", db_value);
+                    if (ImGui::SliderFloat("##Volume", &volume_value, 0.1f, 10.0f, vol_label, ImGuiSliderFlags_Logarithmic)) {
                         // Apply to all selected clips
                         for (int idx : timeline_state.selected_clips) {
                             if (idx >= 0 && idx < (int)player.clips.size()) {
