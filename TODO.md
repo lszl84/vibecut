@@ -1,7 +1,5 @@
 # TODO
 
-1. Add vertical timeline scrolling. Since we use use mouse wheel for zoom, the scroll should happen only on scrollbar drag or Shift+Wheel
-2. Add a splitter to resize the timeline area
-3. The height of the clips in pixels should be 50% more
-4. The speed adjustment does not change anything - needs to be fixed
-5. The volume adjustments seem to work only for values < 1. There is no way to increase volume of a selected clip
+# Notes - do not change these yet
+
+1. When changing the speed of clips with audio, the audio is sped up or slowed down in a funny way. Should we adjust that? Implement some algorithm to change the speed but keep the pitch the same? Hmm.

@@ -64,6 +64,11 @@ struct Clip {
     float speed = 1.0f;   // Playback speed (0.25 to 8.0, 1.0 = normal)
     
     int64_t frame_count() const { return end_frame - start_frame; }
+    // Timeline frames this clip occupies (speed-adjusted: 0.5x → 2x frames, 2x → 0.5x frames)
+    int64_t timeline_frame_count() const {
+        double s = speed > 0.0f ? speed : 1.0f;
+        return std::max((int64_t)1, static_cast<int64_t>(std::round(frame_count() / s)));
+    }
 };
 
 // Connected clip - overlays on top of (or below) the main timeline
@@ -80,10 +85,15 @@ struct ConnectedClip {
     float speed = 1.0f;       // Playback speed (0.25 to 8.0, 1.0 = normal)
     
     int64_t frame_count() const { return end_frame - start_frame; }
+    // Timeline frames this connected clip occupies (speed-adjusted)
+    int64_t timeline_frame_count() const {
+        double s = speed > 0.0f ? speed : 1.0f;
+        return std::max((int64_t)1, static_cast<int64_t>(std::round(frame_count() / s)));
+    }
     // Timeline frame where the clip visually starts (may be before connection_frame)
     int64_t timeline_start() const { return connection_frame - connection_offset; }
-    // Timeline frame where the clip ends (exclusive)
-    int64_t timeline_end() const { return timeline_start() + frame_count(); }
+    // Timeline frame where the clip ends (exclusive) - speed-adjusted
+    int64_t timeline_end() const { return timeline_start() + timeline_frame_count(); }
 };
 
 // Undo/redo state snapshot
@@ -186,9 +196,8 @@ struct VideoPlayer {
         double t = 0.0;
         int64_t remaining = timeline_frame;
         for (const auto& clip : clips) {
-            int64_t count = clip.frame_count();
-            int64_t take = std::min<int64_t>(remaining, count);
-            // For gap clips or invalid sources, use project fps
+            int64_t tl_count = clip.timeline_frame_count();
+            int64_t take = std::min<int64_t>(remaining, tl_count);
             double clip_fps = fps;
             if (!clip.is_gap && clip.source_id >= 0 && clip.source_id < (int)sources.size()) {
                 clip_fps = sources[clip.source_id].fps;
@@ -198,9 +207,7 @@ struct VideoPlayer {
             remaining -= take;
             if (remaining <= 0) break;
         }
-        // Handle frames beyond main clips (connected clips extending past main timeline)
         if (remaining > 0) {
-            // Use default fps for extended region
             t += remaining / fps;
         }
         return t;
@@ -212,24 +219,21 @@ struct VideoPlayer {
         double accumulated_time = 0.0;
         int64_t accumulated_frames = 0;
         for (const auto& clip : clips) {
-            int64_t count = clip.frame_count();
-            // For gap clips or invalid sources, use project fps
+            int64_t tl_count = clip.timeline_frame_count();
             double clip_fps = fps;
             if (!clip.is_gap && clip.source_id >= 0 && clip.source_id < (int)sources.size()) {
                 clip_fps = sources[clip.source_id].fps;
                 if (clip_fps <= 0.0) clip_fps = fps;
             }
-            double clip_duration = count / clip_fps;
+            double clip_duration = tl_count / clip_fps;
             if (accumulated_time + clip_duration >= target_time) {
-                // Target time is within this clip
                 double time_into_clip = target_time - accumulated_time;
                 int64_t frames_into_clip = static_cast<int64_t>(time_into_clip * clip_fps + 0.5);
-                return accumulated_frames + std::min(frames_into_clip, count);
+                return accumulated_frames + std::min(frames_into_clip, tl_count);
             }
             accumulated_time += clip_duration;
-            accumulated_frames += count;
+            accumulated_frames += tl_count;
         }
-        // Past all clips - use default fps for extended region
         double extra_time = target_time - accumulated_time;
         if (extra_time > 0) {
             accumulated_frames += static_cast<int64_t>(extra_time * fps + 0.5);
@@ -259,11 +263,11 @@ struct VideoPlayer {
     // Includes connected clips that extend past the main timeline
     int64_t total_timeline_frames() const {
         int64_t total = 0;
-        for (const auto& clip : clips) total += clip.frame_count();
+        for (const auto& clip : clips) total += clip.timeline_frame_count();
         
         // Check if any connected clips extend past the main timeline
         for (const auto& cc : connected_clips) {
-            int64_t cc_end = connected_clip_timeline_end(cc);
+            int64_t cc_end = cc.timeline_end();
             if (cc_end > total) {
                 total = cc_end;
             }
@@ -274,20 +278,8 @@ struct VideoPlayer {
     // Total frames from main clips only (not including connected clip extensions)
     int64_t main_timeline_frames() const {
         int64_t total = 0;
-        for (const auto& clip : clips) total += clip.frame_count();
+        for (const auto& clip : clips) total += clip.timeline_frame_count();
         return total;
-    }
-    
-    // Calculate the correct timeline end frame for a connected clip
-    // This properly converts source frames to timeline frames using FPS and speed
-    int64_t connected_clip_timeline_end(const ConnectedClip& cc) const {
-        double cc_fps = fps;  // Default to project fps
-        if (cc.source_id >= 0 && cc.source_id < (int)sources.size()) {
-            cc_fps = sources[cc.source_id].fps;
-        }
-        double speed = cc.speed > 0.0f ? cc.speed : 1.0f;
-        double duration = (cc.frame_count() / cc_fps) / speed;
-        return cc.timeline_start() + static_cast<int64_t>(duration * fps + 0.5);
     }
     
     // Check if a timeline frame falls on a gap clip
@@ -295,11 +287,11 @@ struct VideoPlayer {
         if (clips.empty()) return false;
         int64_t pos = 0;
         for (const auto& c : clips) {
-            int64_t count = c.frame_count();
-            if (timeline_frame >= pos && timeline_frame < pos + count) {
+            int64_t tl_count = c.timeline_frame_count();
+            if (timeline_frame >= pos && timeline_frame < pos + tl_count) {
                 return c.is_gap;
             }
-            pos += count;
+            pos += tl_count;
         }
         return false;
     }
@@ -309,14 +301,14 @@ struct VideoPlayer {
         if (clips.empty()) return false;
         int64_t pos = 0;
         for (const auto& c : clips) {
-            int64_t count = c.frame_count();
-            if (timeline_frame >= pos && timeline_frame < pos + count) {
+            int64_t tl_count = c.timeline_frame_count();
+            if (timeline_frame >= pos && timeline_frame < pos + tl_count) {
                 if (c.source_id >= 0 && c.source_id < (int)sources.size()) {
                     return sources[c.source_id].is_audio_only;
                 }
                 return false;
             }
-            pos += count;
+            pos += tl_count;
         }
         return false;
     }
@@ -328,16 +320,19 @@ struct VideoPlayer {
         if (timeline_frame >= total) {
             if (out_source_id) *out_source_id = clips.back().source_id;
             if (out_is_gap) *out_is_gap = clips.back().is_gap;
-            return clips.back().end_frame;  // end position
+            return clips.back().end_frame;
         }
         for (const auto& c : clips) {
-            int64_t count = c.frame_count();
-            if (timeline_frame < count) {
+            int64_t tl_count = c.timeline_frame_count();
+            if (timeline_frame < tl_count) {
                 if (out_source_id) *out_source_id = c.source_id;
                 if (out_is_gap) *out_is_gap = c.is_gap;
-                return c.start_frame + timeline_frame;
+                double speed = c.speed > 0.0f ? c.speed : 1.0f;
+                int64_t source_offset = static_cast<int64_t>(timeline_frame * speed);
+                source_offset = std::min(source_offset, c.frame_count() - 1);
+                return c.start_frame + source_offset;
             }
-            timeline_frame -= count;
+            timeline_frame -= tl_count;
         }
         if (out_source_id) *out_source_id = clips.back().source_id;
         if (out_is_gap) *out_is_gap = clips.back().is_gap;
@@ -348,12 +343,13 @@ struct VideoPlayer {
         int64_t tframe = 0;
         for (const auto& c : clips) {
             if (c.source_id == source_id && source_frame >= c.start_frame && source_frame < c.end_frame) {
-                return tframe + (source_frame - c.start_frame);
+                double speed = c.speed > 0.0f ? c.speed : 1.0f;
+                return tframe + static_cast<int64_t>(std::round((source_frame - c.start_frame) / speed));
             }
-            tframe += c.frame_count();
+            tframe += c.timeline_frame_count();
         }
         if (!clips.empty() && clips.back().source_id == source_id && source_frame == clips.back().end_frame) {
-            return tframe;  // end position
+            return tframe;
         }
         return 0;
     }
@@ -1359,7 +1355,7 @@ struct VideoPlayer {
             // Clip must extend into the valid timeline range (>= 0)
             // Active range is [max(0, timeline_start()), correct_timeline_end())
             int64_t active_start = std::max((int64_t)0, cc.timeline_start());
-            int64_t cc_end = connected_clip_timeline_end(cc);
+            int64_t cc_end = cc.timeline_end();
             if (timeline_frame >= active_start && timeline_frame < cc_end) {
                 // For clips above (positive lane), higher is better
                 // For clips below (negative lane), they don't normally play (future audio use)
@@ -1380,7 +1376,7 @@ struct VideoPlayer {
         for (int i = 0; i < (int)connected_clips.size(); i++) {
             const auto& cc = connected_clips[i];
             int64_t active_start = std::max((int64_t)0, cc.timeline_start());
-            int64_t cc_end = connected_clip_timeline_end(cc);
+            int64_t cc_end = cc.timeline_end();
             if (timeline_frame >= active_start && timeline_frame < cc_end) {
                 return i;  // Return first match
             }
@@ -1399,9 +1395,11 @@ struct VideoPlayer {
         int cc_idx = connected_clip_at_timeline_frame(timeline_frame);
         if (cc_idx >= 0) {
             const auto& cc = connected_clips[cc_idx];
-            // Calculate offset from the clip's visual start (timeline_start)
             int64_t offset_in_clip = timeline_frame - cc.timeline_start();
-            int64_t source_frame = cc.start_frame + offset_in_clip;
+            // Map timeline offset to source frame using connected clip's speed
+            double cc_speed = cc.speed > 0.0f ? cc.speed : 1.0f;
+            int64_t source_frame = cc.start_frame + static_cast<int64_t>(offset_in_clip * cc_speed);
+            source_frame = std::clamp(source_frame, cc.start_frame, std::max(cc.start_frame, cc.end_frame - 1));
             if (cc.source_id != active_source && cc.source_id >= 0) {
                 open_source(cc.source_id, false, playing);
                 previewing_library = false;
@@ -1646,7 +1644,7 @@ struct VideoPlayer {
                 const ConnectedClip& cc = connected_clips[i];
                 if (cc.lane != lane) continue;
                 int64_t cc_start = cc.timeline_start();
-                int64_t cc_end = connected_clip_timeline_end(cc);
+                int64_t cc_end = cc.timeline_end();
                 if (new_start < cc_end && new_end > cc_start) return true;
             }
             return false;
@@ -2075,10 +2073,10 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::vecto
     
     std::printf("EXPORT: === SIMPLIFIED LINEAR EXPORT ===\n");
     
-    // Calculate total frames (including connected clips that extend past main timeline)
+    // Calculate total output frames (timeline_frame_count already accounts for speed)
     int64_t main_frames = 0;
     for (const auto& clip : clips) {
-        main_frames += clip.frame_count();
+        main_frames += clip.timeline_frame_count();
     }
     int64_t total_frames = main_frames;
     for (const auto& cc : connected_clips) {
@@ -2410,10 +2408,9 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::vecto
     // Helper to decode a single frame from a source at a specific source frame
     auto decode_frame_from_source = [&](SourceDecodeState& state, int source_id, int64_t target_source_frame, 
                                          const std::string& debug_name) -> AVFrame* {
-        if (source_id != (state.in_ctx ? connected_source_id : current_source_id)) {
-            if (&state == &connected_state) {
-                connected_source_id = source_id;
-            }
+        int& tracked_id = (&state == &connected_state) ? connected_source_id : current_source_id;
+        if (source_id != tracked_id) {
+            tracked_id = source_id;
             if (!open_source(source_paths[source_id], state)) {
                 return nullptr;
             }
@@ -2482,11 +2479,14 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::vecto
     
     // Process each clip
     for (const auto& clip : clips) {
+        double clip_speed = clip.speed > 0.0f ? clip.speed : 1.0f;
+        int64_t clip_output_frames = clip.timeline_frame_count();
+        
         // Handle gap clips - output black frames
         if (clip.is_gap) {
             std::printf("EXPORT: Processing GAP clip [%lld, %lld) - %lld black frames\n",
-                        (long long)clip.start_frame, (long long)clip.end_frame, (long long)clip.frame_count());
-            for (int64_t i = 0; i < clip.frame_count(); i++) {
+                        (long long)clip.start_frame, (long long)clip.end_frame, (long long)clip_output_frames);
+            for (int64_t i = 0; i < clip_output_frames; i++) {
                 // Check for connected clip override even on gap clips
                 int cc_idx = find_connected_clip_at_frame(connected_clips, output_frame);
                 if (cc_idx >= 0) {
@@ -2514,8 +2514,8 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::vecto
         // Handle audio-only clips - output black frames (same as gap clips)
         if (clip.source_id >= 0 && clip.source_id < (int)source_audio_only.size() && source_audio_only[clip.source_id]) {
             std::printf("EXPORT: Processing AUDIO-ONLY clip [%lld, %lld) - %lld black frames\n",
-                        (long long)clip.start_frame, (long long)clip.end_frame, (long long)clip.frame_count());
-            for (int64_t i = 0; i < clip.frame_count(); i++) {
+                        (long long)clip.start_frame, (long long)clip.end_frame, (long long)clip_output_frames);
+            for (int64_t i = 0; i < clip_output_frames; i++) {
                 // Check for connected video clip override
                 int cc_idx = find_connected_clip_at_frame(connected_clips, output_frame);
                 if (cc_idx >= 0) {
@@ -2550,8 +2550,9 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::vecto
             }
             ensure_source_converters();
         }
-        std::printf("EXPORT: Processing clip [%lld, %lld) src=%d\n",
-                    (long long)clip.start_frame, (long long)clip.end_frame, clip.source_id);
+        std::printf("EXPORT: Processing clip [%lld, %lld) src=%d speed=%.2f -> %lld output frames\n",
+                    (long long)clip.start_frame, (long long)clip.end_frame, clip.source_id,
+                    clip_speed, (long long)clip_output_frames);
         
         const auto ts_rounding = static_cast<AVRounding>(AV_ROUND_DOWN | AV_ROUND_PASS_MINMAX);
         auto ts_to_frame = [&](int64_t ts) -> int64_t {
@@ -2562,164 +2563,60 @@ bool export_clips(const std::vector<std::string>& source_paths, const std::vecto
             return av_rescale_q_rnd(frame, source_state.frame_tb, source_state.stream_time_base, ts_rounding);
         };
         
-        // Seek to clip start
-        int64_t target_ts = source_state.stream_start_pts + frame_to_ts(clip.start_frame);
-        avcodec_flush_buffers(source_state.dec_ctx);
-        avformat_seek_file(source_state.in_ctx, source_state.video_idx, 0, target_ts, target_ts, AVSEEK_FLAG_BACKWARD);
-        avcodec_flush_buffers(source_state.dec_ctx);
-        
-        int64_t frames_needed = clip.frame_count();
+        // For speed-adjusted export, we need to decode source frames on demand
+        // Output frame i maps to source frame: start_frame + floor(i * speed)
+        int64_t frames_needed = clip_output_frames;
         int64_t frames_got = 0;
         bool have_last_rgb = false;
-        auto try_force_last_frame = [&]() -> bool {
-            if (frames_needed <= 0) return false;
-            int64_t target_frame = std::max<int64_t>(clip.start_frame, clip.end_frame - 1);
-            int64_t target_ts = source_state.stream_start_pts + frame_to_ts(target_frame);
-            avcodec_flush_buffers(source_state.dec_ctx);
-            avformat_seek_file(source_state.in_ctx, source_state.video_idx, 0, target_ts, target_ts, AVSEEK_FLAG_BACKWARD);
-            avcodec_flush_buffers(source_state.dec_ctx);
-            while (av_read_frame(source_state.in_ctx, pkt) >= 0) {
-                if (pkt->stream_index != source_state.video_idx) {
-                    av_packet_unref(pkt);
-                    continue;
-                }
-                avcodec_send_packet(source_state.dec_ctx, pkt);
-                av_packet_unref(pkt);
-                while (avcodec_receive_frame(source_state.dec_ctx, dec_frame) >= 0) {
-                    int64_t pts = dec_frame->best_effort_timestamp != AV_NOPTS_VALUE
-                        ? dec_frame->best_effort_timestamp
-                        : dec_frame->pts;
-                    if (pts == AV_NOPTS_VALUE) pts = source_state.stream_start_pts;
-                    pts -= source_state.stream_start_pts;
-                    int64_t src_frame = ts_to_frame(pts);
-                    if (src_frame < clip.start_frame) continue;
-                    if (src_frame > clip.end_frame) break;
-                    std::printf("EXPORT: Fallback decode src=%lld -> encode out=%lld\n",
-                                (long long)src_frame, (long long)output_frame);
-                    AVFrame* rgb = convert_and_save_ppm(dec_frame, "frame_" + std::to_string(output_frame) + "_src" + std::to_string(src_frame));
-                    encode_from_rgb(rgb, output_frame);
-                    have_last_rgb = true;
-                    output_frame++;
-                    frames_got++;
-                    update_export_progress();
-                    return true;
-                }
-            }
-            return false;
-        };
         
-        bool clip_done = false;
-        // Decode frames one by one
-        while (av_read_frame(source_state.in_ctx, pkt) >= 0 && frames_got < frames_needed && !clip_done) {
-            if (pkt->stream_index != source_state.video_idx) {
-                av_packet_unref(pkt);
-                continue;
+        // Decode source frames as needed for speed-adjusted output
+        int64_t last_decoded_src_frame = -1;
+        
+        for (int64_t out_i = 0; out_i < frames_needed; out_i++) {
+            // Map output frame to source frame
+            int64_t target_source_frame = clip.start_frame + static_cast<int64_t>(out_i * clip_speed);
+            target_source_frame = std::min(target_source_frame, clip.end_frame - 1);
+            
+            // Check for connected clip override at this timeline frame
+            int cc_idx = find_connected_clip_at_frame(connected_clips, output_frame);
+            AVFrame* rgb = nullptr;
+            if (cc_idx >= 0) {
+                const auto& cc = connected_clips[cc_idx];
+                int64_t offset_in_cc = output_frame - cc.timeline_start();
+                int64_t cc_source_frame = cc.start_frame + offset_in_cc;
+                std::printf("EXPORT: Connected clip override at timeline %lld -> src %d frame %lld\n",
+                            (long long)output_frame, cc.source_id, (long long)cc_source_frame);
+                rgb = decode_frame_from_source(connected_state, cc.source_id, cc_source_frame, 
+                                               "cc_" + std::to_string(output_frame));
+                if (rgb) {
+                    encode_from_rgb(rgb, output_frame);
+                }
             }
             
-            avcodec_send_packet(source_state.dec_ctx, pkt);
-            av_packet_unref(pkt);
-            
-            while (avcodec_receive_frame(source_state.dec_ctx, dec_frame) >= 0 && frames_got < frames_needed) {
-                // Calculate source frame index
-                int64_t pts = dec_frame->best_effort_timestamp != AV_NOPTS_VALUE
-                    ? dec_frame->best_effort_timestamp
-                    : dec_frame->pts;
-                if (pts == AV_NOPTS_VALUE) pts = source_state.stream_start_pts;
-                pts -= source_state.stream_start_pts;
-                int64_t src_frame = ts_to_frame(pts);
-                
-                // Skip frames before clip start
-                if (src_frame < clip.start_frame) {
-                    std::printf("EXPORT: Skip frame %lld (before clip)\n", (long long)src_frame);
-                    continue;
-                }
-                
-                // Stop if past clip end. Allow one overflow frame to satisfy exact count.
-                if (src_frame >= clip.end_frame) {
-                    if (frames_got + 1 == frames_needed) {
-                        std::printf("EXPORT: Frame %lld past clip end, using as last frame\n", (long long)src_frame);
-                    } else {
-                        std::printf("EXPORT: Frame %lld past clip end, done with clip\n", (long long)src_frame);
-                        clip_done = true;
-                        break;
-                    }
-                }
-                
-                // Check for connected clip override at this timeline frame
-                int cc_idx = find_connected_clip_at_frame(connected_clips, output_frame);
-                AVFrame* rgb = nullptr;
-                if (cc_idx >= 0) {
-                    const auto& cc = connected_clips[cc_idx];
-                    int64_t offset_in_cc = output_frame - cc.timeline_start();
-                    int64_t cc_source_frame = cc.start_frame + offset_in_cc;
-                    std::printf("EXPORT: Connected clip override at timeline %lld -> src %d frame %lld\n",
-                                (long long)output_frame, cc.source_id, (long long)cc_source_frame);
-                    rgb = decode_frame_from_source(connected_state, cc.source_id, cc_source_frame, 
-                                                   "cc_" + std::to_string(output_frame));
+            if (!rgb) {
+                // If same source frame as last, reuse the last decoded RGB frame
+                if (target_source_frame == last_decoded_src_frame && have_last_rgb) {
+                    encode_from_rgb(source_state.debug_rgb, output_frame);
+                } else {
+                    rgb = decode_frame_from_source(source_state, clip.source_id, target_source_frame,
+                                                    "frame_" + std::to_string(output_frame) + "_src" + std::to_string(target_source_frame));
                     if (rgb) {
                         encode_from_rgb(rgb, output_frame);
+                        have_last_rgb = true;
+                        last_decoded_src_frame = target_source_frame;
+                    } else if (have_last_rgb) {
+                        encode_from_rgb(source_state.debug_rgb, output_frame);
+                    } else {
+                        encode_from_rgb(black_rgb, output_frame);
                     }
                 }
-                
-                if (!rgb) {
-                    std::printf("EXPORT: Decode src=%lld -> encode out=%lld\n", (long long)src_frame, (long long)output_frame);
-                    // Convert to RGB and save PPM - get the SAME RGB data for encoding
-                    rgb = convert_and_save_ppm(dec_frame, "frame_" + std::to_string(output_frame) + "_src" + std::to_string(src_frame));
-                    // Encode from the EXACT SAME RGB data we just saved to PPM
-                    encode_from_rgb(rgb, output_frame);
-                }
-                have_last_rgb = true;
-                
-                output_frame++;
-                frames_got++;
-                update_export_progress();
-
-                if (frames_got >= frames_needed) {
-                    break;
-                }
             }
-            if (clip_done) {
-                break;
-            }
-        }
-        
-        // Flush decoder for this clip
-        avcodec_send_packet(source_state.dec_ctx, nullptr);
-        while (avcodec_receive_frame(source_state.dec_ctx, dec_frame) >= 0 && frames_got < frames_needed) {
-            int64_t pts = dec_frame->best_effort_timestamp != AV_NOPTS_VALUE
-                ? dec_frame->best_effort_timestamp
-                : dec_frame->pts;
-            if (pts == AV_NOPTS_VALUE) pts = source_state.stream_start_pts;
-            pts -= source_state.stream_start_pts;
-            int64_t src_frame = ts_to_frame(pts);
-            
-            if (src_frame < clip.start_frame) continue;
-            if (src_frame >= clip.end_frame && frames_got + 1 != frames_needed) continue;
-            
-            std::printf("EXPORT: (flush) Decode src=%lld -> encode out=%lld\n", (long long)src_frame, (long long)output_frame);
-            AVFrame* rgb = convert_and_save_ppm(dec_frame, "frame_" + std::to_string(output_frame) + "_src" + std::to_string(src_frame));
-            encode_from_rgb(rgb, output_frame);
-            have_last_rgb = true;
             
             output_frame++;
             frames_got++;
             update_export_progress();
-            if (frames_got >= frames_needed) break;
         }
         
-        if (frames_got < frames_needed && !have_last_rgb) {
-            try_force_last_frame();
-        }
-        if (frames_got < frames_needed && have_last_rgb) {
-            std::printf("EXPORT: Padding %lld frames using last decoded frame\n",
-                        (long long)(frames_needed - frames_got));
-            while (frames_got < frames_needed) {
-                encode_from_rgb(source_state.debug_rgb, output_frame);
-                output_frame++;
-                frames_got++;
-                update_export_progress();
-            }
-        }
         std::printf("EXPORT: Clip done, got %lld/%lld frames\n", (long long)frames_got, (long long)frames_needed);
     }
     
@@ -3477,40 +3374,28 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
     float clip_margin = 2.0f;
     float playhead_head_size = 10.0f;
     
-    // Convert frames to time for display calculations (internally work in frames)
+    // Simple frame/time conversions (speed is already baked into timeline_frame_count)
     auto frame_to_time = [fps](int64_t f) -> float { return (float)(f / fps); };
     auto time_to_frame_local = [fps](float t) -> int64_t { return (int64_t)(t * fps + 0.5); };
     
-    // Helper to calculate correct timeline end for a connected clip (accounts for FPS and speed)
-    auto cc_timeline_end_local = [&sources, fps](const ConnectedClip& cc) -> int64_t {
-        double cc_fps = fps;  // Default to project fps
-        if (cc.source_id >= 0 && cc.source_id < (int)sources.size()) {
-            cc_fps = sources[cc.source_id].fps;
-        }
-        double speed = cc.speed > 0.0f ? cc.speed : 1.0f;
-        double duration = (cc.frame_count() / cc_fps) / speed;
-        return cc.timeline_start() + static_cast<int64_t>(duration * fps + 0.5);
+    // Connected clip duration in seconds (accounts for cc speed)
+    auto cc_duration_seconds = [fps](const ConnectedClip& cc) -> float {
+        return (float)(cc.timeline_frame_count() / fps);
     };
     
-    // Helper to get correct duration in seconds for a connected clip (accounts for speed)
-    auto cc_duration_seconds = [&sources, fps](const ConnectedClip& cc) -> float {
-        double cc_fps = fps;  // Default to project fps
-        if (cc.source_id >= 0 && cc.source_id < (int)sources.size()) {
-            cc_fps = sources[cc.source_id].fps;
-        }
-        double speed = cc.speed > 0.0f ? cc.speed : 1.0f;
-        return static_cast<float>((cc.frame_count() / cc_fps) / speed);
+    // Connected clip timeline end in timeline frames
+    auto cc_timeline_end_local = [](const ConnectedClip& cc) -> int64_t {
+        return cc.timeline_end();
     };
     
     float source_duration = frame_to_time(total_source_frames);
     float frame_duration = (float)(1.0 / fps);
     
-    // Calculate total timeline frames (sum of all clip frame counts + connected clip extensions)
+    // Calculate total timeline frames (speed-adjusted + connected clip extensions)
     int64_t total_timeline_frames = 0;
-    for (const auto& c : clips) total_timeline_frames += c.frame_count();
-    // Include connected clips that extend past the main timeline
+    for (const auto& c : clips) total_timeline_frames += c.timeline_frame_count();
     for (const auto& cc : connected_clips) {
-        int64_t cc_end = cc_timeline_end_local(cc);
+        int64_t cc_end = cc.timeline_end();
         if (cc_end > total_timeline_frames) {
             total_timeline_frames = cc_end;
         }
@@ -3624,55 +3509,22 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         return palette[color_id % (int)(sizeof(palette) / sizeof(palette[0]))];
     };
     
-    // Helper to convert timeline frame to time (accounting for varying fps per clip)
-    auto timeline_frame_to_time_local = [&](int64_t timeline_frame) -> double {
-        double t = 0.0;
-        int64_t remaining = timeline_frame;
-        for (const auto& clip : clips) {
-            int64_t count = clip.frame_count();
-            int64_t take = std::min<int64_t>(remaining, count);
-            // For gap clips or invalid sources, use project fps
-            double clip_fps = fps;
-            if (!clip.is_gap && clip.source_id >= 0 && clip.source_id < (int)sources.size()) {
-                clip_fps = sources[clip.source_id].fps;
-                if (clip_fps <= 0.0) clip_fps = fps;
-            }
-            t += take / clip_fps;
-            remaining -= take;
-            if (remaining <= 0) break;
-        }
-        // For frames beyond main clips, use default fps
-        if (remaining > 0) {
-            t += remaining / fps;
-        }
-        return t;
-    };
-    
-    // Calculate total main timeline duration in time
+    // Calculate total main timeline duration in time (timeline_frame_count already accounts for speed)
     double main_timeline_time = 0.0;
     for (const auto& clip : clips) {
-        double clip_fps = fps;
-        if (clip.source_id >= 0 && clip.source_id < (int)sources.size()) {
-            clip_fps = sources[clip.source_id].fps;
-            if (clip_fps <= 0.0) clip_fps = fps;
-        }
-        main_timeline_time += clip.frame_count() / clip_fps;
+        main_timeline_time += clip.timeline_frame_count() / fps;
     }
     int64_t main_timeline_frames = 0;
     for (const auto& clip : clips) {
-        main_timeline_frames += clip.frame_count();
+        main_timeline_frames += clip.timeline_frame_count();
     }
     
     // Draw each clip - positioned sequentially (magnetic/ripple style)
     float timeline_pos = 0.0f;  // Current position on timeline (in time units)
     for (int i = 0; i < (int)clips.size(); i++) {
         const Clip& clip = clips[i];
-        // Use source fps for duration calculation to ensure waveform matches audio
-        double source_fps = fps;
-        if (clip.source_id >= 0 && clip.source_id < (int)sources.size()) {
-            source_fps = sources[clip.source_id].fps;
-        }
-        float clip_dur_time = static_cast<float>(clip.frame_count() / source_fps);
+        // Duration = timeline_frame_count / fps (speed already in frame count)
+        float clip_dur_time = static_cast<float>(clip.timeline_frame_count() / fps);
         
         // Skip clips outside visible range (convert view to timeline space)
         if (timeline_pos + clip_dur_time < view_start_timeline || timeline_pos > view_end_timeline) {
@@ -3818,22 +3670,9 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
             if (cc_source_fps <= 0.0) cc_source_fps = fps;
         }
         
-        // Convert timeline frame position to time using proper per-clip fps calculation
         int64_t tl_start_frame = cc.timeline_start();
-        float clip_start_time;
-        if (tl_start_frame >= 0 && tl_start_frame <= main_timeline_frames) {
-            // Within main timeline - use proper conversion
-            clip_start_time = static_cast<float>(timeline_frame_to_time_local(tl_start_frame));
-        } else if (tl_start_frame < 0) {
-            // Before main timeline - use source fps for the negative portion
-            clip_start_time = static_cast<float>(tl_start_frame / cc_source_fps);
-        } else {
-            // After main timeline - main time + extra frames at source fps
-            double extra_frames = tl_start_frame - main_timeline_frames;
-            clip_start_time = static_cast<float>(main_timeline_time + extra_frames / cc_source_fps);
-        }
-        double cc_speed = cc.speed > 0.0f ? cc.speed : 1.0f;
-        float clip_dur_time = static_cast<float>((cc.frame_count() / cc_source_fps) / cc_speed);
+        float clip_start_time = frame_to_time(tl_start_frame);
+        float clip_dur_time = static_cast<float>(cc.timeline_frame_count() / fps);
         
         // Skip clips outside visible range
         if (clip_start_time + clip_dur_time < view_start_timeline || clip_start_time > view_end_timeline) {
@@ -4129,7 +3968,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
         float tpos = 0.0f;
         int64_t frame_pos = 0;
         for (int i = 0; i < (int)clips.size(); i++) {
-            float dur = frame_to_time(clips[i].frame_count());
+            float dur = frame_to_time(clips[i].timeline_frame_count());
             float sx = time_to_x(tpos);
             float ex = time_to_x(tpos + dur);
             clip_positions.push_back({sx, ex, i, tpos, frame_pos});
@@ -4141,7 +3980,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
     // Drag ghost: show semi-transparent clip at the dragged position
     if (state.dragging == 5 && state.dragging_clip >= 0 && state.dragging_clip < (int)clips.size()) {
         const Clip& dragged = clips[state.dragging_clip];
-        float drag_dur = frame_to_time(dragged.frame_count());
+        float drag_dur = frame_to_time(dragged.timeline_frame_count());
         float cursor_time = x_to_time(mouse.x);
         float drag_start_time = cursor_time - state.drag_grab_offset_time;
         float max_start = std::max(0.0f, total_duration - drag_dur);
@@ -4362,7 +4201,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 state.pending_mouse_start = mouse;
                 // Store grab offset so dragging uses the clip's actual center.
                 float grab_offset = (click_x - start_x) / size.x * visible_duration;
-                state.pending_grab_offset_time = std::clamp(grab_offset, 0.0f, frame_to_time(clips[i].frame_count()));
+                state.pending_grab_offset_time = std::clamp(grab_offset, 0.0f, frame_to_time(clips[i].timeline_frame_count()));
                 
                 // Click moves playhead immediately; drag can take over if it starts
                 float timeline_time = x_to_time(click_x);
@@ -4517,7 +4356,7 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
             for (int i = 0; i < (int)clips.size(); i++) {
                 if (i == state.dragging_clip) continue;
                 float tpos = clip_positions[i].timeline_start;
-                float dur = frame_to_time(clips[i].frame_count());
+                float dur = frame_to_time(clips[i].timeline_frame_count());
                 // Drop only after crossing the midpoint of the target clip.
                 float drop_threshold = tpos + dur * 0.5f;
                 if (drag_cursor_time < drop_threshold) break;
@@ -4886,11 +4725,11 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
             ConnectedClip& cc = connected_clips[idx];
             float delta_x = mouse.x - state.trim_mouse_start_x;
             float delta_time = (delta_x / size.x) * visible_duration;
-            int64_t delta_frames = time_to_frame_local(std::abs(delta_time));
-            if (delta_time < 0) delta_frames = -delta_frames;
             
             if (state.connected_clip_dragging == 1) {
                 // Left handle - trim start
+                int64_t delta_frames = time_to_frame_local(std::abs(delta_time));
+                if (delta_time < 0) delta_frames = -delta_frames;
                 int64_t new_start = state.connected_clip_trim_start_frame + delta_frames;
                 int64_t min_start = 0;
                 int64_t max_start = cc.end_frame - 1;
@@ -4900,6 +4739,8 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 state.clips_modified = true;
             } else if (state.connected_clip_dragging == 2) {
                 // Right handle - trim end
+                int64_t delta_frames = time_to_frame_local(std::abs(delta_time));
+                if (delta_time < 0) delta_frames = -delta_frames;
                 int64_t old_end = cc.end_frame;
                 int64_t new_end = old_end + delta_frames;
                 int64_t min_end = cc.start_frame + 1;
@@ -4910,6 +4751,8 @@ bool ClipsTimeline(const char* label, int64_t* current_source_frame, int* curren
                 state.clips_modified = true;
             } else if (state.connected_clip_dragging == 3) {
                 // Move the clip
+                int64_t delta_frames = time_to_frame_local(std::abs(delta_time));
+                if (delta_time < 0) delta_frames = -delta_frames;
                 int64_t new_connection = state.connected_clip_drag_start_connection + delta_frames;
                 new_connection = std::max(new_connection, (int64_t)0);
                 cc.connection_frame = new_connection;
@@ -5754,12 +5597,38 @@ int main() {
                         }
                         if (ImGui::Button(speed_labels[s])) {
                             speed_value = speeds[s];
-                            // Apply to all selected clips
+                            // Apply speed to selected main clips, adjusting connected clips
                             for (int idx : timeline_state.selected_clips) {
-                                if (idx >= 0 && idx < (int)player.clips.size()) {
-                                    player.clips[idx].speed = speed_value;
+                                if (idx < 0 || idx >= (int)player.clips.size()) continue;
+                                auto& clip = player.clips[idx];
+                                float old_speed = clip.speed > 0.0f ? clip.speed : 1.0f;
+                                float new_speed = speed_value > 0.0f ? speed_value : 1.0f;
+                                if (std::abs(old_speed - new_speed) < 0.001f) continue;
+                                
+                                // Calculate timeline position of this clip
+                                int64_t clip_tl_start = 0;
+                                for (int ci = 0; ci < idx; ci++)
+                                    clip_tl_start += player.clips[ci].timeline_frame_count();
+                                int64_t old_tl_count = clip.timeline_frame_count();
+                                
+                                clip.speed = speed_value;
+                                int64_t new_tl_count = clip.timeline_frame_count();
+                                int64_t delta = new_tl_count - old_tl_count;
+                                
+                                // Adjust connected clips
+                                for (auto& cc : player.connected_clips) {
+                                    if (cc.connection_frame >= clip_tl_start && cc.connection_frame < clip_tl_start + old_tl_count) {
+                                        // Connected to this clip: maintain source frame anchor
+                                        int64_t offset = cc.connection_frame - clip_tl_start;
+                                        int64_t source_offset = static_cast<int64_t>(offset * old_speed);
+                                        cc.connection_frame = clip_tl_start + static_cast<int64_t>(std::round(source_offset / (double)new_speed));
+                                    } else if (cc.connection_frame >= clip_tl_start + old_tl_count) {
+                                        // After this clip: shift by the delta
+                                        cc.connection_frame += delta;
+                                    }
                                 }
                             }
+                            // Apply speed to selected connected clips (no repositioning needed)
                             for (int idx : timeline_state.selected_connected_clips) {
                                 if (idx >= 0 && idx < (int)player.connected_clips.size()) {
                                     player.connected_clips[idx].speed = speed_value;
