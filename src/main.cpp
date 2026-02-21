@@ -3196,11 +3196,13 @@ bool load_project_file(const std::string& path, VideoPlayer& player, float& out_
 
 WindowData create_window(const char* title, int width, int height, GLFWwindow* share_context = nullptr) {
     WindowData data;
-    
+
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    
+    glfwWindowHintString(GLFW_X11_CLASS_NAME, "VibeCut");
+    glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "VibeCut");
+
     data.window = glfwCreateWindow(width, height, title, nullptr, share_context);
     if (!data.window) return data;
     
@@ -5092,7 +5094,7 @@ int main() {
         return 1;
     }
 
-    WindowData main_window = create_window("VibeCut", 1600, 1000);
+    WindowData main_window = create_window("VibeCut", 2400, 1500);
     if (!main_window.window) {
         std::fprintf(stderr, "Failed to create main window\n");
         glfwTerminate();
